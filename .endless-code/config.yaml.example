@@ -1,0 +1,21 @@
+# Endless Code 配置文件示例
+# 复制此文件为 config.yaml 并填写实际的 API 密钥
+#
+# 配置文件查找顺序：
+#   1. 当前目录 .endless-code/config.yaml
+#   2. 用户目录 ~/.config/endless-code/config.yaml
+
+providers:
+  - name: deepseek
+    protocol: deepseek
+    model: deepseek-chat
+    base_url: https://api.deepseek.com
+    api_key: $DEEPSEEK_API_KEY        # 环境变量引用
+    thinking: false                    # 是否启用扩展思考（仅 DeepSeek 生效）
+
+  - name: openai
+    protocol: openai
+    model: gpt-4o
+    # base_url 可省略，默认使用 OpenAI 官方端点
+    api_key: $OPENAI_API_KEY           # 环境变量引用
+    thinking: false                    # OpenAI 忽略此字段

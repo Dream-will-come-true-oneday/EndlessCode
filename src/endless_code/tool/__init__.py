@@ -1,0 +1,101 @@
+"""工具层：统一抽象、注册中心、执行与结果。"""
+
+import asyncio
+from dataclasses import dataclass
+from typing import Any, Protocol, runtime_checkable
+
+from endless_code.llm import ToolDefinition
+
+DEFAULT_TIMEOUT: float = 30.0
+
+
+@dataclass
+class Result:
+    """工具执行结果——永远以值类型返回，从不抛异常给上层。"""
+
+    content: str
+    is_error: bool = False
+
+
+@runtime_checkable
+class Tool(Protocol):
+    """统一工具抽象。"""
+
+    def name(self) -> str: ...
+    def description(self) -> str: ...
+    def parameters(self) -> dict[str, Any]: ...
+    async def execute(self, args: str) -> Result: ...
+
+
+def _truncate(s: str, max_lines: int = 2000, max_chars: int = 256_000) -> str:
+    """超出上限时截断并标注。"""
+    truncated = False
+    if len(s) > max_chars:
+        s = s[:max_chars]
+        truncated = True
+    lines = s.splitlines(keepends=True)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        truncated = True
+    result = "".join(lines)
+    if truncated:
+        result += "\n[truncated]"
+    return result
+
+
+class Registry:
+    """集中登记、按名查找、导出定义、按名执行。"""
+
+    def __init__(self) -> None:
+        self._order: list[str] = []
+        self._tools: dict[str, Tool] = {}
+
+    def register(self, t: Tool) -> None:
+        n = t.name()
+        if n in self._tools:
+            raise ValueError(f"工具名重复: {n}")
+        self._order.append(n)
+        self._tools[n] = t
+
+    def get(self, name: str) -> Tool | None:
+        return self._tools.get(name)
+
+    def definitions(self) -> list[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name=self._tools[n].name(),
+                description=self._tools[n].description(),
+                input_schema=self._tools[n].parameters(),
+            )
+            for n in self._order
+        ]
+
+    async def execute(self, name: str, args: str, timeout: float = DEFAULT_TIMEOUT) -> Result:
+        tool = self.get(name)
+        if tool is None:
+            return Result(content=f"未知工具: {name}", is_error=True)
+        try:
+            return await asyncio.wait_for(tool.execute(args), timeout)
+        except asyncio.TimeoutError:
+            return Result(content=f"工具 {name} 执行超时（{timeout}s）", is_error=True)
+        except Exception as e:
+            return Result(content=f"工具 {name} 异常: {e}", is_error=True)
+
+
+def new_default_registry() -> Registry:
+    """构造并注册 6 个核心工具。"""
+    from endless_code.tool.bash import BashTool
+    from endless_code.tool.edit_file import EditFileTool
+    from endless_code.tool.glob_tool import GlobTool
+    from endless_code.tool.grep_tool import GrepTool
+    from endless_code.tool.read_file import ReadFileTool
+    from endless_code.tool.write_file import WriteFileTool
+
+    r = Registry()
+    r.register(ReadFileTool())
+    r.register(WriteFileTool())
+    r.register(EditFileTool())
+    r.register(BashTool())
+    r.register(GlobTool())
+    r.register(GrepTool())
+    return r

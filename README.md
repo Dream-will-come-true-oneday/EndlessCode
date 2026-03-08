@@ -1,14 +1,18 @@
 # endless-code
 
-一个基于 Textual TUI 的命令行 AI 对话助手，支持流式多轮对话，可切换 OpenAI 与 DeepSeek 等多种供应商。
+一个基于 Textual TUI 的命令行 AI 编程助手，支持流式多轮对话与工具调用，能读写文件、执行命令、搜索代码——从聊天机器人到能干活的 Agent。
 
 ## 特性
 
-- 终端内交互式对话界面，回复以流式逐字显示（打字机效果）
-- 多供应商支持：OpenAI、DeepSeek
+- 终端内交互式对话界面，回复以流式逐字显示
+- 多供应商支持：OpenAI、DeepSeek（及任何 OpenAI 兼容端点）
 - 多轮对话，进程内保留上下文记忆
+- **工具系统**：模型可自主调用 6 个核心工具（read_file、write_file、edit_file、bash、glob、grep）
+- **单轮闭环**：模型请求工具 → 执行 → 结果回灌 → 最终答复
+- Claude Code 风格工具行呈现（`● read_file(path)` + 结果摘要）
+- 结构化错误处理，工具失败不中断会话
 - 助手回复支持 Markdown 渲染
-- 扩展思考模式（DeepSeek，通过 `thinking` 开关）
+- 扩展思考模式（DeepSeek）
 
 ## 安装
 
@@ -87,17 +91,27 @@ python -m endless_code
 
 ```
 src/endless_code/
-├── cli.py              # CLI 入口：加载配置、打印 banner、启动 TUI
+├── cli.py              # CLI 入口：加载配置、构造工具注册中心、启动 TUI
 ├── config.py           # 配置层：加载、校验、环境变量展开
-├── conversation.py     # 会话层：进程内多轮历史管理
-├── prompt.py           # banner 等提示文本渲染
+├── conversation.py     # 会话层：进程内多轮历史管理（含工具调用回合）
+├── prompt.py           # 系统提示词与启动 banner
 ├── llm/
-│   ├── __init__.py     # Provider 抽象接口、统一数据结构
-│   ├── openai_provider.py
-│   └── deepseek_provider.py
+│   ├── __init__.py     # Provider 抽象接口、ToolCall/ToolResult/ToolDefinition
+│   ├── openai_provider.py   # OpenAI 适配器（含工具调用解析与回灌）
+│   └── deepseek_provider.py # DeepSeek 适配器
+├── tool/
+│   ├── __init__.py     # Tool Protocol、Registry、Result、new_default_registry
+│   ├── read_file.py    # 读文件（带行号）
+│   ├── write_file.py   # 写文件（自动创建父目录）
+│   ├── edit_file.py    # 唯一匹配替换
+│   ├── bash.py         # 执行 shell 命令（带超时）
+│   ├── glob_tool.py    # 按模式查找文件
+│   └── grep_tool.py    # 正则搜索文件内容
+├── agent/
+│   └── __init__.py     # Agent 单轮闭环编排
 └── tui/
     ├── __init__.py
-    └── app.py           # Textual TUI 主应用、状态机、对话逻辑
+    └── app.py          # Textual TUI 主应用、工具行渲染
 ```
 
 ## 开发流程

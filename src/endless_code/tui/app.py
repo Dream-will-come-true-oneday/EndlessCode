@@ -7,15 +7,16 @@ from enum import Enum
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text as RichText
-from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Container, VerticalScroll
 from textual.widgets import Footer, Header, Input, RichLog, Static
 from textual.timer import Timer
 
+from endless_code.agent import Agent, Event, Phase
 from endless_code.config import ProviderConfig
 from endless_code.conversation import Conversation
-from endless_code.llm import Message, Provider, StreamEvent, new_provider
+from endless_code.llm import Provider, new_provider
+from endless_code.tool import Registry
 
 
 class SessionState(Enum):
@@ -69,16 +70,19 @@ class EndlessCodeApp(App):
     def __init__(
         self,
         providers: list[ProviderConfig],
+        registry: Registry | None = None,
     ) -> None:
         super().__init__()
         self._providers = providers
         self._provider: Provider | None = None
+        self._registry = registry
         self._conv = Conversation()
         self._state = SessionState.SELECTING
         self._cur_reply: str = ""
         self._turn_start: float = 0.0
         self._stream_task: asyncio.Task | None = None
         self._timer: Timer | None = None
+        self._cur_tool_name: str = ""
 
     @property
     def state(self) -> SessionState:
@@ -232,27 +236,49 @@ class EndlessCodeApp(App):
         # T15: 启动计时器
         self._timer = self.set_interval(0.25, self._tick)
 
-        self._stream_task = asyncio.create_task(self._consume_stream())
+        self._stream_task = asyncio.create_task(self._consume_agent_events())
 
     def _tick(self) -> None:
-        """T15: 更新计时显示。"""
+        """更新计时显示。"""
         elapsed = time.monotonic() - self._turn_start
-        self._streaming.update(
-            f"  Imagining… ({elapsed:.1f}s)\n\n  {self._cur_reply}"
-        )
+        if self._cur_tool_name:
+            label = f"● {self._cur_tool_name} Running…"
+        else:
+            label = "Imagining…"
+        self._streaming.update(f"  {label} ({elapsed:.1f}s)")
 
-    @work(exclusive=True)
-    async def _consume_stream(self) -> None:
-        """T14: 消费 provider 流式输出。"""
+    async def _consume_agent_events(self) -> None:
+        """消费 Agent 事件流。"""
+        from endless_code.tool import new_default_registry
+
+        registry = self._registry or new_default_registry()
+        agent = Agent(self._provider, registry)
+
         try:
-            async for event in self._provider.stream(self._conv.messages()):
-                if event.text:
-                    self._cur_reply += event.text
-                elif event.done:
+            async for ev in agent.run(self._conv):
+                if ev.text:
+                    self._cur_reply += ev.text
+                elif ev.tool and ev.tool.phase == Phase.START:
+                    if self._cur_reply:
+                        self._chat.write(Markdown(self._cur_reply))
+                        self._cur_reply = ""
+                    self._cur_tool_name = ev.tool.name
+                elif ev.tool and ev.tool.phase == Phase.END:
+                    self._chat.write(
+                        RichText(f"● {ev.tool.name}({ev.tool.args})", style="bold cyan")
+                    )
+                    summary = ev.tool.result
+                    lines = summary.splitlines()
+                    if len(lines) > 8:
+                        summary = "\n".join(lines[:8]) + "\n[truncated]"
+                    style = "red" if ev.tool.is_error else "dim"
+                    self._chat.write(RichText(f"  ⎿ {summary}", style=style))
+                    self._cur_tool_name = ""
+                elif ev.done:
                     self._finish_turn()
                     return
-                elif event.err is not None:
-                    self._handle_stream_error(event.err)
+                elif ev.err is not None:
+                    self._handle_stream_error(ev.err)
                     return
         except asyncio.CancelledError:
             pass

@@ -1,312 +1,425 @@
-# 工具系统 Plan
-
-> 基于已批准的 spec.md。本文档与语言相关（Python 3.12+）。SDK 调用方式已对 `anthropic`（`AsyncAnthropic`，支持 tool_use streaming）、`openai`（`AsyncOpenAI`，支持 chat.completions tool_calls streaming）实测核对。
+# Agent Loop Plan
 
 ## 架构概览
 
-在 ch02「provider → conversation → tui」三件套之上，新增两个包并扩展三处：
+本阶段在现有 `config -> llm/tool -> conversation -> agent -> tui -> cli` 分层上扩展，不拆分现有包，也不引入新的运行时框架。
 
-- **mewcode.tool（新建）**：统一工具抽象 `Tool`、执行结果 `Result`、注册中心 `Registry`、6 个核心工具。零外部依赖，不感知 LLM 协议。
-- **mewcode.agent（新建）**：承载「单轮闭环」编排——请求#1（带工具）→ 收集工具调用 → 注册中心执行 → 结果回灌进 `Conversation` → 请求#2（续答）→ 最终文本 → 停。对外吐出一条 `Event` async generator 供 TUI 渲染。只依赖 `llm`、`tool`、`conversation`，不 import anthropic/openai，保持协议无关。
-- **mewcode.llm（扩展）**：`Message`/`StreamEvent` 增加工具字段；新增协议无关类型 `ToolCall`/`ToolResult`/`ToolDefinition` 与 `ROLE_TOOL` 常量；`Provider.stream` 增加 `tools` 参数；两个适配器注入工具定义、解析流式工具调用、回灌工具结果。
-- **mewcode.conversation（扩展）**：新增「assistant 工具调用回合」与「工具结果回合」的追加方法。
-- **mewcode.prompt（扩展）**：`SYSTEM_PROMPT` 增补 Agent 角色与工具使用约定。
-- **mewcode.tui（扩展）**：`submit` 改走 `Agent.run`；事件消费 task 处理工具事件；渲染 Claude Code 风格工具行与执行指示。
-- **cli.py（扩展）**：构造 `tool.new_default_registry()` 并注入 `MewCodeApp`。
+- `endless_code.llm` 继续负责协议适配，新增统一用量对象、Plan Mode 系统提示后缀和流式用量上报。DeepSeek 与 OpenAI 都沿用 `AsyncOpenAI` 的 Chat Completions 流。
+- `endless_code.tool` 增加只读分类、只读定义导出和可靠的命令进程清理。注册中心继续统一负责工具超时和异常值化。
+- `endless_code.conversation` 继续保存协议无关历史，并增加末尾角色查询，供异常终止时补齐合法历史。
+- `endless_code.agent` 从固定两次请求改为 ReAct 循环，独占 assistant/tool 历史写入，负责停止条件、取消、批次并发和事件顺序。
+- `endless_code.tui` 只添加用户消息并消费 Agent 事件，负责模式切换、取消按键、累计用量、迭代展示和输出脱敏。
+- `endless_code.security` 提供无状态的敏感文本脱敏和工具参数摘要，避免界面直接显示原始参数内容。
 
-依赖方向（无环）：`tool → llm`；`conversation → llm`；`agent → {llm, tool, conversation}`；`tui → {agent, tool, conversation, llm, prompt}`；`llm → {config, prompt}`。
+依赖方向保持无环：
 
-## 核心数据结构### llm 包（`__init__.py` 扩展）
-
-```python
-from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Literal, Protocol
-
-# 消息角色——新增 ROLE_TOOL。
-ROLE_USER = "user"
-ROLE_ASSISTANT = "assistant"
-ROLE_TOOL = "tool"  # 携带工具执行结果的回合
-
-@dataclass
-class ToolCall:
-    """协议无关地承载模型发起的一次工具调用（流式拼接完成后）。"""
-    id: str            # provider 侧调用 id；回灌结果时配对
-    name: str          # 工具名（注册中心按名查找）
-    input: str         # 拼接完成的 JSON 参数字符串（raw JSON）
-
-@dataclass
-class ToolResult:
-    """协议无关地承载一次工具执行结果。"""
-    tool_call_id: str  # 对应 ToolCall.id
-    content: str       # 执行产出（成功内容或结构化错误文本）
-    is_error: bool = False  # 是否为错误结果（F9）
-
-@dataclass
-class ToolDefinition:
-    """注册中心导出的协议无关工具定义。"""
-    name: str
-    description: str
-    input_schema: dict[str, Any]  # 完整 JSON Schema：type/properties/required
-
-# Message 扩展：assistant 回合可带 tool_calls；ROLE_TOOL 回合带 tool_results。
-@dataclass
-class Message:
-    role: Literal["user", "assistant", "tool"]
-    content: str = ""
-    tool_calls: list[ToolCall] = field(default_factory=list)    # 仅 assistant
-    tool_results: list[ToolResult] = field(default_factory=list) # 仅 ROLE_TOOL
-
-# StreamEvent 扩展：在 text/done/err 之外，turn 结束时一次性上抛 tool_calls。
-@dataclass
-class StreamEvent:
-    text: str = ""                       # 文本增量
-    tool_calls: list[ToolCall] = field(default_factory=list)  # 非空：本轮模型请求执行这些工具（done 之前发出）
-    done: bool = False
-    err: Exception | None = None
+```text
+config ───────────────┐
+prompt ───────────────┤
+security ─────────────┤
+llm ───────┐          │
+tool ──────┼─> agent ─┼─> tui ─> cli
+conversation ┘        │
 ```
 
-`Provider.stream` 签名变更：
+`llm` 依赖 `config` 与 `prompt`；`tool` 依赖 `llm` 的工具定义类型；`agent` 依赖 `llm/tool/conversation/prompt`；`tui` 依赖上述公开接口与 `security`。
+
+## 需求归属
+
+| 需求 | 架构归属 |
+|---|---|
+| F1/F2 | `agent.Agent.run` 的循环与停止分支 |
+| F3 | `agent.Event`、`ToolEvent` 与 TUI 事件消费 |
+| F4 | 两个 Provider 的分片拼接与 Agent 单轮收集 |
+| F5 | 工具只读分类与 Agent 保序分批执行 |
+| F6 | `Conversation` 与 Agent 统一历史写入/终止收尾 |
+| F7 | TUI 按键、per-turn 取消事件、Agent 流/工具取消 |
+| F8 | `llm.Usage`、Provider usage 提取、TUI 累加展示 |
+| F9 | Agent 迭代事件与 TUI 动态区 |
+| F10 | `Mode`、只读工具定义、系统提示后缀、`/plan`/`/do` |
+| F11 | `DeepSeekProvider`、`OpenAIProvider` 及共享协议测试 |
+| N1/N5 | `Registry` 超时、`BashTool` 进程树清理、Agent task 清理 |
+| N2 | Provider/工具异步执行、TUI 计时器与非阻塞事件消费 |
+| N3/N6 | Agent 批次结果槽位与固定事件顺序 |
+| N4 | 各工具现有截断逻辑与 TUI 结果摘要截断 |
+| N7 | `security` 与所有 TUI 输出入口 |
+| N8 | TUI 启动测试、依赖边界、跨平台测试命令 |
+
+## 核心数据结构与接口
+
+### LLM 用量与流事件
 
 ```python
+@dataclass
+class Usage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass
+class StreamEvent:
+    text: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: Usage | None = None
+    done: bool = False
+    err: Exception | None = None
+
+
 class Provider(Protocol):
-    @property
-    def name(self) -> str: ...
-    @property
-    def model(self) -> str: ...
     def stream(
         self,
         msgs: list[Message],
         tools: list[ToolDefinition],
+        system_suffix: str = "",
     ) -> AsyncIterator[StreamEvent]: ...
 ```
 
-`tools` 为空表示本次请求不带工具。续答请求（请求#2）仍传入 `tools`（与真实协议一致），但编排层忽略其再次返回的工具调用（单轮）。
+每次 Provider 请求最多产生一个 `usage` 事件。`usage` 在流结束前发出，随后发出 `done=True`。若请求异常，只发 `err`，不伪造用量。
 
-### tool 包（新建）
-
-```python
-from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
-
-@dataclass
-class Result:
-    """工具执行结果——永远以值类型返回，从不抛 Python 异常给上层。"""
-    content: str          # 回灌给模型的文本（已截断/带行号等）
-    is_error: bool = False  # True 表示结构化错误，content 即错误描述
-
-@runtime_checkable
-class Tool(Protocol):
-    """统一工具抽象（F1）。"""
-    def name(self) -> str: ...               # 模型看到的工具名，如 "read_file"
-    def description(self) -> str: ...        # 给模型的用途说明
-    def parameters(self) -> dict[str, Any]: ...  # 手写 JSON Schema（type/properties/required/description）
-    async def execute(self, args: str) -> Result: ...
-    # 注：args 是 raw JSON 字符串；超时由外部 asyncio.wait_for 控制
-
-class Registry:
-    """集中登记、按名查找、导出定义、按名执行。"""
-    def __init__(self) -> None:
-        self._order: list[str] = []      # 保持注册顺序，导出稳定
-        self._tools: dict[str, Tool] = {}
-
-    def register(self, t: Tool) -> None: ...
-    def get(self, name: str) -> Tool | None: ...
-    def definitions(self) -> list["ToolDefinition"]: ...  # F3/AC1：按序导出
-    async def execute(self, name: str, args: str, timeout: float) -> Result: ...
-    # F5/F9：未知工具兜底为 is_error；超时由 asyncio.wait_for 抛 TimeoutError → 转 Result
-
-def new_default_registry() -> Registry:
-    """构造并注册 6 个工具，固化 bash 超时与各上限常量。"""
-    ...
-
-DEFAULT_TIMEOUT: float = 30.0  # 单个工具执行的默认超时秒数（N1，不可配）
-```
-
-每个工具用 `@dataclass` + 手写 `from_json` 解析入参，或直接 `json.loads` 后用 `dict.get`；解析失败转为 `Result(is_error=True, ...)`。
-
-| 工具名 | 参数（JSON Schema） | 成功结果 | 错误结果 |
-|--------|--------------------|---------|---------|
-| `read_file` | `path`(必填) | 带行号文本（`f"{n:6d}\t{line}"` 风格，≤2000 行 / ≤256KB，超出截断标注 `[truncated]`） | 不存在/不可读/是目录 |
-| `write_file` | `path`(必填)、`content`(必填) | `Path.parent.mkdir(parents=True, exist_ok=True)` 后覆盖写，返回路径与字节数 | 写入失败 |
-| `edit_file` | `path`、`old_string`、`new_string`(均必填) | `content.count(old)==1` 时唯一替换并写回 | 0 处→「未找到匹配」；>1 处→「匹配到 N 处，old_string 不唯一，请提供更长上下文」 |
-| `bash` | `command`(必填) | `asyncio.create_subprocess_shell(..., stdout=PIPE, stderr=PIPE)` 执行，返回 stdout/stderr/exit_code（合并视图截断 ~30000 字符） | 超时（is_error）；命令非零退出按结果回灌 |
-| `glob` | `pattern`(必填，如 `**/*.py`)、`path`(可选，默认 cwd) | `pathlib.Path(root).rglob(pattern)` 或 `glob.glob(recursive=True)` 匹配（≤100，排序） | 无匹配返回空说明（非 is_error） |
-| `grep` | `pattern`(必填，Python 正则)、`path`(可选)、`glob`(可选文件名过滤) | `re.compile` + 逐行扫，`file:line:content` 列表（≤100，超出标注） | 正则非法（is_error）；无命中返回空说明 |
-
-### agent 包（新建）
+### Agent 模式与事件
 
 ```python
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import AsyncIterator
+class Mode(Enum):
+    NORMAL = "normal"
+    PLAN = "plan"
 
-class Phase(Enum):
-    START = "start"  # 工具开始执行
-    END = "end"      # 工具执行完毕
 
 @dataclass
 class ToolEvent:
-    """一次工具调用的开始/结束（供 TUI 渲染工具行与结果摘要）。"""
+    call_id: str
     name: str
-    args: str = ""        # 参数预览（用于 ● name(args)）
+    args: str = ""
     phase: Phase = Phase.START
-    result: str = ""      # phase=END：结果摘要
-    is_error: bool = False  # phase=END：是否错误
+    result: str = ""
+    is_error: bool = False
+
 
 @dataclass
 class Event:
-    """单轮闭环对外事件流元素，TUI 据非 None 字段分派渲染。"""
-    text: str = ""          # 文本增量（preamble 或最终答复）
-    tool: ToolEvent | None = None  # 工具调用开始/结束
-    done: bool = False      # 本轮结束
-    err: Exception | None = None  # 出错（不中断会话）
+    text: str = ""
+    tool: ToolEvent | None = None
+    usage: Usage | None = None
+    iteration: int | None = None
+    notice: str = ""
+    done: bool = False
+    err: Exception | None = None
+
 
 class Agent:
-    """持有 provider 与注册中心，执行单轮闭环。"""
-    def __init__(self, provider: Provider, registry: Registry) -> None:
-        self._provider = provider
-        self._registry = registry
-
-    async def run(self, conv: Conversation) -> AsyncIterator[Event]:
-        """执行单轮闭环，async generator 吐出事件流。调用方 cancel() 该 task 即终止。"""
-        ...
+    def run(
+        self,
+        conv: Conversation,
+        mode: Mode = Mode.NORMAL,
+        cancel: asyncio.Event | None = None,
+    ) -> AsyncIterator[Event]: ...
 ```
 
-## 模块设计### `mewcode.tool`**职责：** 提供 6 个工具的统一抽象与执行；集中登记与导出；所有失败包成 `Result(is_error=True)` 而非抛异常（F1/F2/F9/N4）。
-**对外接口：** `Tool`、`Result`、`Registry`、`new_default_registry`、`DEFAULT_TIMEOUT`。
-**依赖：** 标准库（`pathlib`、`asyncio`、`re`、`fnmatch`、`json`）、`mewcode.llm`（仅为 `definitions()` 返回 `list[ToolDefinition]`）。
-**关键实现点：**
-- Schema 手写为 `dict[str, Any]`：OpenAI 直接用整对象；Anthropic 由 llm 适配器取 `["properties"]`/`["required"]`。
-- `read_file` 带行号、行/字节上限、`[truncated]` 标注（N5/AC2）。
-- `edit_file` 唯一匹配语义 + 含计数的可区分错误（AC4）。
-- `bash` 用 `asyncio.create_subprocess_shell(cmd, stdout=PIPE, stderr=PIPE)`，外层 `asyncio.wait_for(..., timeout=DEFAULT_TIMEOUT)` 控制超时；超时则 `proc.kill()` 并返回结构化错误（AC5/N1）。`shell=True` 自带 pipe/redirect 支持，跨平台用 `/bin/sh -c` 或 `cmd /C`（asyncio 自动按 OS 选）。
-- `glob` 用 `pathlib.Path(root).glob(pattern)` 或自实现 `**` 段匹配；遍历期间 `await asyncio.sleep(0)` 让出 event loop。`grep` 用 `re` + `Path.rglob` + 异步友好的分批读取。
-- 空 `args`（OpenAI 可能给空串而非 `{}`）归一为 `"{}"` 处理，避免误报参数错误。
+事件使用互斥的有效字段；一个事件只表达一种状态。每次 `run` 的所有终止路径最后都发出且只发出一个 `done=True`。错误路径先发 `err`，停止原因先发 `notice`，再以 `done` 收尾。
 
-### `mewcode.agent`**职责：** 单轮闭环编排（F5/F6），保证 AC9 单轮上限；把 provider 的 `StreamEvent` 与工具执行翻译成统一 `Event` 异步流。
-**对外接口：** `Agent`、`Event`、`ToolEvent`、`Phase`。
-**依赖：** `mewcode.llm`、`mewcode.tool`、`mewcode.conversation`、`asyncio`。
-**run 算法：**
-1. `defs = self._registry.definitions()`。
-2. **请求#1**：`async for ev in self._stream_once(conv, defs):` 转发 `text` 增量给调用方、累积完整 preamble 文本、收集 `tool_calls`；出错则 `yield Event(err=...)` 后结束。
-3. 若无 `tool_calls`：`conv.add_assistant(preamble)`，`yield Event(done=True)`，结束（纯文本回合，与 ch02 等价）。
-4. 有 `tool_calls`：`conv.add_assistant_with_tool_calls(preamble, calls)`。
-5. 顺序执行每个 call：`yield Event(tool=ToolEvent(name, args, Phase.START))` → `r = await self._registry.execute(call.name, call.input, timeout=tool.DEFAULT_TIMEOUT)` → `yield Event(tool=ToolEvent(name, phase=Phase.END, result=r.content, is_error=r.is_error))` → 收集 `ToolResult(tool_call_id=call.id, content=r.content, is_error=r.is_error)`。
-6. `conv.add_tool_results(results)`。
-7. **请求#2**：`async for ev in self._stream_once(conv, defs):` 转发最终答复 `text`、累积 final 文本；**忽略**其返回的任何 `tool_calls`（单轮，AC9）。
-8. `conv.add_assistant(final)`，`yield Event(done=True)`。
-- 调用方 `cancel()` 此 task（退出/Ctrl+C）时 `async for` 自然抛 `CancelledError`，沿向上传播终止；工具执行经 `asyncio.wait_for` 受 `DEFAULT_TIMEOUT` 约束（N1）。
-
-### `mewcode.llm`（扩展）**职责：** 协议无关请求/响应抽象 + 两协议工具调用全流程（F3/F4/F6/F7）。
-**`anthropic_provider.py` 关键改动：**
-- 请求构造加 `params["tools"] = to_anthropic_tools(tools)`：每项 `{"name": d.name, "description": d.description, "input_schema": d.input_schema}`（SDK 直接接受 `input_schema` 完整对象）。
-- 流循环用 `async with self._client.messages.stream(**params) as stream:`；按 `event.type` 分派：`content_block_delta` + `delta.type == "text_delta"` → `yield StreamEvent(text=delta.text)`；`thinking_delta` / `input_json_delta` 跳过（SDK 内部累加器会保留完整 input JSON）。
-- 流结束后取 `final_message = await stream.get_final_message()`：若 `final_message.stop_reason == "tool_use"`，遍历 `final_message.content`，对 `ToolUseBlock` 类型块收集 `ToolCall(id=block.id, name=block.name, input=json.dumps(block.input))`，`yield StreamEvent(tool_calls=calls)`。
-- `to_anthropic_messages` 扩展：assistant 回合若有 `tool_calls`，content 用 `[{"type": "text", "text": preamble}, {"type": "tool_use", "id": ..., "name": ..., "input": json.loads(call.input)}]` 数组；`ROLE_TOOL` 回合把每个 `ToolResult` 用 `{"type": "tool_result", "tool_use_id": id, "content": content, "is_error": is_error}` 拼进**一条 user 消息**的 content 数组。
-
-**`openai_provider.py` 关键改动：**
-- 请求构造加 `params["tools"]`：每项 `{"type": "function", "function": {"name": d.name, "description": d.description, "parameters": d.input_schema}}`。
-- 流循环 `async for chunk in await self._client.chat.completions.create(..., stream=True):`；按 index 维护 `tool_calls_buf: dict[int, dict]`，把 `delta.tool_calls` 中每片 `{index, id?, function.name?, function.arguments?}` 累加合并（id/name 取首次出现，arguments 拼接）；正文 `delta.content` 仍 yield 文本增量。
-- 流结束后（`finish_reason == "tool_calls"` 或 buf 非空）按 index 排序组 `ToolCall(id, name, input=arguments_buf)`（空 arguments 归一为 `"{}"`），`yield StreamEvent(tool_calls=calls)`。
-- `to_openai_messages` 扩展：assistant 回合若有 `tool_calls`，发 `{"role": "assistant", "content": preamble or None, "tool_calls": [{"id": c.id, "type": "function", "function": {"name": c.name, "arguments": c.input}} for c in calls]}`；`ROLE_TOOL` 回合每个 `ToolResult` 发一条 `{"role": "tool", "tool_call_id": r.tool_call_id, "content": r.content}`。
-
-### `mewcode.conversation`（扩展）
+### 工具只读分类
 
 ```python
-def add_assistant_with_tool_calls(self, text: str, calls: list[ToolCall]) -> None:
-    """assistant 工具调用回合。"""
-    self._messages.append(Message(role=ROLE_ASSISTANT, content=text, tool_calls=list(calls)))
+class Tool(Protocol):
+    read_only: bool
 
-def add_tool_results(self, results: list[ToolResult]) -> None:
-    """ROLE_TOOL 结果回合。"""
-    self._messages.append(Message(role=ROLE_TOOL, tool_results=list(results)))
+    def name(self) -> str: ...
+    def description(self) -> str: ...
+    def parameters(self) -> dict[str, Any]: ...
+    async def execute(self, args: str) -> Result: ...
+
+
+class Registry:
+    def read_only_definitions(self) -> list[ToolDefinition]: ...
+    def is_read_only(self, name: str) -> bool: ...
 ```
-保留 `add_user`/`add_assistant`/`messages`/`__len__` 不变。
 
-### `mewcode.tui`（扩展）**职责：** 渲染 `agent.Event`（文本/工具行/结果摘要/错误/结束），保持非阻塞（N2）。
-- `MewCodeApp.__init__(self, providers, version, registry)`：存 `self._registry`。
-- 新增 reactive / 成员：`self._cur_tool: ToolDisplay | None`（执行中指示：name/args，非 None 即在 `#streaming` 渲染执行行）。
-- `submit`：`conv.add_user(text)` 后 `self._stream_task = asyncio.create_task(self._consume_agent_events())`，task 内构造 `agent = Agent(self.provider, self._registry)` 后 `async for ev in agent.run(self.conv):` 分派。
-- `_consume_agent_events` 分派：
-  - `ev.text` 非空：`cur_reply += ev.text`，更新动态区显示；
-  - `ev.tool` 且 `phase==START`：若 `cur_reply` 非空，先把 preamble 经 markdown 渲染后 `RichLog.write(...)` 提交并清空 `cur_reply`；置 `self._cur_tool`；
-  - `ev.tool` 且 `phase==END`：依次 `RichLog.write(tool_line(name, args))` + `RichLog.write(tool_result_summary(result, is_error))` 顺序提交；清 `self._cur_tool`；
-  - `ev.done`：把 `cur_reply`（最终答复）经 `rich.markdown.Markdown` 渲染并写入 `RichLog`；`_finish_turn()`；
-  - `ev.err`：`RichLog.write(error_block(err))`；`_finish_turn()`。
-- `view.py` 新增：`tool_line(name, args) -> RenderableType`（青/绿 `●` + `name(args)`，用 `Text(..., style="bold cyan")`）、`tool_result_summary(result, is_error) -> RenderableType`（缩进 `  ⎿ `、灰/红、UI 截断 ~8 行）。
-- `View.compose`（或 `_render_streaming`）在 `self._cur_tool is not None` 时渲染「`● name(args)` + spinner Running…」到 `#streaming`，否则沿用「Imagining… (Ns)」。
-- `RichLog.write` 同步追加保证顺序——Python 这边只有一个 event loop，不存在 Go `tea.Batch` 那种并发乱序问题，无需特殊同步原语。
+分类固定如下：
+
+| 工具 | `read_only` |
+|---|---|
+| `read_file` | `True` |
+| `glob` | `True` |
+| `grep` | `True` |
+| `write_file` | `False` |
+| `edit_file` | `False` |
+| `bash` | `False` |
+
+未知工具的 `is_read_only` 返回 `False`，因此形成串行批次边界。
+
+### Conversation 末尾角色
+
+```python
+def last_role(self) -> str:
+    """空历史返回空字符串，否则返回最后一条消息的 role。"""
+```
+
+### 安全输出
+
+```python
+def redact_sensitive(text: str, secrets: Collection[str] = ()) -> str: ...
+
+def summarize_tool_args(
+    tool_name: str,
+    raw_args: str,
+    secrets: Collection[str] = (),
+) -> str: ...
+```
+
+`redact_sensitive` 先替换当前配置中可解析的确切密钥，再处理常见 `sk-...` 和 `api_key=...` 形式。`summarize_tool_args` 使用 JSON 解析：文件工具展示路径，写入/替换工具只展示内容长度，搜索工具展示模式与路径，bash 展示脱敏后的命令；JSON 非法或未知工具只显示脱敏截断摘要。
+
+## 模块设计
+
+### `endless_code.agent`
+
+职责：ReAct 循环、停止条件、事件流、工具执行调度和历史一致性。
+
+内置常量：
+
+```python
+MAX_ITERATIONS = 25
+MAX_UNKNOWN_RUN = 3
+NOTICE_MAX_ITER = "（已达最大迭代轮数 25，自动停止；可继续发消息推进。）"
+NOTICE_UNKNOWN_TOOLS = "（连续多轮只请求到未注册的工具，自动停止。）"
+NOTICE_STREAM_ERROR = "（请求出错，本轮已中断。）"
+NOTICE_CANCELLED = "（已取消。）"
+NOTICE_EMPTY_FINAL = "（任务已结束，模型未返回文本。）"
+```
+
+`Agent.run` 算法：
+
+1. `cancel is None` 时创建未触发的 `asyncio.Event`。
+2. `Mode.NORMAL` 使用全部工具和空系统后缀；`Mode.PLAN` 使用只读工具定义与 `PLAN_MODE_REMINDER`。
+3. 对 `1..MAX_ITERATIONS`：
+   - 发出 `Event(iteration=n)`。
+   - 发起一次 Provider 流，实时转发文本，收集完整文本、工具调用和用量。
+   - 收到用量后发出 `Event(usage=...)`。
+   - 无工具调用时，由 Agent 把最终文本写入 Conversation，发出 `done` 并返回。
+   - 有工具调用时，先写入含工具调用的 assistant 消息，再分批执行工具，最后一次性按原顺序写入所有工具结果。
+   - 若执行未取消且未知工具连续计数未触顶，进入下一轮。
+4. 达到未知工具阈值或迭代上限时，追加 assistant 停止说明，发出 `notice` 和 `done`。
+5. 流错误或取消时按“历史收尾”规则追加消息，发出终止事件并返回。
+
+Agent 是 assistant/tool 历史的唯一写入者。TUI 只在启动一轮前添加 user 消息；TUI 的完成处理不得再次调用 `add_assistant`，从根源上消除重复历史。
+
+#### 可取消的 Provider 流
+
+不能只在收到 chunk 后轮询 `cancel`，否则网络长时间无数据时取消不及时。单轮收集器对每次 `anext(stream)` 与一个长期存在的 `cancel.wait()` task 使用 `asyncio.wait(..., FIRST_COMPLETED)`：
+
+- chunk 先到则消费并继续；
+- cancel 先到则取消并等待 `anext` task，关闭 Provider async generator，标记本轮取消；
+- `finally` 中取消并等待辅助 task，确保没有挂起任务。
+
+两个 Provider 在读取 SDK 流时使用异步上下文管理器；Agent 关闭生成器后，适配器退出上下文并关闭 HTTP 响应。
+
+#### 保序分批执行
+
+按调用顺序切分最长连续批次：
+
+- 连续只读工具形成并发批；
+- 每个有副作用工具或未知工具单独形成串行批。
+
+每批执行流程：
+
+1. 按调用顺序发出全部 `Phase.START` 事件。
+2. 只读批为每个调用创建独立 task；串行批只创建一个 task。
+3. 将工具完成 task 与 `cancel.wait()` 竞速。
+4. 正常完成后把结果写入预分配的原始下标。
+5. 取消时取消并等待未完成 task；已完成结果保留，未完成调用生成 `is_error=True` 的取消结果。
+6. 按调用顺序发出全部 `Phase.END` 事件。
+7. 所有批次结束或取消后，按原顺序构造 `ToolResult` 列表并一次写入 Conversation。
+
+并发 task 不写 Conversation，只返回自己的 `Result`；主循环负责合并，因此没有共享历史竞争。
+
+#### 历史收尾
+
+- 流在工具调用入历史前取消或出错：追加 `partial_text + notice` 的 assistant 文本；没有 partial text 时只追加 notice。
+- 工具执行阶段取消：为本轮每个工具调用补齐实际或取消结果，再追加 assistant 取消说明。
+- 未知工具阈值或迭代上限：工具结果已经配对，再追加 assistant 停止说明。
+- 自然完成：只追加模型最终文本；空文本使用 `NOTICE_EMPTY_FINAL`。
+
+所有异常终止后历史均以普通 assistant 文本结尾，下一轮可继续使用。
+
+### `endless_code.llm`
+
+职责：协议无关消息/事件定义、DeepSeek/OpenAI 请求转换、工具调用分片拼接和用量上报。
+
+共享行为：
+
+- `_to_openai_messages(msgs, system_suffix)` 在内置系统提示后拼接非空后缀。
+- 两个 Provider 请求均启用流与工具定义，并请求流式 usage。
+- 每个 chunk 先检查 `chunk.usage`，不能假定 usage chunk 一定没有 choices。
+- 工具调用继续按 `index` 缓冲 `id/name/arguments`，流结束后按 index 生成 `ToolCall`。
+- SDK 流放入 `async with response`，确保取消时关闭连接。
+
+`OpenAIProvider`：请求加入 `stream_options={"include_usage": True}`，从 `prompt_tokens` 和 `completion_tokens` 生成 `Usage`。
+
+`DeepSeekProvider`：沿用默认 DeepSeek `base_url` 与现有 `thinking` 请求体，同时加入兼容的 `stream_options={"include_usage": True}`，按同一 usage 字段生成 `Usage`。Plan Mode 仅影响工具定义和系统后缀，不改变 `thinking` 配置。
+
+若兼容端点没有返回 usage，适配器不伪造数字；自动化 Provider 测试验证字段解析，真实 DeepSeek/OpenAI 用量由端到端验收确认。
+
+### `endless_code.tool`
+
+职责：工具分类、超时、结构化错误和命令生命周期。
+
+- `Registry.execute` 保留单一 `asyncio.wait_for` 超时层；Agent 不再重复包装超时。
+- `BashTool` 根据 `returncode != 0` 设置 `Result.is_error`。
+- `BashTool.execute` 捕获 `CancelledError`，终止完整进程树、等待进程退出后重新抛出取消，让 `Registry` 正确返回超时或让 Agent 正确处理用户取消。
+- POSIX 创建独立 session，清理时向进程组发送终止信号，必要时升级为强制结束。
+- Windows 创建独立进程组，清理时使用系统进程树终止能力结束 shell 及其子进程，并等待 shell 回收。
+- stdout/stderr 的现有截断上限不变。
+
+### `endless_code.prompt`
+
+新增：
+
+```python
+PLAN_MODE_REMINDER = (
+    "You are in PLAN MODE. Use only read_file, glob, and grep to investigate. "
+    "Do not write or edit files and do not run shell commands. Produce a clear "
+    "step-by-step plan, then stop and wait for /do."
+)
+
+EXECUTE_DIRECTIVE = "请按上面的计划开始执行。"
+```
+
+`SYSTEM_PROMPT` 增加持续使用工具直到任务完成的约定。Plan Mode 的只读限制同时由提示词和实际注入的工具集合保证。
+
+### `endless_code.security`
+
+职责：所有用户可见输出的密钥脱敏及工具参数摘要。
+
+- 函数保持无状态，便于单测。
+- TUI 初始化时从所有 ProviderConfig 收集明文密钥和当前环境中可解析的密钥引用；未设置的环境变量跳过，不提前阻止应用启动。
+- assistant 最终文本、跨工具 preamble、工具参数、工具结果摘要和异常文本在写入 RichLog 前统一脱敏。
+- 原始对话历史和完整工具结果仍在内部保留；本阶段只保证用户可见输出不回显密钥，不改变模型上下文语义。
+
+### `endless_code.tui`
+
+职责：输入、模式状态、事件渲染、用户取消与会话级统计。
+
+主要字段：
+
+```python
+self._tool_registry: Registry       # 避免覆盖 Textual App._registry
+self._mode: Mode = Mode.NORMAL
+self._iteration: int = 0
+self._usage_in: int = 0
+self._usage_out: int = 0
+self._turn_cancel: asyncio.Event | None = None
+self._cur_tools: list[ToolDisplay] = []
+self._secrets: set[str] = ...
+```
+
+输入处理：
+
+- `/exit`、`/quit`：退出。
+- `/plan`：切换 `Mode.PLAN`，写入脱敏的模式提示，不发起模型请求。
+- `/do`：切换 `Mode.NORMAL`，向 Conversation 添加 `EXECUTE_DIRECTIVE` 用户消息并立即启动 Agent；`/do` 字面值不写入历史。
+- 普通文本：添加 user 消息并按当前模式启动 Agent。
+
+按键：
+
+- `Ctrl+D`：沿用程序退出；若当前有 task，先取消并等待工具清理。
+- `Ctrl+C`：流式状态只 `set()` 当前取消事件；其他状态退出程序。
+- `Esc`：流式状态只 `set()` 当前取消事件；其他状态忽略。
+
+事件消费：
+
+- `text`：累积当前文本；工具开始前将其作为 preamble 写入 scrollback。
+- `tool START`：使用 `summarize_tool_args` 建立 `ToolDisplay` 并加入动态区。
+- `tool END`：按 `call_id` 移除对应动态项，按事件顺序写入工具行和脱敏结果摘要。
+- `usage`：累加输入/输出并刷新状态文本。
+- `iteration`：更新动态区轮次。
+- `notice`：写入系统提示。
+- `err`：提交尚未展示的 partial text，再展示脱敏错误块；等待随后的 `done` 统一清理。
+- `done`：提交剩余最终文本，停止计时器、恢复输入和空闲态；不得写 Conversation。
+
+Provider 状态、模式和累计用量通过 `App.sub_title` 显示，Footer 继续显示快捷键。流式动态区显示当前轮次、计时和所有运行中的工具。
+
+Provider 构造或环境变量解析失败时在界面显示错误并保持选择/空闲状态，不允许异常逃逸导致 TUI 崩溃。
+
+### `endless_code.cli` 与依赖
+
+- CLI 接线保持 `Config -> Registry -> EndlessCodeApp`。
+- TUI 工具字段改名后继续传入同一 Registry 实例。
+- `pyproject.toml` 为 Textual 增加当前主版本上界 `<9`，并分别验证最低声明版本与当前 8.x；避免未来主版本自动进入支持范围。
+- pytest 明确异步 fixture loop scope，消除当前弃用警告。
+- README 更新 Agent Loop、Plan Mode、取消键和用量展示说明。
 
 ## 模块交互
 
-```
-用户提交
-  └─ MewCodeApp.submit: conv.add_user(text); self._stream_task = asyncio.create_task(_consume_agent_events())
-       └─ _consume_agent_events:
-            └─ agent = Agent(provider, registry); async for ev in agent.run(conv):
-                 ├─ 请求#1: async for se in provider.stream(conv.messages(), registry.definitions()):
-                 │     └─ 适配器: 注入 tools → 流式拼接 → StreamEvent{text…} / StreamEvent{tool_calls}
-                 │     → agent 转发 Event{text}（preamble），收集 calls
-                 ├─ 无 calls → conv.add_assistant(preamble); yield Event(done=True)
-                 └─ 有 calls:
-                      ├─ conv.add_assistant_with_tool_calls(preamble, calls)
-                      ├─ for call: yield Event(tool=START) → await registry.execute(name, args, timeout=DEFAULT_TIMEOUT) → yield Event(tool=END)
-                      ├─ conv.add_tool_results(results)
-                      ├─ 请求#2: async for se in provider.stream(...) → yield Event(text)（最终答复）
-                      │     （适配器把 conv 里的 tool_use/tool_result 回合映射为各自线格式）
-                      └─ conv.add_assistant(final); yield Event(done=True)
-  └─ _consume_agent_events 按 Event 类型渲染（cur_reply 动态区 / RichLog.write 进 scrollback）
-```
+```text
+用户普通输入或 /do
+  -> TUI 添加一条 user 消息
+  -> 创建 turn_cancel，启动 Agent.run
+     -> iteration 事件
+     -> Provider.stream(history, tools(mode), suffix(mode))
+        -> text/tool_calls/usage/done 或 err
+     -> 无工具：Agent 保存 assistant 最终文本 -> done
+     -> 有工具：Agent 保存 assistant(tool_calls)
+        -> 按顺序切分只读并发批/副作用串行批
+        -> START 事件 -> 执行 -> END 事件
+        -> Agent 保存全部 ToolResult
+        -> 下一轮 Provider.stream
+  -> TUI 仅消费事件并渲染
 
-并发：`conv` 仅在单个 event loop 上被消费 task 触碰——`submit` 在 create_task 前 `add_user`，之后只读；`run` 协程独占后续所有 `conv` 变更。`messages()` 返回副本。Textual UI 渲染回到主协程序列化执行，与 `conv` 互不干扰（N2）。
+Esc/Ctrl+C
+  -> turn_cancel.set()
+  -> Agent 关闭当前 Provider 流或取消工具 task
+  -> BashTool 在取消传播时终止进程树
+  -> Agent 补齐工具结果与 assistant 取消说明
+  -> notice -> done
+  -> TUI 回到 IDLE
+```
 
 ## 文件组织
 
-```
-mewcode/
-├── pyproject.toml                          — 不变（已含 anthropic/openai/textual/rich/pyyaml）
-├── src/mewcode/
-│   ├── cli.py                              — 修改：new_default_registry() 注入 MewCodeApp
+```text
+endless-code/
+├── pyproject.toml                         # Textual 上界、pytest 异步配置
+├── README.md                              # Agent Loop 与交互说明
+├── src/endless_code/
+│   ├── cli.py                             # 保持接线，适配 TUI 构造参数
+│   ├── conversation.py                    # 增加 last_role
+│   ├── prompt.py                          # Plan/执行提示和循环约定
+│   ├── security.py                        # 新增脱敏与安全参数摘要
 │   ├── llm/
-│   │   ├── __init__.py                     — 修改：新增 ToolCall/ToolResult/ToolDefinition/ROLE_TOOL；扩展 Message/StreamEvent；Provider.stream 加 tools 参数
-│   │   ├── anthropic_provider.py           — 修改：to_anthropic_tools；stream 解析 tool_use blocks；to_anthropic_messages 支持 tool_use/tool_result
-│   │   └── openai_provider.py              — 修改:to_openai_tools；按 index 拼 tool_calls；to_openai_messages 支持 assistant.tool_calls/tool 消息
-│   ├── tool/                               — 新建
-│   │   ├── __init__.py                     — Tool Protocol、Result、Registry、new_default_registry、DEFAULT_TIMEOUT、_truncate 辅助
-│   │   ├── read_file.py / write_file.py / edit_file.py / bash.py / glob_tool.py / grep_tool.py
-│   ├── agent/                              — 新建
-│   │   └── __init__.py                     — Agent、Event、ToolEvent、Phase、run、_stream_once
-│   ├── conversation.py                     — 修改：add_assistant_with_tool_calls、add_tool_results
-│   ├── prompt.py                           — 修改：SYSTEM_PROMPT 增 Agent 角色与工具约定
+│   │   ├── __init__.py                    # Usage、StreamEvent、Provider 签名
+│   │   ├── openai_provider.py             # system_suffix、usage、可关闭流
+│   │   └── deepseek_provider.py           # system_suffix、usage、thinking 保持
+│   ├── tool/
+│   │   ├── __init__.py                    # read_only 接口、Registry 查询
+│   │   ├── bash.py                        # 非零错误、取消时清理进程树
+│   │   └── 其余五个工具                    # read_only 属性
+│   ├── agent/
+│   │   └── __init__.py                    # ReAct 循环、事件、取消、分批执行
 │   └── tui/
-│       ├── app.py                          — 修改：__init__ 接 registry；新增 _cur_tool 字段
-│       ├── stream.py                       — 修改：submit 走 Agent.run；_consume_agent_events 分派工具事件
-│       └── view.py                         — 修改：tool_line/tool_result_summary；执行指示
+│       └── app.py                         # 模式、状态、事件渲染、脱敏、按键
 └── tests/
-    ├── test_tool.py                        — 新建：注册中心 + 各工具单测
-    └── test_agent.py                       — 新建：单轮闭环（fake provider）：AC8 链路、AC9 单轮
+    ├── test_agent.py                      # 重写为多轮/停止/并发/取消测试
+    ├── test_tool.py                       # 分类、非零退出、跨平台超时清理
+    ├── test_conversation.py               # 新增 last_role 测试
+    ├── test_llm.py                        # 新增两 Provider 分片/usage/suffix 测试
+    ├── test_security.py                   # 新增脱敏与参数摘要测试
+    └── test_tui.py                        # 新增 Textual 挂载/历史/命令/取消测试
 ```
-
-注意：`.mewcode/config.yaml` 与 ch02 完全一致——跨章节不变。
 
 ## 技术决策
 
 | 决策点 | 选择 | 理由 |
-|--------|------|------|
-| 工具调用循环放哪 | 新建 `mewcode.agent` 包，TUI 退化为渲染器 | 循环（请求#1→执行→请求#2）无法塞进 ch02 的单个 `_consume_stream` 协程；独立包可无 UI 单测（AC8/AC9），只依赖 llm+tool+conversation，不泄漏 SDK 类型。命名 `agent` 而非 `runner`：概念即 Agent，本章恰为单轮。 |
-| 是否用 SDK 的高级 tool-runner | 不用，坚持手写 streaming + 手动单轮 | anthropic Python SDK 暂无自动 tool runner；openai 的 helper 自动连环到完成，违反 F6/AC9。手写迭代更可控且与 ch02 stable 风格一致。 |
-| 工具定义传入哪一层 | `Provider.stream` 第二参数 `list[ToolDefinition]` | 两 SDK 都把 tools 放 per-request params；续答仍需带；保持 Provider 无状态。 |
-| 工具参数 Schema 生成 | 每工具手写 `dict[str, Any]` | OpenAI `parameters` 与 Anthropic `input_schema` 都直接吃 JSON Schema dict；6 个固定工具手写最直白，描述对模型可读性最关键；不引入 `pydantic` 反射（schema 还要剥 `$defs`/`additionalProperties` 噪音）。 |
-| 流式工具参数拼接 | Anthropic 用 `stream.get_final_message()` 拿汇总；OpenAI 按 `delta.tool_calls[i].function.arguments` 按 index 累加 | Anthropic SDK 自带累加器，避免手写 PartialJSON 边界；OpenAI 必须按 index 拼接（多工具下同时分片）。 |
-| Glob/Grep 实现 | 纯标准库（`pathlib.glob`/`re` + 异步 `await asyncio.sleep(0)` 让出） | 零额外依赖、跨平台；spec 要求保持简单、不引入配置。 |
-| Bash 实现与超时 | `asyncio.create_subprocess_shell` + `asyncio.wait_for(..., DEFAULT_TIMEOUT)` | `shell=True` 自带管道/重定向；asyncio 原生超时 + `proc.kill()` 终止；30s 内置不可配（spec：超时不配置化）。跨平台兼容（Win 上 asyncio 走 ProactorEventLoop）。 |
-| 工具失败的表达 | `execute` 返回 `Result(content, is_error)`，从不抛异常给上层 | F9/N4：所有失败包成结构化结果回灌，程序不崩，上层无需区分 try/except 路径。 |
-| 工具结果在 Message 的形态 | 平铺字段（assistant 加 `tool_calls`，`ROLE_TOOL` 加 `tool_results`） | 两 SDK 工具语义本就是 id 关联的 tool_use/tool_result 列表；通用 content-block 联合属过度设计（本章结果均文本）。适配器吸收差异（Anthropic 结果进 user 消息、OpenAI 用 tool 角色）。 |
-| UI 截断 vs 回灌截断 | 两者分离：UI 摘要 ~8 行；回灌为工具级上限（read 2000 行 / bash 30000 字符 等） | AC11/N5 要界面截断，但模型需较完整内容；尾部统一加 `[truncated]` 标注。 |
-| 续答请求是否带 tools | 带，但忽略其返回的工具调用 | 与真实协议一致（OpenAI assistant+tool 后不带 tools 也可，但带更稳）；F6/AC9 由 agent 不再触发执行来保证单轮。 |
-| thinking 与工具组合 | 历史含工具交互的请求（续答）不启用 thinking | Anthropic 在 thinking 启用时要求回灌带 tool_use 的 assistant 回合附原 thinking 块（含 signature），而本章按 spec 丢弃 thinking 增量、不留签名；故对这类请求关闭 thinking 以避免 400。 |
-| 空最终答复 | 续答为空时用单轮提示占位并推给 UI | 空 assistant 回合会破坏下一轮请求（Anthropic 要求非空内容 + 角色交替）；占位提示同时满足 AC9 的"单轮上限提示"。 |
-| 空参数归一 | OpenAI 侧空 arguments 归一为 `"{}"` | 无参工具的 arguments 可能为空串，回灌时须是合法 JSON，否则严格兼容端点对 `"arguments": ""` 返回 400。 |
-| grep 超长行 | 显式标注未完整搜索 | `for line in file` 遇超长行可能阻塞或读爆内存；用 `read(chunk)` + 手动分割或 `iter(..., '')` 加最大长度判定，超出标注「该行过长，未完整搜索」避免假"无命中"误导模型。 |
-| scrollback 顺序提交 | 单 event loop 内 `RichLog.write` 同步追加 | Python 的 asyncio 单线程模型天然保证顺序；不存在 Go `tea.Batch` 并发乱序问题。 |
-| 工具命名 | `read_file`/`write_file`/`edit_file`/`bash`/`glob`/`grep` | 符合 OpenAI 函数名规则（`a-zA-Z0-9_-`）与 Claude Code 习惯；TUI 工具行显示 `● name(关键参数)`。 |
+|---|---|---|
+| 循环归属 | 重写 `Agent.run` | 编排与 UI 解耦，Conversation 写入只有一个所有者 |
+| 迭代上限 | 内置 25 | 足够覆盖多步任务，同时限制失控请求和成本 |
+| 未知工具阈值 | 连续 3 个“全为未知工具”的迭代 | 给模型纠偏机会；混入已知工具表示仍有进展并重置 |
+| 取消信号 | per-turn `asyncio.Event` + `asyncio.wait` 竞速 | 既能保留历史收尾，又能在无新 chunk 时及时打断 |
+| 工具并发 | 仅最长连续只读批并发 | 满足顺序语义，不跨副作用边界重排 |
+| 工具超时 | Registry 维持唯一 `wait_for` | 避免双重超时；工具负责 cancellation cleanup |
+| 命令清理 | 独立进程组/树，取消时显式终止并等待 | 单纯取消 `communicate()` 不会停止子进程 |
+| 历史所有权 | Agent 写 assistant/tool，TUI 只写 user | 消除当前重复 assistant 消息并保持协议历史一致 |
+| Plan Mode 防线 | 只读工具集合 + 系统提示后缀 | 即使模型忽略提示，也拿不到写入/执行工具 |
+| 用量来源 | Provider 从最终流式 usage 块上报 | 输入/输出口径来自服务端实际计费统计 |
+| DeepSeek 适配 | 保持 OpenAI 兼容流并保留 `thinking` 请求体 | 与现有实现和配置兼容，改动集中在 usage/suffix |
+| 输出脱敏 | TUI 所有输出入口统一处理，工具参数结构化摘要 | 不污染内部历史，同时覆盖用户可见泄漏面 |
+| TUI 注册中心字段 | `_tool_registry` | 避免覆盖 Textual 的 `_registry` 私有字段 |
+| Textual 版本 | 保留最低版本并增加 `<9` 上界 | 最低声明版本与当前 8.x 都列为显式验证目标，未来主版本需重新验证 |
+| 文件拆分 | 仅新增 `security.py`，其余沿用当前单文件 TUI | 避免把本阶段扩大成无关重构 |

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "CLI AI assistant with streaming multi-turn conversation"
 requires-python = ">=3.12"
 dependencies = [
-    "textual>=0.52",
+    "textual>=0.52,<9",
     "rich>=13.0",
     "openai>=1.0",
     "pyyaml>=6.0",
@@ -25,6 +25,7 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [build-system]
 requires = ["hatchling"]

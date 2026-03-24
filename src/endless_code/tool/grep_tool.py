@@ -10,6 +10,8 @@ from endless_code.tool import Result
 
 
 class GrepTool:
+    read_only = True
+
     def name(self) -> str:
         return "grep"
 

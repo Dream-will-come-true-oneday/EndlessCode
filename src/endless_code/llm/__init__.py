@@ -31,6 +31,14 @@ class ToolResult:
 
 
 @dataclass
+class Usage:
+    """一次模型请求的输入与输出 Token 用量。"""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass
 class ToolDefinition:
     """注册中心导出的协议无关工具定义。"""
 
@@ -55,6 +63,7 @@ class StreamEvent:
 
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: Usage | None = None
     done: bool = False
     err: Exception | None = None
 
@@ -69,7 +78,10 @@ class Provider(Protocol):
     def model(self) -> str: ...
 
     def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition]
+        self,
+        msgs: list[Message],
+        tools: list[ToolDefinition],
+        system_suffix: str = "",
     ) -> AsyncIterator[StreamEvent]: ...
 
 

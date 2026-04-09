@@ -8,7 +8,11 @@
 - 多供应商支持：OpenAI、DeepSeek（及任何 OpenAI 兼容端点）
 - 多轮对话，进程内保留上下文记忆
 - **工具系统**：模型可自主调用 6 个核心工具（read_file、write_file、edit_file、bash、glob、grep）
-- **单轮闭环**：模型请求工具 → 执行 → 结果回灌 → 最终答复
+- **Agent Loop**：模型可跨多轮持续请求工具、查看结果并自主推进，直到任务完成
+- **安全停止**：支持迭代上限、连续未知工具、流错误和用户取消
+- **保序并发**：连续只读工具并发执行，写入和命令工具保持串行顺序
+- **Plan Mode**：`/plan` 仅开放只读工具生成计划，`/do` 切回全部工具并立即执行
+- **会话统计**：状态区展示当前模式、迭代轮次和累计输入/输出 Token
 - Claude Code 风格工具行呈现（`● read_file(path)` + 结果摘要）
 - 结构化错误处理，工具失败不中断会话
 - 助手回复支持 Markdown 渲染
@@ -78,7 +82,11 @@ python -m endless_code
 
 - `Enter` —— 提交消息
 - `Ctrl`+`D` —— 退出程序
+- `Esc` —— Agent 运行时取消当前回合
+- `Ctrl`+`C` —— Agent 运行时取消当前回合；空闲时退出程序
 - `/exit` 或 `/quit` —— 退出程序
+- `/plan` —— 进入只读计划模式
+- `/do` —— 退出计划模式并立即按上文计划执行
 
 ## 支持的供应商
 
@@ -95,6 +103,7 @@ src/endless_code/
 ├── config.py           # 配置层：加载、校验、环境变量展开
 ├── conversation.py     # 会话层：进程内多轮历史管理（含工具调用回合）
 ├── prompt.py           # 系统提示词与启动 banner
+├── security.py         # 用户可见输出脱敏与安全工具参数摘要
 ├── llm/
 │   ├── __init__.py     # Provider 抽象接口、ToolCall/ToolResult/ToolDefinition
 │   ├── openai_provider.py   # OpenAI 适配器（含工具调用解析与回灌）
@@ -108,7 +117,7 @@ src/endless_code/
 │   ├── glob_tool.py    # 按模式查找文件
 │   └── grep_tool.py    # 正则搜索文件内容
 ├── agent/
-│   └── __init__.py     # Agent 单轮闭环编排
+│   └── __init__.py     # 可取消 ReAct Agent Loop、停止条件与保序工具调度
 └── tui/
     ├── __init__.py
     └── app.py          # Textual TUI 主应用、工具行渲染

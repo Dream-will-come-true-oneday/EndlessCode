@@ -64,8 +64,12 @@ class DeepSeekProvider:
                         usage_seen = True
                         yield StreamEvent(
                             usage=Usage(
-                                input_tokens=getattr(chunk_usage, "prompt_tokens", 0) or 0,
-                                output_tokens=getattr(chunk_usage, "completion_tokens", 0) or 0,
+                                input_tokens=getattr(chunk_usage, "prompt_tokens", 0)
+                                or 0,
+                                output_tokens=getattr(
+                                    chunk_usage, "completion_tokens", 0
+                                )
+                                or 0,
                             )
                         )
 
@@ -101,5 +105,5 @@ class DeepSeekProvider:
 
             yield StreamEvent(done=True)
 
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             yield StreamEvent(err=exc)

@@ -89,15 +89,17 @@ class Registry:
         tool = self.get(name)
         return tool is not None and tool.read_only
 
-    async def execute(self, name: str, args: str, timeout: float = DEFAULT_TIMEOUT) -> Result:
+    async def execute(
+        self, name: str, args: str, timeout: float = DEFAULT_TIMEOUT
+    ) -> Result:
         tool = self.get(name)
         if tool is None:
             return Result(content=f"未知工具: {name}", is_error=True)
         try:
             return await asyncio.wait_for(tool.execute(args), timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return Result(content=f"工具 {name} 执行超时（{timeout}s）", is_error=True)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             return Result(content=f"工具 {name} 异常: {e}", is_error=True)
 
 

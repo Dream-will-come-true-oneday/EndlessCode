@@ -127,7 +127,13 @@ async def test_mount_registers_widgets_and_exits_cleanly() -> None:
 @pytest.mark.asyncio
 async def test_history_usage_and_iteration_are_updated_once() -> None:
     provider = FakeProvider(
-        [[StreamEvent(text="hello"), StreamEvent(usage=Usage(4, 3)), StreamEvent(done=True)]]
+        [
+            [
+                StreamEvent(text="hello"),
+                StreamEvent(usage=Usage(4, 3)),
+                StreamEvent(done=True),
+            ]
+        ]
     )
     with patch("endless_code.tui.app.new_provider", return_value=provider):
         app = EndlessCodeApp([_config()], new_default_registry())
@@ -143,7 +149,10 @@ async def test_history_usage_and_iteration_are_updated_once() -> None:
             app._tick = tracked_tick
             app._start_turn("hi")
             await _wait_for_state(app, pilot, SessionState.IDLE)
-            assert [message.role for message in app._conv.messages()] == ["user", "assistant"]
+            assert [message.role for message in app._conv.messages()] == [
+                "user",
+                "assistant",
+            ]
             assert app._conv.messages()[-1].content == "hello"
             assert app._usage_in == 4
             assert app._usage_out == 3

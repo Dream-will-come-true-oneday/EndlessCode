@@ -4,14 +4,15 @@ import asyncio
 import time
 from dataclasses import dataclass
 from enum import Enum
+from typing import ClassVar
 
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text as RichText
 from textual.app import App, ComposeResult
 from textual.containers import Container, VerticalScroll
-from textual.widgets import Footer, Header, Input, RichLog, Static
 from textual.timer import Timer
+from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from endless_code import __version__
 from endless_code.agent import Agent, Mode, Phase
@@ -70,7 +71,7 @@ class EndlessCodeApp(App):
     }
     """
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
         ("ctrl+d", "quit", "退出"),
         ("ctrl+c", "cancel_or_quit", "取消/退出"),
         ("escape", "cancel_turn", "取消本轮"),
@@ -118,7 +119,9 @@ class EndlessCodeApp(App):
         yield Header(show_clock=True)
         yield VerticalScroll(RichLog(id="chat-area", highlight=True, markup=True))
         yield Static("", id="streaming-box", classes="hidden")
-        yield Container(Input(placeholder="输入消息…", id="user-input"), id="input-area")
+        yield Container(
+            Input(placeholder="输入消息…", id="user-input"), id="input-area"
+        )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -154,7 +157,7 @@ class EndlessCodeApp(App):
             if secret:
                 self._secrets.add(secret)
             return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self._provider = None
             self._write_error(f"{type(exc).__name__}: {exc}")
             return False
@@ -272,7 +275,9 @@ class EndlessCodeApp(App):
         elapsed = time.monotonic() - self._turn_start
         if self._cur_tools:
             lines = [f"● {tool.name}({tool.args}) Running…" for tool in self._cur_tools]
-            self._streaming.update("\n".join(lines) + f"\n  ({elapsed:.1f}s · 第 {self._iteration} 轮)")
+            self._streaming.update(
+                "\n".join(lines) + f"\n  ({elapsed:.1f}s · 第 {self._iteration} 轮)"
+            )
         else:
             iteration = f" · 第 {self._iteration} 轮" if self._iteration else ""
             self._streaming.update(f"  Imagining… ({elapsed:.1f}s{iteration})")
@@ -321,7 +326,7 @@ class EndlessCodeApp(App):
                     return
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self._flush_reply()
             self._write_error(f"{type(exc).__name__}: {exc}")
         finally:
@@ -336,7 +341,9 @@ class EndlessCodeApp(App):
             self._tick()
             return
 
-        self._cur_tools = [tool for tool in self._cur_tools if tool.call_id != event.call_id]
+        self._cur_tools = [
+            tool for tool in self._cur_tools if tool.call_id != event.call_id
+        ]
         self._chat.write(RichText(f"● {event.name}({args})", style="bold cyan"))
         summary = self._safe(event.result)
         lines = summary.splitlines()

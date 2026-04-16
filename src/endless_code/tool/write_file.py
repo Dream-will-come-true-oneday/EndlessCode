@@ -47,4 +47,6 @@ class WriteFileTool:
         except OSError as e:
             return Result(content=f"写入失败: {e}", is_error=True)
 
-        return Result(content=f"已写入 {path_str}（{len(content.encode('utf-8'))} 字节）")
+        return Result(
+            content=f"已写入 {path_str}（{len(content.encode('utf-8'))} 字节）"
+        )

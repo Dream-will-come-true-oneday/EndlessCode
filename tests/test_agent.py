@@ -26,7 +26,9 @@ from endless_code.tool import Registry, Result
 
 
 class FakeProvider:
-    def __init__(self, scripts: list[list[StreamEvent]], *, repeat_last: bool = False) -> None:
+    def __init__(
+        self, scripts: list[list[StreamEvent]], *, repeat_last: bool = False
+    ) -> None:
         self.scripts = scripts
         self.repeat_last = repeat_last
         self.call_count = 0
@@ -47,7 +49,11 @@ class FakeProvider:
         system_suffix: str = "",
     ):
         self.requests.append((msgs, tools, system_suffix))
-        index = min(self.call_count, len(self.scripts) - 1) if self.repeat_last else self.call_count
+        index = (
+            min(self.call_count, len(self.scripts) - 1)
+            if self.repeat_last
+            else self.call_count
+        )
         self.call_count += 1
         for event in self.scripts[index]:
             yield event
@@ -126,7 +132,9 @@ class TimedTool(EchoTool):
         self.timeline.events.append(f"start:{label}")
         if self.read_only:
             self.timeline.active_reads += 1
-            self.timeline.peak_reads = max(self.timeline.peak_reads, self.timeline.active_reads)
+            self.timeline.peak_reads = max(
+                self.timeline.peak_reads, self.timeline.active_reads
+            )
             await asyncio.sleep(0.03)
             self.timeline.active_reads -= 1
         else:
@@ -142,7 +150,9 @@ def _registry(*tools) -> Registry:
     return registry
 
 
-def _tool_event(call_id: str, name: str = "echo_tool", value: str = "ok") -> StreamEvent:
+def _tool_event(
+    call_id: str, name: str = "echo_tool", value: str = "ok"
+) -> StreamEvent:
     return StreamEvent(
         tool_calls=[ToolCall(id=call_id, name=name, input=json.dumps({"value": value}))]
     )
@@ -183,22 +193,42 @@ async def test_multi_round_event_sequence_and_history() -> None:
     provider = FakeProvider(
         [
             [StreamEvent(text="checking"), _tool_event("c1"), StreamEvent(done=True)],
-            [StreamEvent(text="finished"), StreamEvent(usage=Usage(5, 2)), StreamEvent(done=True)],
+            [
+                StreamEvent(text="finished"),
+                StreamEvent(usage=Usage(5, 2)),
+                StreamEvent(done=True),
+            ],
         ]
     )
     conv = Conversation()
     conv.add_user("work")
     events = await _run(Agent(provider, _registry(EchoTool())), conv)
     assert [event.iteration for event in events if event.iteration] == [1, 2]
-    assert [event.tool.phase for event in events if event.tool] == [Phase.START, Phase.END]
-    assert [(event.usage.input_tokens, event.usage.output_tokens) for event in events if event.usage] == [(5, 2)]
+    assert [event.tool.phase for event in events if event.tool] == [
+        Phase.START,
+        Phase.END,
+    ]
+    assert [
+        (event.usage.input_tokens, event.usage.output_tokens)
+        for event in events
+        if event.usage
+    ] == [(5, 2)]
     assert sum(event.done for event in events) == 1
     messages = conv.messages()
-    assert [message.role for message in messages] == ["user", "assistant", "tool", "assistant"]
+    assert [message.role for message in messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
     assert messages[1].tool_calls[0].id == "c1"
     assert messages[2].tool_results[0].tool_call_id == "c1"
     assert messages[-1].content == "finished"
-    assert [message.role for message in provider.requests[1][0]] == ["user", "assistant", "tool"]
+    assert [message.role for message in provider.requests[1][0]] == [
+        "user",
+        "assistant",
+        "tool",
+    ]
 
 
 @pytest.mark.asyncio
@@ -215,7 +245,9 @@ async def test_plan_mode_limits_tools_and_suffix() -> None:
 
 @pytest.mark.asyncio
 async def test_max_iterations_stops_at_limit() -> None:
-    provider = FakeProvider([[_tool_event("same"), StreamEvent(done=True)]], repeat_last=True)
+    provider = FakeProvider(
+        [[_tool_event("same"), StreamEvent(done=True)]], repeat_last=True
+    )
     conv = Conversation()
     conv.add_user("loop")
     events = await _run(Agent(provider, _registry(EchoTool())), conv)
@@ -280,12 +312,63 @@ async def test_batch_execution_is_concurrent_and_ordered() -> None:
     assert timeline.events.index("start:w1") > timeline.events.index("end:r1")
     assert timeline.events.index("start:w1") > timeline.events.index("end:r2")
     assert timeline.events.index("start:r3") > timeline.events.index("end:w1")
-    starts = [event.tool.call_id for event in events if event.tool and event.tool.phase is Phase.START]
-    ends = [event.tool.call_id for event in events if event.tool and event.tool.phase is Phase.END]
+    starts = [
+        event.tool.call_id
+        for event in events
+        if event.tool and event.tool.phase is Phase.START
+    ]
+    ends = [
+        event.tool.call_id
+        for event in events
+        if event.tool and event.tool.phase is Phase.END
+    ]
     assert starts == ["r1", "r2", "w1", "r3"]
     assert ends == starts
     results = conv.messages()[2].tool_results
     assert [result.tool_call_id for result in results] == starts
+
+
+@pytest.mark.asyncio
+async def test_batch_history_is_committed_atomically() -> None:
+    timeline = Timeline()
+    calls = [
+        ToolCall(id="r1", name="reader", input=json.dumps({"value": "r1"})),
+        ToolCall(id="r2", name="reader", input=json.dumps({"value": "r2"})),
+    ]
+    provider = FakeProvider(
+        [
+            [StreamEvent(tool_calls=calls), StreamEvent(done=True)],
+            [StreamEvent(text="done"), StreamEvent(done=True)],
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("batch history")
+    stream = (
+        Agent(
+            provider,
+            _registry(TimedTool("reader", True, timeline)),
+        )
+        .run(conv)
+        .__aiter__()
+    )
+
+    while True:
+        event = await anext(stream)
+        if event.tool is not None and event.tool.phase is Phase.END:
+            break
+
+    assert [message.role for message in conv.messages()] == ["user", "assistant"]
+
+    remaining = [event async for event in stream]
+    assert any(event.done for event in remaining)
+    messages = conv.messages()
+    assert [message.role for message in messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert [result.tool_call_id for result in messages[2].tool_results] == ["r1", "r2"]
 
 
 @pytest.mark.asyncio
@@ -316,7 +399,9 @@ async def test_tool_cancel_pairs_results_and_history_recovers() -> None:
     conv = Conversation()
     conv.add_user("block")
     cancel = asyncio.Event()
-    task = asyncio.create_task(_run(Agent(provider, _registry(tool)), conv, cancel=cancel))
+    task = asyncio.create_task(
+        _run(Agent(provider, _registry(tool)), conv, cancel=cancel)
+    )
     await tool.started.wait()
     cancel.set()
     events = await asyncio.wait_for(task, timeout=1)

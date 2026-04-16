@@ -17,7 +17,9 @@ def redact_sensitive(text: Any, secrets: Collection[str] = ()) -> str:
     if text is None:
         return ""
     value = str(text)
-    unique_secrets = {secret for secret in secrets if isinstance(secret, str) and len(secret) >= 4}
+    unique_secrets = {
+        secret for secret in secrets if isinstance(secret, str) and len(secret) >= 4
+    }
     for secret in sorted(unique_secrets, key=len, reverse=True):
         value = value.replace(secret, "[REDACTED]")
     value = _KEY_TOKEN.sub("[REDACTED]", value)
@@ -49,7 +51,9 @@ def summarize_tool_args(
     if tool_name == "write_file":
         content = data.get("content")
         size = len(content) if isinstance(content, str) else 0
-        return f"path={_display_value(data.get('path'), secrets)}, content=<{size} chars>"
+        return (
+            f"path={_display_value(data.get('path'), secrets)}, content=<{size} chars>"
+        )
     if tool_name == "edit_file":
         old = data.get("old_string")
         new = data.get("new_string")
@@ -60,7 +64,9 @@ def summarize_tool_args(
             f"old=<{old_size} chars>, new=<{new_size} chars>"
         )
     if tool_name == "bash":
-        return f"command={_display_value(data.get('command'), secrets)}"[:_PREVIEW_LIMIT]
+        return f"command={_display_value(data.get('command'), secrets)}"[
+            :_PREVIEW_LIMIT
+        ]
     if tool_name == "glob":
         pattern = _display_value(data.get("pattern"), secrets)
         path = _display_value(data.get("path") or ".", secrets)

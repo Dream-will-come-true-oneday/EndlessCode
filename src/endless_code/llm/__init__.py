@@ -32,10 +32,12 @@ class ToolResult:
 
 @dataclass
 class Usage:
-    """一次模型请求的输入与输出 Token 用量。"""
+    """一次模型请求的输入、输出和缓存 Token 用量。"""
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_write: int = 0
+    cache_read: int = 0
 
 
 @dataclass
@@ -55,6 +57,24 @@ class Message:
     content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_results: list[ToolResult] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class System:
+    """稳定系统提示与动态环境段。"""
+
+    stable: str = ""
+    environment: str = ""
+
+
+@dataclass
+class Request:
+    """一次 Provider 请求的完整协议无关输入。"""
+
+    messages: list[Message] = field(default_factory=list)
+    tools: list[ToolDefinition] = field(default_factory=list)
+    system: System = field(default_factory=System)
+    reminder: str = ""
 
 
 @dataclass
@@ -77,23 +97,21 @@ class Provider(Protocol):
     @property
     def model(self) -> str: ...
 
-    def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]: ...
+    def stream(self, req: Request) -> AsyncIterator[StreamEvent]: ...
 
 
 def new_provider(cfg: "ProviderConfig") -> Provider:
     """根据配置构造对应的 Provider 适配器实例。"""
+    if cfg.protocol == "anthropic":
+        from endless_code.llm.anthropic_provider import AnthropicProvider
+
+        return AnthropicProvider(cfg)
     if cfg.protocol == "deepseek":
         from endless_code.llm.deepseek_provider import DeepSeekProvider
 
         return DeepSeekProvider(cfg)
-    elif cfg.protocol == "openai":
+    if cfg.protocol == "openai":
         from endless_code.llm.openai_provider import OpenAIProvider
 
         return OpenAIProvider(cfg)
-    else:
-        raise ValueError(f"不支持的 protocol：{cfg.protocol}")
+    raise ValueError(f"不支持的 protocol：{cfg.protocol}")

@@ -81,9 +81,11 @@ class EndlessCodeApp(App):
         self,
         providers: list[ProviderConfig],
         registry: Registry | None = None,
+        version: str = __version__,
     ) -> None:
         super().__init__()
         self._providers = providers
+        self._version = version
         self._provider: Provider | None = None
         self._tool_registry = registry or new_default_registry()
         self._conv = Conversation()
@@ -298,7 +300,7 @@ class EndlessCodeApp(App):
         if provider is None or cancel is None:
             self._end_turn()
             return
-        agent = Agent(provider, self._tool_registry)
+        agent = Agent(provider, self._tool_registry, self._version)
         terminal = False
         try:
             async for event in agent.run(self._conv, self._mode, cancel):

@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "CLI AI assistant with streaming multi-turn conversation"
 requires-python = ">=3.12"
 dependencies = [
+    "anthropic>=0.40",
     "textual>=0.52,<9",
     "rich>=13.0",
     "openai>=1.0",

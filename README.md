@@ -1,44 +1,31 @@
-# endless-code
+# Endless Code
 
-> 一个会持续执行，直到任务完成的终端 AI 编程 Agent。
+> 面向多模型的终端智能编程代理
 
-endless-code 是一个基于 Textual 的轻量级 TUI 编程助手。它连接 DeepSeek、OpenAI
-及 OpenAI 兼容端点，让模型在同一个用户回合中持续分析、调用工具、读取结果并调整行动，
-直到自然完成或触发明确的停止条件。
+Endless Code 是一个运行在终端中的智能编程助手。它以可取消的多轮 Agent Loop 为核心，让模型持续分析代码库、调用工具、读取结果并调整行动，直到任务完成或触发明确的停止条件。
 
-它的核心不是“在终端里聊天”，而是让模型真正完成代码库中的多步工作。
+项目基于 Textual 构建 TUI，统一支持 Anthropic、OpenAI、OpenAI 兼容端点和 DeepSeek。
 
 ## 核心能力
 
-- **自主 Agent Loop**：连续执行“判断 -> 调用工具 -> 回灌结果 -> 继续判断”，无需用户逐步催促。
-- **六个内置工具**：读取、写入、精确编辑文件，执行 Shell 命令，以及 Glob/Grep 搜索。
-- **Plan / Do 工作流**：`/plan` 只开放只读工具进行调研，`/do` 恢复全部工具并按计划执行。
-- **保序并发调度**：连续只读工具并发执行；写文件、编辑和命令等副作用工具保持串行边界。
-- **可取消、可恢复**：流式响应或工具运行期间可随时取消，清理任务和子进程后继续对话。
-- **完整运行反馈**：实时展示文本、工具调用、结果摘要、迭代轮次和累计 Token 用量。
-- **双 Provider 支持**：DeepSeek 与 OpenAI 共用一致的流式工具调用和历史回灌语义。
-- **输出脱敏**：API 密钥不会出现在工具预览、结果摘要、错误信息或对话界面中。
+- **多轮 Agent Loop**：自动完成“分析 -> 调用工具 -> 读取结果 -> 继续行动”的工作流。
+- **Plan / Do 模式**：`/plan` 仅开放只读工具进行调查，`/do` 恢复完整工具集并执行计划。
+- **六个内置工具**：`read_file`、`write_file`、`edit_file`、`glob`、`grep` 和 `bash`。
+- **安全的工具调度**：连续只读调用可并发执行，写入和命令调用保持顺序边界。
+- **流式响应与可取消**：实时显示文本、工具调用、结果、迭代轮次和 Token usage；支持 `Esc` 与 `Ctrl+C` 取消。
+- **系统提示工程化**：稳定提示模块化，环境信息、缓存前缀和 `system-reminder` 分离管理。
+- **缓存 usage 观测**：兼容 Anthropic、OpenAI 和 DeepSeek 返回的缓存读写字段。
+- **输出脱敏**：API key 不会显示在工具预览、错误信息或对话界面中。
 
-## 工作方式
+## 支持的 Provider
 
-```text
-用户任务
-   |
-   v
-模型流式响应 ---- 无工具调用 ----> 最终答复
-   |
-   | 工具调用
-   v
-只读工具并发 / 副作用工具串行
-   |
-   v
-结果按原顺序写回会话
-   |
-   +--------------------------> 下一轮模型判断
-```
+| Provider | 配置方式 | 特性 |
+| --- | --- | --- |
+| Anthropic | `protocol: anthropic` | 官方 Messages API、稳定 system 缓存断点 |
+| OpenAI | `protocol: openai` | 官方 API 或任意 OpenAI 兼容 `base_url` |
+| DeepSeek | `protocol: deepseek` | DeepSeek 默认 endpoint、thinking 和 prompt cache 字段 |
 
-循环会在模型自然完成、达到 25 轮上限、连续请求未知工具、响应出错或用户取消时停止。
-所有停止路径都会补全合法会话历史，下一条消息可以正常继续。
+DeepSeek 也可以通过 OpenAI 兼容配置使用：将 `protocol` 设置为 `openai`，再指定 `base_url`。专门的 `deepseek` 配置适合需要 `thinking` 或 DeepSeek 缓存 usage 的场景。
 
 ## 快速开始
 
@@ -50,7 +37,7 @@ cd Endless-Coding
 python -m pip install -e .
 ```
 
-复制示例配置：
+复制配置模板：
 
 ```bash
 # macOS / Linux
@@ -60,134 +47,106 @@ cp .endless-code/config.yaml.example .endless-code/config.yaml
 Copy-Item .endless-code/config.yaml.example .endless-code/config.yaml
 ```
 
-推荐通过环境变量提供 API 密钥：
+设置所需的 API key。推荐使用环境变量，不要把真实 key 写入配置文件：
 
 ```bash
-# macOS / Linux
-export DEEPSEEK_API_KEY="your-key"
+export ANTHROPIC_API_KEY="your-key"
 export OPENAI_API_KEY="your-key"
+export DEEPSEEK_API_KEY="your-key"
 ```
+
+Windows PowerShell：
 
 ```powershell
-# Windows PowerShell
-$env:DEEPSEEK_API_KEY = "your-key"
+$env:ANTHROPIC_API_KEY = "your-key"
 $env:OPENAI_API_KEY = "your-key"
+$env:DEEPSEEK_API_KEY = "your-key"
 ```
 
-启动应用：
+启动：
 
 ```bash
 endless-code
-
-# 或
-python -m endless_code
 ```
 
-## 配置
+## 配置 Provider
 
-`.endless-code/config.yaml` 可以配置一个或多个 Provider：
+配置文件为 `.endless-code/config.yaml`，可以同时配置多个 Provider，启动后选择要使用的模型：
 
 ```yaml
 providers:
+  - name: anthropic
+    protocol: anthropic
+    model: claude-3-5-sonnet-latest
+    api_key: $ANTHROPIC_API_KEY
+
+  - name: openai
+    protocol: openai
+    model: gpt-4o
+    api_key: $OPENAI_API_KEY
+    # 可选：第三方 OpenAI 兼容服务
+    # base_url: https://example.com/v1
+
   - name: deepseek
     protocol: deepseek
     model: deepseek-chat
     base_url: https://api.deepseek.com
     api_key: $DEEPSEEK_API_KEY
     thinking: false
-
-  - name: openai
-    protocol: openai
-    model: gpt-4o
-    api_key: $OPENAI_API_KEY
 ```
 
-`api_key` 支持 `$VAR_NAME` 环境变量引用或明文值。建议始终使用环境变量，避免密钥进入配置文件、
-终端历史或版本控制。
-
-配置文件按以下顺序查找：
+`api_key` 支持 `$VAR_NAME` 环境变量引用，也支持明文值，但生产环境应优先使用环境变量。配置文件查找顺序为：
 
 1. 当前目录 `.endless-code/config.yaml`
 2. 用户目录 `~/.config/endless-code/config.yaml`
 
-只配置一个 Provider 时自动启用；配置多个 Provider 时，启动后输入编号选择。OpenAI 兼容服务可通过
-`protocol: openai` 与自定义 `base_url` 接入。DeepSeek 可设置 `thinking: true` 启用扩展思考。
+## 使用方式
 
-## 使用
-
-直接描述希望完成的结果，例如：
+直接输入任务，Agent 会自主检索、修改和验证：
 
 ```text
-检查这个项目的测试失败，定位原因，修复后运行相关测试。
+定位这个项目的测试失败原因，修复后运行相关测试。
 ```
 
-Agent 会根据需要自行搜索代码、读取文件、修改实现并执行验证。常用命令和快捷键如下：
+常用命令：
 
 | 输入 | 行为 |
-|---|---|
+| --- | --- |
 | `Enter` | 提交消息 |
 | `/plan` | 进入只读计划模式 |
-| `/do` | 退出计划模式并立即执行已有计划 |
-| `Esc` | 取消当前 Agent 回合 |
-| `Ctrl+C` | 运行时取消当前回合；空闲时退出 |
+| `/do` | 退出计划模式并执行当前计划 |
+| `Esc` | 取消当前回合 |
+| `Ctrl+C` | 运行时取消回合，空闲时退出 |
 | `Ctrl+D` | 退出程序 |
 | `/exit`、`/quit` | 退出程序 |
 
-### Plan / Do 示例
+## 系统提示与缓存
 
-```text
-/plan
-分析认证模块的耦合点，并给出重构计划。
+稳定系统提示由身份、约束、任务模式、动作执行、工具约定、表达风格和输出格式等模块按优先级组装。工具定义与稳定提示保持固定顺序，便于使用 Provider 的前缀缓存。
 
-/do
-```
+每轮请求另外注入：
 
-Plan Mode 同时通过系统提示和工具定义限制写入：模型只能使用 `read_file`、`glob`、`grep`。
-执行 `/do` 后恢复 `write_file`、`edit_file`、`bash`，并立即基于上文计划开始工作。
+- 当前工作目录、平台、日期、版本、模型和可用 Git 状态。
+- 不写入持久化对话历史的 `<system-reminder>`。
+- Plan Mode 的完整或精简轮次提醒。
 
-## 工具与调度
+Anthropic 使用 `cache_control.type: ephemeral` 标记稳定 system 块；OpenAI 和 DeepSeek 使用各自返回的缓存 usage 字段。端点不提供缓存字段时，usage 会以 `0` 展示，不影响对话继续。
 
-| 工具 | 类型 | 用途 |
-|---|---|---|
-| `read_file` | 只读 | 带行号读取文件 |
-| `glob` | 只读 | 按 Glob 模式查找文件 |
-| `grep` | 只读 | 使用正则搜索文件内容 |
-| `write_file` | 有副作用 | 写入文件并创建父目录 |
-| `edit_file` | 有副作用 | 对唯一匹配内容进行替换 |
-| `bash` | 有副作用 | 执行 Shell 命令并返回退出码与输出 |
+## 工具与安全边界
 
-同一轮中的连续只读调用可以并发执行。副作用工具构成串行边界，所有结果仍按模型原始调用顺序展示并回灌。
-大文件、长命令输出和大量搜索结果会被截断并明确标记。
+`edit_file` 编辑前必须先读取目标文件，`bash` 描述明确优先使用专用读写搜索工具。工具输出、错误信息和 TUI 内容会进行敏感值脱敏。
 
-## 安全边界
-
-endless-code 会清理取消或超时后的异步任务和命令子进程，并对可见输出进行密钥脱敏。
-
-当前版本**没有文件系统沙箱，也没有工具执行前审批**。模型可以访问当前用户有权限访问的路径，
-并可执行 Shell 命令。请在可信代码库和权限受限的开发环境中运行，并在执行前使用 `/plan`
-检查高风险任务的操作方案。
-
-## 项目结构
-
-```text
-src/endless_code/
-├── agent/              # 可取消 ReAct Agent Loop、停止条件与工具调度
-├── llm/                # Provider 抽象、DeepSeek 与 OpenAI 适配器
-├── tool/               # 工具协议、注册中心和六个内置工具
-├── tui/                # Textual 界面、事件渲染、模式与取消交互
-├── config.py           # YAML 配置加载、校验与环境变量展开
-├── conversation.py     # 多轮对话与工具历史
-├── prompt.py           # 系统提示、Plan Mode 与执行指令
-├── security.py         # 输出脱敏与工具参数摘要
-└── cli.py              # 命令行入口
-```
+当前版本不提供文件系统沙箱或工具执行审批。模型可以访问当前用户有权限访问的路径，也可以执行 shell 命令。请在可信代码库和受控开发环境中使用，并在高风险任务前先运行 `/plan`。
 
 ## 开发与验证
 
 ```bash
 python -m pytest -q
+python -m pytest -q -W error::ResourceWarning
 python -m ruff format --check .
 python -m ruff check .
+python -m compileall -q src examples
+python examples/smoke.py --provider openai
 ```
 
 项目采用 Spec 驱动开发：

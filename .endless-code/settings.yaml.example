@@ -1,0 +1,23 @@
+# Endless Code 权限配置示例
+#
+# 配置文件查找顺序（优先级从低到高）：
+#   1. ~/.config/endless-code/settings.yaml       （用户级）
+#   2. .endless-code/settings.yaml                （项目级）
+#   3. .endless-code/settings.local.yaml          （本地级，gitignore）
+#
+# 本地级优先级最高；同层 deny 优先于 allow。
+# 只读工具（read_file / glob / grep）默认即 Allow，
+# allow 规则主要用于提前放行 Bash / write_file / edit_file，
+# deny 规则可对只读做围栏（如 Read(.env)）。
+
+# 启动时的默认权限模式（四档：default / acceptEdits / plan / bypassPermissions）
+default_mode: default
+
+permissions:
+  allow:
+    - "Bash(git *)"
+    - "Bash(pytest)"
+  deny:
+    - "Bash(rm *)"
+    - "Read(.env)"
+    - "Write(.env)"

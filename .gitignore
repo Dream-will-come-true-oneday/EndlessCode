@@ -1,5 +1,6 @@
 # 真实密钥文件（不提交）
 .endless-code/config.yaml
+.endless-code/settings.local.yaml
 
 # Python
 __pycache__/

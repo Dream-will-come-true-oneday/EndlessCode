@@ -1,9 +1,10 @@
-"""Textual TUI：Agent 事件渲染、模式、用量与取消。"""
+"""Textual TUI：Agent 事件渲染、四档权限模式、审批交互与取消。"""
 
 import asyncio
 import time
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import ClassVar
 
 from rich.markdown import Markdown
@@ -15,13 +16,23 @@ from textual.timer import Timer
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from endless_code import __version__
-from endless_code.agent import Agent, Mode, Phase
+from endless_code.agent import Agent, ApprovalRequest, Phase
 from endless_code.config import ConfigError, ProviderConfig
 from endless_code.conversation import Conversation
 from endless_code.llm import Provider, new_provider
+from endless_code.permission import Mode, Outcome
+from endless_code.permission.engine import Engine, new_engine
 from endless_code.prompt import EXECUTE_DIRECTIVE
 from endless_code.security import redact_sensitive, summarize_tool_args
 from endless_code.tool import Registry, new_default_registry
+
+MODE_LABELS = {
+    Mode.DEFAULT: "DEFAULT",
+    Mode.ACCEPT_EDITS: "ACCEPT EDITS",
+    Mode.PLAN: "PLAN",
+    Mode.BYPASS: "BYPASS",
+}
+OUTCOME_BY_INDEX = [Outcome.ALLOW_ONCE, Outcome.ALLOW_FOREVER, Outcome.DENY_ONCE]
 
 
 class SessionState(Enum):
@@ -30,6 +41,7 @@ class SessionState(Enum):
     SELECTING = "selecting"
     IDLE = "idle"
     STREAMING = "streaming"
+    APPROVING = "approving"
 
 
 @dataclass
@@ -37,6 +49,10 @@ class ToolDisplay:
     call_id: str
     name: str
     args: str
+
+
+def next_mode(mode: Mode) -> Mode:
+    return Mode((int(mode) + 1) % 4)
 
 
 class EndlessCodeApp(App):
@@ -75,6 +91,7 @@ class EndlessCodeApp(App):
         ("ctrl+d", "quit", "退出"),
         ("ctrl+c", "cancel_or_quit", "取消/退出"),
         ("escape", "cancel_turn", "取消本轮"),
+        ("shift+tab", "cycle_mode", "切换权限模式"),
     ]
 
     def __init__(
@@ -82,6 +99,7 @@ class EndlessCodeApp(App):
         providers: list[ProviderConfig],
         registry: Registry | None = None,
         version: str = __version__,
+        engine: Engine | None = None,
     ) -> None:
         super().__init__()
         self._providers = providers
@@ -90,7 +108,8 @@ class EndlessCodeApp(App):
         self._tool_registry = registry or new_default_registry()
         self._conv = Conversation()
         self._state = SessionState.SELECTING
-        self._mode = Mode.NORMAL
+        self._engine = engine or new_engine(str(Path.cwd().resolve()))[0]
+        self._mode: Mode = self._engine.start_mode()
         self._cur_reply = ""
         self._cur_tools: list[ToolDisplay] = []
         self._turn_start = 0.0
@@ -101,6 +120,8 @@ class EndlessCodeApp(App):
         self._turn_cancel: asyncio.Event | None = None
         self._timer: Timer | None = None
         self._secrets: set[str] = set()
+        self.pending: ApprovalRequest | None = None
+        self.approve_cursor: int = 0
         for provider in providers:
             try:
                 secret = provider.resolve_api_key()
@@ -167,9 +188,9 @@ class EndlessCodeApp(App):
     def _update_status(self) -> None:
         provider_name = self._provider.name if self._provider else "--"
         model = self._provider.model if self._provider else "--"
-        mode = "PLAN" if self._mode is Mode.PLAN else "NORMAL"
+        mode_label = MODE_LABELS.get(self._mode, str(self._mode))
         self.sub_title = (
-            f"{provider_name} | {model} | {mode} | "
+            f"{mode_label} | {provider_name} | {model} | "
             f"↑{self._usage_in} ↓{self._usage_out} tok"
         )
 
@@ -178,7 +199,7 @@ class EndlessCodeApp(App):
             Panel(
                 RichText.from_markup(
                     f"[bold]endless-code v{__version__}[/]\n"
-                    "输入消息后按 Enter 提交，输入 /exit 退出。"
+                    "输入消息后按 Enter 提交，Shift+Tab 切换权限模式，输入 /exit 退出。"
                 ),
                 title="欢迎",
             )
@@ -246,7 +267,7 @@ class EndlessCodeApp(App):
             self._update_status()
             return
         if text == "/do":
-            self._mode = Mode.NORMAL
+            self._mode = Mode.DEFAULT
             self._write_notice("已退出计划模式，开始执行上文计划。")
             self._update_status()
             self._start_turn(EXECUTE_DIRECTIVE, display_user=False)
@@ -275,6 +296,8 @@ class EndlessCodeApp(App):
 
     def _tick(self) -> None:
         elapsed = time.monotonic() - self._turn_start
+        if self._state is SessionState.APPROVING:
+            return
         if self._cur_tools:
             lines = [f"● {tool.name}({tool.args}) Running…" for tool in self._cur_tools]
             self._streaming.update(
@@ -294,16 +317,91 @@ class EndlessCodeApp(App):
         else:
             self._chat.write(Markdown(self._safe(text)))
 
+    def _render_approval(self) -> None:
+        req = self.pending
+        if req is None:
+            return
+        args = summarize_tool_args(req.name, req.args, self._secrets)
+        lines = [
+            f"● {req.name}({args})",
+            f"  原因：{req.reason}",
+            "  是否继续？",
+        ]
+        for idx, label in enumerate(
+            ["允许本次", "永久允许（写入本地配置）", "拒绝本次"]
+        ):
+            prefix = "> " if idx == self.approve_cursor else "  "
+            lines.append(f"{prefix}{idx + 1}. {label}")
+        lines.append("  ↑↓ 选择 · Enter 确认 · Esc 取消")
+        self._streaming.remove_class("hidden")
+        self._streaming.update("\n".join(lines))
+
+    def _update_approving(self, key: str) -> None:
+        if self.pending is None or self._state is not SessionState.APPROVING:
+            return
+        index: int | None = None
+        if key in ("up", "k"):
+            self.approve_cursor = (self.approve_cursor - 1) % 3
+            self._render_approval()
+            return
+        if key in ("down", "j"):
+            self.approve_cursor = (self.approve_cursor + 1) % 3
+            self._render_approval()
+            return
+        if key in ("enter", "space"):
+            index = self.approve_cursor
+        elif key in ("1", "2", "3"):
+            index = int(key) - 1
+        elif key == "y":
+            index = 0
+        elif key in ("n", "d"):
+            index = 2
+        if index is None:
+            return
+        self._submit_approval(index)
+
+    def _submit_approval(self, index: int) -> None:
+        req = self.pending
+        if req is None:
+            return
+        outcome = OUTCOME_BY_INDEX[index]
+        self._state = SessionState.STREAMING
+        self.pending = None
+        self.approve_cursor = 0
+        if not req.respond.done():
+            req.respond.set_result(outcome)
+        self._tick()
+
+    def update_approving(self, key: str) -> None:
+        """对外暴露的待批准按键入口，转发给内部实现。"""
+        self._update_approving(key)
+
+    def _resolve_pending_deny(self) -> None:
+        req = self.pending
+        if req is None:
+            return
+        self.pending = None
+        self.approve_cursor = 0
+        if not req.respond.done():
+            req.respond.set_result(Outcome.DENY_ONCE)
+
     async def _consume_agent_events(self) -> None:
         provider = self._provider
         cancel = self._turn_cancel
         if provider is None or cancel is None:
             self._end_turn()
             return
-        agent = Agent(provider, self._tool_registry, self._version)
+        agent = Agent(provider, self._tool_registry, self._version, self._engine)
         terminal = False
         try:
             async for event in agent.run(self._conv, self._mode, cancel):
+                if event.approval is not None:
+                    self._flush_reply()
+                    self.pending = event.approval
+                    self.approve_cursor = 0
+                    self._state = SessionState.APPROVING
+                    self._render_approval()
+                    continue
                 if event.text:
                     self._cur_reply += event.text
                 elif event.tool is not None:
@@ -332,7 +430,10 @@ class EndlessCodeApp(App):
             self._flush_reply()
             self._write_error(f"{type(exc).__name__}: {exc}")
         finally:
-            if not terminal and self._state is SessionState.STREAMING:
+            if not terminal and self._state in (
+                SessionState.STREAMING,
+                SessionState.APPROVING,
+            ):
                 self._end_turn()
 
     def _handle_tool_event(self, event) -> None:
@@ -364,6 +465,8 @@ class EndlessCodeApp(App):
         self._cur_reply = ""
         self._cur_tools.clear()
         self._iteration = 0
+        if self._state in (SessionState.STREAMING, SessionState.APPROVING):
+            self._resolve_pending_deny()
         self._state = SessionState.IDLE
         self._input.disabled = False
         self._input.focus()
@@ -371,14 +474,57 @@ class EndlessCodeApp(App):
         self._stream_task = None
 
     def action_cancel_or_quit(self) -> None:
-        if self._state is SessionState.STREAMING and self._turn_cancel is not None:
+        if (
+            self._state in (SessionState.STREAMING, SessionState.APPROVING)
+            and self._turn_cancel is not None
+        ):
+            self._resolve_pending_deny()
             self._turn_cancel.set()
         else:
             self.exit()
 
     def action_cancel_turn(self) -> None:
-        if self._state is SessionState.STREAMING and self._turn_cancel is not None:
+        if (
+            self._state in (SessionState.STREAMING, SessionState.APPROVING)
+            and self._turn_cancel is not None
+        ):
+            self._resolve_pending_deny()
             self._turn_cancel.set()
+
+    def action_cycle_mode(self) -> None:
+        if self._state is not SessionState.IDLE:
+            return
+        self._mode = next_mode(self._mode)
+        self._write_notice(f"已切换到 {MODE_LABELS.get(self._mode)} 模式")
+        self._update_status()
+
+    def on_key(self, event) -> None:
+        if self._state is SessionState.APPROVING:
+            key = event.key
+            if key in (
+                "up",
+                "down",
+                "k",
+                "j",
+                "enter",
+                "space",
+                "1",
+                "2",
+                "3",
+                "y",
+                "n",
+                "d",
+                "escape",
+                "ctrl+c",
+            ):
+                if key in ("escape", "ctrl+c"):
+                    self._resolve_pending_deny()
+                    self._turn_cancel and self._turn_cancel.set()
+                else:
+                    self._update_approving(key)
+                event.stop()
+                return
+        super().on_key(event)
 
     async def action_quit(self) -> None:
         task = self._stream_task

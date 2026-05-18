@@ -1,191 +1,235 @@
-# 系统提示工程化 Tasks
+# 权限系统 Tasks
+
+> 包名：`endless_code`（Python 3.12+）。源码位于 `src/endless_code/`，新增子包 `endless_code.permission`。
 
 ## 文件清单
 
 | 操作 | 文件 | 职责 |
 |---|---|---|
-| 修改 | pyproject.toml | 增加 Anthropic SDK 依赖并保持现有版本范围 |
-| 删除 | src/endless_code/prompt.py | 迁移为 prompt 子包，避免模块/包同名冲突 |
-| 新建 | src/endless_code/prompt/__init__.py | Prompt 公共导出与兼容导出 |
-| 新建 | src/endless_code/prompt/modules.py | Module、固定模块和可选空模块 |
-| 新建 | src/endless_code/prompt/environment.py | 环境数据结构、Git 降级采集与渲染 |
-| 新建 | src/endless_code/prompt/reminder.py | system-reminder、Plan reminder、执行指令 |
-| 修改 | src/endless_code/config.py | 支持 anthropic protocol、API key 和 base_url |
-| 修改 | src/endless_code/llm/__init__.py | System、Request、缓存 Usage 与 Provider 接口 |
-| 新建 | src/endless_code/llm/anthropic_provider.py | Anthropic system/cache/message/stream 适配 |
-| 修改 | src/endless_code/llm/openai_provider.py | Request、环境块、reminder、cached_tokens |
-| 修改 | src/endless_code/llm/deepseek_provider.py | Request、环境块、reminder、prompt cache usage |
-| 修改 | src/endless_code/tool/edit_file.py | 强化编辑前读取描述 |
-| 修改 | src/endless_code/tool/bash.py | 强化专用工具优先描述 |
-| 修改 | src/endless_code/agent/__init__.py | 构造 Request、环境、轮次 reminder 和缓存透传 |
-| 修改 | src/endless_code/tui/app.py | 传入版本并保留既有模式/取消行为 |
-| 修改 | src/endless_code/cli.py | 传递应用版本、支持三 Provider 配置选择 |
-| 新建 | examples/smoke.py | 打印三协议输入/输出/缓存 usage |
-| 新建 | tests/test_config.py | 三协议配置、环境变量和 base_url |
-| 新建 | tests/test_prompt.py | 模块装配、环境降级和 reminder |
-| 新建 | tests/test_anthropic_provider.py | Anthropic system/cache/reminder/usage |
-| 修改 | tests/test_llm.py | OpenAI/DeepSeek Request 接口与缓存 usage |
-| 修改 | tests/test_agent.py | FakeProvider、Request、轮次 reminder、缓存透传 |
-| 修改 | tests/test_tui.py | 新接口下的 TUI 回归 |
-| 修改 | tests/test_tool.py | 工具 description 强化回归 |
+| 新建 | `src/endless_code/permission/__init__.py` | 包对外门面：导出 `Mode`/`Decision`/`Category`/`Outcome`/`Engine`/`new_engine`/`persist_local_allow`/`ApprovalError`；`Mode` 四档 + `str`/`parse_mode` |
+| 新建 | `src/endless_code/permission/blacklist.py` | 内置危险命令正则集 + `hits_blacklist`（不可配，N1） |
+| 新建 | `src/endless_code/permission/sandbox.py` | `resolve_root`、`sandbox_ok`、`eval_symlinks_or_ancestor`（N2） |
+| 新建 | `src/endless_code/permission/rule.py` | `Rule`/`RuleSet`、`parse_rule`、`match`、`match_pattern`（glob） |
+| 新建 | `src/endless_code/permission/settings.py` | `Settings` YAML、`load_settings`、`to_rule_set`、`friendly_name`、`categorize`、`extract_target` |
+| 新建 | `src/endless_code/permission/engine.py` | `Engine`、`new_engine`、`check` 前四层流水线、`mode_fallback`、`start_mode` |
+| 新建 | `src/endless_code/permission/persist.py` | `rule_for`、`persist_local_allow`（写本地层文件） |
+| 新建 | `tests/test_permission_*.py` | 黑名单/沙箱（含祖先回退）/规则/优先级/矩阵/加载降级/解析失败单测 |
+| 改 | `src/endless_code/agent/__init__.py` | 删 `Mode`（迁 permission）；`Agent` 加 `engine`；执行链接入 `check`；`request_approval`；`ApprovalRequest` 事件；Deny 用 `ToolResult` 构造 |
+| 改 | `tests/test_agent.py` | 权限集成(Allow/Deny/Ask/永久)、保序回灌、只读并发不退化、取消、模式迁移 |
+| 改 | `src/endless_code/tui/app.py` | `mode`→`permission.Mode`、加 `engine`/`pending`/`approve_cursor`；`APPROVING` 态分派；全局 ctrl+c/esc 覆盖 approving；`shift+tab` 循环模式 |
+| 改 | `tests/test_tui.py` | `shift+tab` 循环、approval 态按键回传、Esc 取消兜底、状态栏模式、模式跨轮保持；既有 `/plan`·`/do` 用例适配新 `Mode` |
+| 改 | `src/endless_code/cli.py` | 构造 `permission.new_engine(root)` 注入 `tui.EndlessCodeApp` |
+| 改 | `examples/smoke.py` | 新增 cwd、构造引擎、`Mode.BYPASS` 运行 |
+| 改 | `.gitignore` | 追加 `.endless-code/settings.local.yaml` |
+| 新建 | `.endless-code/settings.yaml.example` | 权限配置示例（default_mode + allow/deny） |
 
-## T1: 建立 Prompt 模块化基础
+---
 
-文件：src/endless_code/prompt.py、src/endless_code/prompt/__init__.py、src/endless_code/prompt/modules.py
-依赖：无
+## T1: permission 基础类型
 
-步骤：
+**文件：** `src/endless_code/permission/__init__.py`
+**依赖：** 无
 
-1. 将现有系统提示固定内容拆成身份、系统约束、任务模式、动作执行、工具使用、语气风格、文本输出七个 Module。
-2. 增加三个空的可选模块：自定义指令、已激活 Skill、长期记忆。
-3. 实现按 priority 升序拼接、跳过空内容并以空行分隔的 assemble_system。
-4. 在 prompt/__init__.py 导出 build_system_prompt 和旧名称兼容常量，迁移现有 import。
-5. 删除旧的 src/endless_code/prompt.py，保证 from endless_code.prompt import ... 仍可用。
+**步骤：**
+1. `class Mode(IntEnum)`：`DEFAULT`/`ACCEPT_EDITS`/`PLAN`/`BYPASS`。
+2. `Mode.__str__` → `"default"`/`"acceptEdits"`/`"plan"`/`"bypassPermissions"`。
+3. `def parse_mode(s: str) -> tuple[Mode, bool]`：大小写不敏感识别四档名，未知返回 `(Mode.DEFAULT, False)`。
+4. `class Decision(IntEnum)`：`ALLOW`/`DENY`/`ASK`；`class Category(IntEnum)`：`READ`/`WRITE`/`EXEC`。
+5. `class Outcome(IntEnum)`：`DENY_ONCE`/`ALLOW_ONCE`/`ALLOW_FOREVER`（人在回路三选一）。
+6. 暴露后续会被 agent/tui import 的符号：`Mode`、`Decision`、`Category`、`Outcome`、`Engine`、`new_engine`、`persist_local_allow`、`ApprovalError`。
 
-验证：运行 python -m pytest tests/test_prompt.py -q -k 'module or assemble'，预期固定模块顺序正确、空模块不产生多余空行，且旧导入路径可用。
+**验证：** `python -c "from endless_code.permission import Mode, parse_mode, Outcome; assert parse_mode('bypassPermissions') == (Mode.BYPASS, True); assert parse_mode('x') == (Mode.DEFAULT, False)"` 跑通。
 
-## T2: 实现环境信息和动态提醒
+## T2: 危险命令黑名单
 
-文件：src/endless_code/prompt/environment.py、src/endless_code/prompt/reminder.py、tests/test_prompt.py
-依赖：T1
+**文件：** `src/endless_code/permission/blacklist.py`
+**依赖：** 无
 
-步骤：
+**步骤：**
+1. 模块级 `_BLACKLIST: list[re.Pattern]`，编译一组高危模式：`rm -rf /`、`rm -fr ~`、`dd of=/dev/`、fork bomb、`mkfs.`、重定向覆盖磁盘设备、`chmod -R 777 /` 等。
+2. `def hits_blacklist(command: str) -> bool`：`any(p.search(command) for p in _BLACKLIST)`。
+3. 顶部 docstring 声明「启发式、非完备、不可配置放开」（N1）。
 
-1. 实现 Environment 与 gather_environment(version, model)，收集工作目录、平台、日期、Git 状态、版本和模型。
-2. Git 命令使用有界执行；非 Git 目录、超时或异常时只返回空 Git 状态，不抛出到 Agent。
-3. 实现 Environment.render，不得读取或渲染 API key、环境变量值或其它敏感配置。
-4. 实现 system_reminder 标签包裹、完整/精简 plan_reminder 和 EXECUTE_DIRECTIVE。
-5. 为固定环境、Git 降级、标签格式、完整/精简提醒增加测试。
+**验证：** `python -c "from endless_code.permission.blacklist import hits_blacklist; assert hits_blacklist('rm -rf /'); assert not hits_blacklist('git status')"` 跑通。
 
-验证：运行 python -m pytest tests/test_prompt.py -q，预期包含环境字段、Git 降级和 system-reminder 断言的测试全部通过。
+## T3: 路径沙箱
 
-## T3: 扩展配置和依赖
+**文件：** `src/endless_code/permission/sandbox.py`
+**依赖：** T1（Engine）
 
-文件：pyproject.toml、src/endless_code/config.py、tests/test_config.py
-依赖：无
+**步骤：**
+1. `def resolve_root(root: str) -> str`：`Path(root).expanduser().resolve(strict=True)`（失败抛 `FileNotFoundError`）。
+2. `def eval_symlinks_or_ancestor(abs_path: str) -> str`：存在则 `Path.resolve(strict=True)`；不存在则逐级取最近已存在祖先 `resolve(strict=True)` 后拼接剩余段。
+3. `def sandbox_ok(engine: Engine, path: str) -> bool`：空 path 视为 root；相对路径相对 `engine.root` 解析为绝对；`resolved = eval_symlinks_or_ancestor(abs_path)`；返回 `resolved == root or resolved.startswith(root + os.sep)`。用 `pathlib` / `os.sep`，不硬编码 `/`。
 
-步骤：
+**验证：** 单测用 `tmp_path` 造 root 内/外文件、符号链接、多级未创建中间目录，断言 root 内放行、`/etc/passwd`/`../outside`/指向外部软链接被拒。
 
-1. 增加 anthropic SDK 依赖，保留 Python、Textual、OpenAI 和 PyYAML 约束。
-2. 将 protocol 校验扩展为 anthropic、deepseek、openai。
-3. 保留 OpenAI/DeepSeek 的 base_url；Anthropic 缺省使用官方地址，允许显式覆盖。
-4. 保持  展开、缺失 key 的 ConfigError 和多 Provider 加载顺序。
-5. 为三种协议、环境变量 key、缺省/自定义 base_url 和非法 protocol 增加测试；测试不得打印 key。
+## T4: 规则与匹配
 
-验证：运行 python -m pytest tests/test_config.py -q，预期三协议配置均可解析，缺失环境变量得到结构化错误。
+**文件：** `src/endless_code/permission/rule.py`
+**依赖：** T1
 
-## T4: 迁移公共 LLM 请求接口
+**步骤：**
+1. `@dataclass class Rule`：`tool`/`pattern`/`allow`；`@dataclass class RuleSet`：`allow`/`deny` 列表。
+2. `def parse_rule(s: str) -> tuple[Rule, bool]`：解析 `Tool(pattern)` 或 `Tool`；括号不配对/空串非法返回 `(Rule("", "", False), False)`。
+3. `def match_pattern(pattern: str, target: str) -> bool`：`pattern == ""` → True；命令串用 glob（`*` 任意字符、`**` 等价 `*`）；文件路径按 `/` 分段，`*` 段内任意字符、`**` 跨段。
+4. `RuleSet.match(friendly, target)`：先遍历 deny 再 allow；命中返回 `(Decision.DENY/ALLOW, True)`，否则 `(Decision.ALLOW, False)`。
 
-文件：src/endless_code/llm/__init__.py、tests/test_llm.py
-依赖：T1、T2
+**验证：** 单测 `Bash(git *)` 放行 `git status`、不放过 `npm i`；`Write(src/**)` 放行 `src/a/b.py`、不放 `docs/x`；同层 deny 优先。
 
-步骤：
+## T5: 配置加载与映射
 
-1. 新增 System 和 Request dataclass，区分 stable、environment、messages、tools 和 reminder。
-2. 为 Usage 增加 cache_write、cache_read，默认值为 0。
-3. 将 Provider Protocol 改为 stream(req: Request)，保留 StreamEvent 的文本、工具、usage、done、err 语义。
-4. 更新 FakeProvider 及公共测试构造，确保旧 Agent 行为的测试可以迁移。
+**文件：** `src/endless_code/permission/settings.py`
+**依赖：** T1、T4
 
-验证：运行 python -m pytest tests/test_llm.py -q -k 'request or usage'，预期 Request 字段和缓存 Usage 默认值/透传测试通过。
+**步骤：**
+1. `@dataclass class Settings`：`default_mode: str`、`permissions: PermissionsBlock`。
+2. `def load_settings(path: str) -> Settings`：文件不存在 → 空 `Settings`；`yaml.safe_load` 失败 → 抛 `SettingsError`（调用方降级，N5）。
+3. `def to_rule_set(s: Settings) -> RuleSet`：allow/deny 各条 `parse_rule`，非法条目跳过。
+4. `def friendly_name(internal: str) -> str`：`bash→Bash, read_file→Read, write_file→Write, edit_file→Edit, glob→Glob, grep→Grep`；未知原样返回。
+5. `def categorize(internal: str, read_only: bool) -> Category`：`read_only→READ`；否则 `write_file/edit_file→WRITE`；其余（含 bash、未知）→EXEC（N7 最严）。
+6. `def extract_target(call: ToolCall) -> tuple[str, bool, bool]`：`read_file/write_file/edit_file` 取 `path`（is_file=True）；`glob/grep` 取搜索根 `path`，空→"."（is_file=True）；`bash` 取 `command`（is_file=False）；未知工具→("", False, False)；`json.loads` 失败或缺必填字段→`ok=False`。
 
-## T5: 实现 Anthropic Provider
+**验证：** 缺失文件得空且不抛；非法 YAML 抛 `SettingsError`；`to_rule_set` 跳过非法项；`friendly_name`/`categorize`/`extract_target` 各分支正确。
 
-文件：src/endless_code/llm/anthropic_provider.py、tests/test_anthropic_provider.py
-依赖：T4
+## T6: 引擎与前四层流水线
 
-步骤：
+**文件：** `src/endless_code/permission/engine.py`
+**依赖：** T1、T2、T3、T4、T5
 
-1. 使用 AsyncAnthropic 和 ProviderConfig 创建客户端；支持默认和自定义 base_url。
-2. 将 stable system 序列化为带 cache_control.type=ephemeral 的文本块，environment 序列化为无缓存控制的第二文本块。
-3. 按 Anthropic content block 协议转换历史、工具调用和工具结果，保持 call ID 配对。
-4. 将 reminder 追加到末条可追加消息的 content block；必要时创建合法 user 消息，不修改传入 Conversation。
-5. 解析文本分片、工具 JSON 分片、完成/错误和 cache_creation_input_tokens、cache_read_input_tokens。
-6. 在异步 generator 的 finally 中关闭响应和辅助任务。
-7. 用 Fake AsyncAnthropic/FakeStream 覆盖 system 顺序、缓存断点、reminder、usage、工具调用和关闭。
+**步骤：**
+1. `@dataclass class Engine`：`root`、`blacklist`、`user/project/local RuleSet`、`local_path`、`start_mode`。
+2. `def new_engine(root: str) -> tuple[Engine, Exception | None]`：
+   - `try: root = resolve_root(root) except Exception as e`：失败时 `engine.root` 退化为传入值、四层规则空、`start_mode=Mode.DEFAULT`，仍返回非 None engine + e。
+   - 加载三层：user=`~/.config/endless-code/settings.yaml`、project=`<root>/.endless-code/settings.yaml`、local=`<root>/.endless-code/settings.local.yaml`；各 `load_settings`→`to_rule_set`；单文件读/解析失败仅降级跳过。
+   - `local_path = <root>/.endless-code/settings.local.yaml`。
+   - `start_mode`：依次取 local/project/user 的 `default_mode`（parse_mode 成功者优先，local 优先），皆无→`Mode.DEFAULT`。
+3. `def mode_fallback(mode: Mode, cat: Category) -> Decision`：只产 Allow/Ask，矩阵见 spec F5。
+4. `Engine.check(mode, call, read_only)`：
+   - `cat = categorize(call.name, read_only)`；`friendly = friendly_name(call.name)`；`target, is_file, ok = extract_target(call)`。
+   - ① `cat == EXEC and target != "" and hits_blacklist(target)` → `(DENY, "命中危险命令黑名单：<target>")`。
+   - ② `is_file`：`not ok` → `(DENY, "无法解析文件路径参数，安全拒绝")`；否则 `not sandbox_ok(...)` → `(DENY, "路径在项目目录之外：<target>")`。
+   - ③ 按 `local → project → user` 顺序 `match(friendly, target)`；命中即返回。
+   - ④ `mode_fallback(mode, cat)` → `(ALLOW, "")` 或 `(ASK, "<mode> 模式下 <category> 类操作需确认")`。
+5. `Engine.start_mode()` 返回 `self._start_mode`。
 
-验证：运行 python -m pytest tests/test_anthropic_provider.py -q，预期请求 payload、缓存标记、提醒注入和流关闭断言全部通过。
+**验证：** 单测逐层短路、跳层放行、模式矩阵、三级优先级、`resolve_root` 失败仍得非 None 引擎。
 
-## T6: 迁移 OpenAI 与 DeepSeek Provider
+## T7: 本地永久规则写入
 
-文件：src/endless_code/llm/openai_provider.py、src/endless_code/llm/deepseek_provider.py、tests/test_llm.py
-依赖：T4
+**文件：** `src/endless_code/permission/persist.py`
+**依赖：** T5、T6
 
-步骤：
+**步骤：**
+1. `def rule_for(call: ToolCall) -> tuple[Rule, str, bool]`：据 `extract_target` + `friendly_name` 生成精确规则；`Bash(<command>)` / `Write(<relpath>)` 等；glob 元字符转义；解析失败→`(Rule("","",False), "", False)`。
+2. `Engine.persist_local_allow(call)`：`load_settings(local_path)`（缺失则空）→ 追加规则到 `permissions.allow` 并去重 → `yaml.safe_dump` → 确保父目录存在 → 写文件 → 同步 `self.local.allow`。异常向上抛，由 agent 侧捕获仅记日志不阻断。
 
-1. 将两个 Provider 的输入改为 Request，stable system 放在请求前缀，environment 位于稳定块之后。
-2. OpenAI/DeepSeek reminder 使用尾部 user 消息，不写入 Conversation。
-3. 保持工具定义顺序、thinking/extra_body、分片工具参数和异步关闭逻辑。
-4. 解析 OpenAI prompt_tokens_details.cached_tokens 与 DeepSeek 可用 prompt cache 字段；缺失时为零。
-5. 更新 FakeStream 测试，覆盖两 Provider 的同一 Request 语义、base_url、usage 和 reminder。
+**验证：** 单测（`tmp_path` 作 root）：`persist_local_allow` 后本地文件含 allow 条目；重新 `new_engine` 后同一调用判 Allow；重复持久化不重复写。
+## T8: agent 接入权限（模式迁移 + 判定 + 人在回路）
 
-验证：运行 python -m pytest tests/test_llm.py -q，预期 OpenAI、DeepSeek 测试全部通过且缺省缓存字段不报错。
+**文件：** `src/endless_code/agent/__init__.py`
+**依赖：** T6、T7
 
-## T7: 强化工具约定
+**步骤：**
+1. **模式迁移**：删除 agent 内 `Mode` 定义，`from endless_code.permission import Mode`；`run` 形参 `mode: Mode`；`mode == Mode.PLAN` 处不变（defs 选只读、plan_reminder 注入）。
+2. `Agent.__init__` 增加 `engine: Engine | None = None`；未传入时用 `permission.new_engine(str(Path.cwd().resolve()))[0]`。
+3. 新增 `@dataclass class ApprovalRequest`：`name`/`args`/`reason`/`respond`；`Event` 增加 `approval: ApprovalRequest | None = None`。
+4. `request_approval(call, reason) -> Outcome`：创建 `asyncio.Future[Outcome]`，发 `Event(approval=ApprovalRequest(...))`，`await respond`；`CancelledError` 原样上抛走取消收尾。
+5. `execute_batched`（沿用现有 `_execute_events` 结构，增加 mode 参数）：
+   - 只读批：每个 `k` 先 `engine.check(mode, calls[k], True)`；Deny 直接预置 `ToolResult(..., is_error=True)` 且不纳入 `asyncio.gather`；Allow 照旧并发；不产 ApprovalRequest。
+   - 串行批：先 `engine.check(mode, calls[i], False)`；Allow 执行；Deny 构造被拒结果；Ask → `outcome = await request_approval(...)`；`ALLOW_ONCE` 执行；`ALLOW_FOREVER` 先 `persist_local_allow`（异常仅 logger.warning）再执行；`DENY_ONCE` 构造被拒结果。
+   - Deny 与 Allow 项结果按原调用序与各自 `tool_call_id` 配对，互不串位。
+6. `run` 调用 `_execute_events(calls, cancel, execution, mode)`，并把 `self.engine` 传给执行链路。
 
-文件：src/endless_code/tool/edit_file.py、src/endless_code/tool/bash.py、tests/test_tool.py
-依赖：T1
+**验证：** `python -c "from endless_code.agent import Agent"` 不抛；轻量自检：表驱动断言 `request_approval` 在 `asyncio.CancelledError` 抛出时正确传播、不阻塞。
 
-步骤：
+## T9: agent 单测
 
-1. 在 edit_file 描述中明确编辑前必须先读取目标文件。
-2. 在 bash 描述中明确优先使用 read/write/edit/glob/grep 专用工具。
-3. 保持工具执行行为、超时、退出码和安全摘要不变。
-4. 增加 description 文本回归断言。
+**文件：** `tests/test_agent.py`
+**依赖：** T8
 
-验证：运行 python -m pytest tests/test_tool.py -q -k 'description or Registry'，预期工具注册顺序和强化文本通过。
+**步骤：**
+1. 既有用例适配：`Agent(provider, registry, version, engine)`；`Mode.NORMAL`→`Mode.DEFAULT`；fake provider 签名不变。
+2. 新增：
+   - **Deny 回灌不中断**：构造沙箱外路径或 deny 规则 → 工具结果 `is_error`，Loop 继续到次轮。
+   - **保序回灌**：单批含「被拒调用 + 放行调用」→ 结果按原 `calls` 下标、各自 `tool_call_id` 正确配对。
+   - **Ask 人在回路**：default 下请求 `write_file` → 收到 `ApprovalRequest` → `respond.set_result(Outcome.ALLOW_ONCE/DENY_ONCE)`，断言执行/回灌生效。
+   - **永久放行**：选 `ALLOW_FOREVER` → 断言 `local_path` 文件被写、含 allow 条目。
+   - **只读并发不退化**：一批只读不产生任何 `ApprovalRequest`；被沙箱拦的只读得 errResult、其余仍并发完成。
+   - **取消**：在 `ApprovalRequest` 等待中 `task.cancel()` → Loop 干净收尾、历史合法、无挂起 task。
+   - **plan 迁移**：`Mode.PLAN` 仍只放只读工具、注入计划提醒。
 
-## T8: 接入 Agent Request 和 Plan reminder
+**验证：** `pytest tests/test_agent.py -q`；`pytest --timeout=30 tests/test_agent.py` 无超时；`python -X dev` 跑测试无 `RuntimeWarning: coroutine ... was never awaited`。
 
-文件：src/endless_code/agent/__init__.py、tests/test_agent.py
-依赖：T2、T4、T5、T6
+## T10: TUI 接入（模式切换 + 待批准态）
 
-步骤：
+**文件：** `src/endless_code/tui/app.py`
+**依赖：** T8
 
-1. Agent 构造函数接收并保存应用 version。
-2. 每次 run 开始构造稳定 system 和 environment，按 mode 选择全量或只读 tools。
-3. 增加 PLAN_REMINDER_INTERVAL=4；首轮和间隔轮次使用完整提醒，其余轮次使用精简提醒。
-4. 每轮组装 Request 调用 Provider，透传缓存 usage 到 Event.usage。
-5. 确保 reminder 不写入 Conversation，不改变既有 assistant/tool 历史、取消、错误、批量执行和停止条件。
-6. 更新 FakeProvider 记录 Request，增加 stable/environment/reminder/tools/cache usage 断言。
+**步骤：**
+1. `EndlessCodeApp.mode: permission.Mode`；加 `engine`、`pending: ApprovalRequest | None`、`approve_cursor: int = 0`；`__init__` 增加 `engine: Engine | None = None`，默认 `permission.new_engine(str(Path.cwd().resolve()))[0]`，`self._mode = engine.start_mode()`。
+2. `SessionState.APPROVING` 枚举值；`on_key` 在 `APPROVING` 分派 `update_approving`。
+3. **全局 ctrl+c/esc**：条件从 `self._state == SessionState.STREAMING` 改为 `self._state in (SessionState.STREAMING, SessionState.APPROVING)`；approving 态取消时先 `self.pending.respond.set_result(Outcome.DENY_ONCE)` 再取消本轮。
+4. **shift+tab**：新增 `case "shift+tab":`（仅 `IDLE` 生效）`self._mode = next_mode(self._mode)` 并写提示；`next_mode(m: Mode) -> Mode` 为模块小函数，`Mode((int(m) + 1) % 4)`，循环 `DEFAULT→ACCEPT_EDITS→PLAN→BYPASS→DEFAULT`。
+5. `_consume_agent_events`：`if event.approval is not None:` → 保存 `self.pending`、重置光标、切 `APPROVING`、渲染待批准块；等待用户回传后继续 `async for`。
+6. `update_approving(key)`：`up`/`k`、`down`/`j` 循环移动光标；`enter`/`space` 提交当前项；数字键 `1`/`2`/`3` 直选；`y`=ALLOW_ONCE、`n`/`d`=DENY_ONCE；提交后 `respond.set_result(outcome)`、回 `STREAMING`、清 pending。
+7. `submit`：保留 `/plan`（→`Mode.PLAN`）、`/do`（→`Mode.DEFAULT`，固定回 default 并触发执行）、`/exit`；不新增 `/mode` 命令。
+8. `status_bar`：左侧常驻显示当前权限模式（`DEFAULT`/`ACCEPT EDITS`/`PLAN`/`BYPASS`，取代 provider 名）；右侧模型名 + token 用量不变。
 
-验证：运行 python -m pytest tests/test_agent.py -q，预期原有 Agent 场景和新增 Request、Plan reminder、缓存透传测试全部通过。
+**验证：** `python -m endless_code` 启动可进 idle；自动化部分见 T11。
 
-## T9: 接入配置、TUI 和 smoke
+## T11: TUI 单测
 
-文件：src/endless_code/cli.py、src/endless_code/tui/app.py、examples/smoke.py
-依赖：T3、T8
+**文件：** `tests/test_tui.py`
+**依赖：** T10
 
-步骤：
+**步骤：**
+1. 既有 `/plan`·`/do` 用例适配 `permission.Mode`（`Mode.PLAN`/`Mode.DEFAULT`）。
+2. 新增（Textual `App.run_test()` + `Pilot`）：
+   - 连续 `shift+tab`（idle）→ `app.mode` 依次 `DEFAULT→ACCEPT_EDITS→PLAN→BYPASS→DEFAULT`，每次有提示写入 RichLog。
+   - 注入 `ApprovalRequest` 事件 → `app.state == APPROVING`、`pending` 已设、`approve_cursor == 0`；`down`+`enter` → respond 收到 `ALLOW_FOREVER`；数字键 `1`→`ALLOW_ONCE`、`3`→`DENY_ONCE`。
+   - approving 态按 `escape`/`ctrl+c` → respond 收到兜底 `DENY_ONCE`，应用未退出。
+   - `status_bar` 左侧显示对应模式名，不包含 provider 名。
+   - **模式跨轮保持**：Shift+Tab 切到 `ACCEPT_EDITS` 后再 `begin_turn`，`app.mode` 仍为 `ACCEPT_EDITS`。
 
-1. Provider 工厂和 CLI 传入应用版本，保留多 Provider 选择与缺失 key 降级。
-2. TUI 构造 Agent 时传入 version；保留 /plan、/do、Esc、Ctrl+C、状态和历史行为。
-3. 新建 smoke 脚本，加载配置，连续执行两轮最小请求，打印输入/输出/cache_write/cache_read，不打印密钥。
-4. smoke 对不存在缓存字段按 0 展示，对 provider 错误返回非零并保留可读错误。
+**验证：** `pytest tests/test_tui.py -q`（带 pytest-asyncio + Textual 测试工具）。
 
-验证：运行 python -m pytest tests/test_tui.py -q；使用 FakeProvider 运行 smoke 测试入口，预期 TUI 测试通过且 smoke 输出不含 key。
+## T12: cli / smoke / 配置文件接线
 
-## T10: 更新回归测试和工程检查
+**文件：** `src/endless_code/cli.py`、`examples/smoke.py`、`.gitignore`、`.endless-code/settings.yaml.example`
+**依赖：** T6、T8、T10
 
-文件：tests/test_config.py、tests/test_prompt.py、tests/test_anthropic_provider.py、tests/test_llm.py、tests/test_agent.py、tests/test_tui.py、tests/test_tool.py
-依赖：T1-T9
+**步骤：**
+1. `cli.py`：`root = str(Path.cwd().resolve())`；`engine, err = permission.new_engine(root)`；`if err is not None: print("权限引擎降级:", err, file=sys.stderr)` 后继续；`app = EndlessCodeApp(cfg.providers, registry, version=__version__, engine=engine)`。
+2. `examples/smoke.py`：`cwd = str(Path.cwd().resolve())`；`engine, _ = permission.new_engine(cwd)`；`agent = Agent(provider, new_default_registry(), __version__, engine)`；`await agent.run(conversation, mode=Mode.BYPASS)`。
+3. `.gitignore`：追加 `.endless-code/settings.local.yaml`。
+4. `.endless-code/settings.yaml.example`：示例 `default_mode: default`；`permissions.allow: ["Bash(git *)", "Bash(pytest)"]`；`permissions.deny: ["Bash(rm *)", "Read(.env)", "Write(.env)"]`；注释说明三层文件与优先级，并注明只读类默认即 Allow，allow 规则主要用于提前放行 Bash/Write，deny 规则可对只读做围栏。
 
-步骤：
+**验证：** `python -m endless_code` 能正常启动进对话；`python examples/smoke.py` 在 `Mode.BYPASS` 下不阻塞、跑完；`git check-ignore .endless-code/settings.local.yaml` 命中。
 
-1. 执行每个前置任务的验证命令并修复失败。
-2. 增加跨协议请求装配测试：stable 相同、environment/reminder 动态、tools 顺序稳定。
-3. 增加既有 Agent Loop 多轮、取消、流错误、Plan/Do、历史和脱敏回归。
-4. 检查测试输出、Git diff 和配置忽略规则，不允许真实 key 或临时文件进入变更。
+## T13: 全量编译测试与规范
 
-验证：依次运行 python -m ruff format .、python -m ruff format --check .、python -m ruff check .、python -m compileall -q src、python -m pytest -q 和 python -m pytest -q -W error::ResourceWarning，预期全部退出码为 0。
+**文件：** —
+**依赖：** T1—T12
+
+**步骤：**
+1. `python -m ruff format --check .` 通过（本地 `ruff format .` 已统一）。
+2. `python -m ruff check .` 无告警（permission 子包按本地包分组，import 顺序正确）。
+3. `python -m pytest` 通过；`pytest --timeout=30 tests/test_agent.py tests/test_permission_*.py tests/test_tui.py` 无超时。
+4. （可选）`python -m mypy src/endless_code` 通过（含 permission 子包）。
+5. 确认 `.endless-code/settings.local.yaml` 已被 gitignore；检索输出无 api_key 明文。
+6. 端到端：default 下写文件触发 Ask 弹窗；Shift+Tab 切到 bypassPermissions 后不再 Ask、状态栏左侧显示 `BYPASS`；`rm -rf /` 在 bypass 下仍被拦。
+
+**验证：** 全部通过。
 
 ## 执行顺序
 
-T1 -> T2
-T3 -> T4 -> T5
-       |     |
-       +----> T6
-T1 -> T7
-T2,T4,T5,T6 -> T8 -> T9
-T1-T9 -> T10
+```text
+T1(类型) → T2(黑名单) → T3(沙箱) → T4(规则) → T5(配置/映射) → T6(引擎/流水线) → T7(规则写入)
+T6,T7 → T8(agent 接入) → T9(agent 单测)
+T8 → T10(TUI 接入) → T11(TUI 单测)
+T6,T8,T10 → T12(cli/smoke/配置)
+全部 → T13(ruff/pytest/mypy/端到端)
+```
 
-所有任务完成后，逐项执行 checklist.md；未通过项必须修复并重跑，不以静态推断代替验证。
+（依赖：T5→{T1,T4}；T6→{T1,T2,T3,T4,T5}；T7→{T5,T6}；T8→{T6,T7}；T9→T8；T10→T8；T11→T10；T12→{T6,T8,T10}；T13→全部。）

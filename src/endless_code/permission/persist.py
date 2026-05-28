@@ -35,6 +35,12 @@ def rule_for(engine: Engine, call: ToolCall) -> tuple[Rule, str, bool]:
     """为一次具体调用生成精确 allow 规则（Rule + YAML 串）。"""
     target, is_file, ok = extract_target(call)
     friendly = friendly_name(call.name)
+
+    # MCP 工具：以 mcp__<server>__<tool> 为精确 allow 规则，无 pattern 段
+    if call.name.startswith("mcp__"):
+        rule = Rule(tool=call.name, pattern="", allow=True)
+        return rule, call.name, True
+
     if not ok or friendly not in _KNOWN_FRIENDLY:
         return Rule("", "", False), "", False
 

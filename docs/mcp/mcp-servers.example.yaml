@@ -1,0 +1,29 @@
+# Endless Code MCP 服务器配置示例
+#
+# 复制本文件内容到以下任一位置（优先级从低到高，同名 server 项目级完整覆盖用户级）：
+#   1. ~/.config/endless-code/mcp.yaml          （用户级）
+#   2. .endless-code/mcp.yaml                   （项目级）
+#
+# env / headers 的值支持 ${VAR} 从宿主环境变量展开；command / args 不展开。
+# 未定义的环境变量展开为空串 + stderr 一次性告警，不阻断启动。
+#
+# 连接失败 / 配置非法 / 超时的 server 会被跳过，其余 server 与内置工具照常可用。
+
+mcp_servers:
+  github:
+    type: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"          # 从宿主环境展开，密钥不入配置
+
+  local-sqlite:
+    type: stdio
+    command: python
+    args: ["-m", "mcp_server_sqlite", "--db", "./data.db"]
+
+  example-http:
+    type: http
+    url: "https://mcp.example.com/mcp"
+    headers:
+      Authorization: "Bearer ${EXAMPLE_TOKEN}"  # 自定义 HTTP 头，也支持 ${VAR}

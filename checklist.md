@@ -1,58 +1,49 @@
-# 权限系统 Checklist
+```Markdown
+# MCP 客户端 Checklist
 
-> 每一项通过运行代码或观察行为来验证，聚焦系统行为；括号内为验证方式与对应需求。函数/类型名仅作定位提示，核验断言本身不依赖其命名（重命名实现而行为不变时本清单仍适用）。
+> 每一项通过运行代码或观察行为来验证；函数 / 类型名仅作定位提示，核验断言本身不依赖其命名（重命名实现而行为不变时本清单仍适用）。
 
 ## 实现完整性
-
-- [ ] 黑名单硬拦截：对 `rm -rf /`、`rm -fr ~`、fork bomb、写块设备等命令做权限判定，结果为 Deny 且不执行（验证：单测对这些命令调用判 Deny；端到端观察被拒回灌）。（AC1/F1）
-- [ ] 黑名单不可绕过：在 bypassPermissions 模式下，同样的黑名单命令仍判 Deny（验证：单测在 bypass 模式下对 `rm -rf /` 仍得 Deny）。（AC1/N1）
-- [ ] 沙箱围栏：对项目根之外的路径（如 `/etc/passwd`、`../outside`）做文件操作判 Deny；项目内路径放行（验证：单测用 `tmp_path` 造内外路径断言裁决）。（AC2/F2）
-- [ ] 沙箱防逃逸顺序：构造一个位于项目内、但指向项目外目录的软链接，对其做文件操作判 Deny（验证：单测用 `Path.symlink_to` 建软链接断言「先解析再比对」生效）。（AC2/N2）
-- [ ] 沙箱新建文件祖先回退：对项目内、但中间多级目录尚未创建的新建文件路径，判 Allow（验证：单测专测目标不存在时回退到最近已存在祖先的分支）。（AC2/N2）
-- [ ] 规则精确与 glob 匹配：`Bash(git status)` 放行 `git status` 而不放行 `git push`；`Bash(git *)` 放行所有 git；`Write(src/**)` 放行 `src/a/b.py` 而不放行 `docs/x`（验证：规则单测断言匹配结果）。（AC3/F3）
-- [ ] deny 规则正向拦截：单独一条 deny 规则（如 `Bash(git push)` deny）命中时判定为 Deny（验证：引擎单测构造该 deny 规则对 `git push` 断言 Deny）。（AC3/F3）
-- [ ] 同层 deny 优先：同一层 allow 与 deny 都命中时判 Deny（验证：规则/引擎单测）。（AC5/F4）
-- [ ] 友好名路由：规则里的 Bash/Read/Write/Edit/Glob/Grep 正确作用到对应的 6 个内置工具（验证：单测用友好名规则对相应工具调用断言命中）。（AC4/F3）
-- [ ] 模式矩阵：default(只读放行/写·命令执行需确认)、acceptEdits(写放行/命令执行需确认)、bypass(全放行)、plan(仅只读可见且其写/命令执行兜底仍为需确认)，逐档逐类裁决正确（验证：引擎单测对每档每类断言最终裁决值，含 plan 行 Write/Exec=Ask）。（AC7/F5）
-- [ ] 流水线短路与跳层：黑名单命中不再走沙箱/规则；deny 规则命中不再走模式；allow 规则命中直接放行；非命令执行工具不被黑名单误拦、命令执行工具不被沙箱误拦而是继续后续层（验证：引擎单测按层构造样例断言短路与跳层放行）。（AC8/F6）
-- [ ] 安全默认（分三路）：(a) 未注册工具名 → 归命令执行类、判需确认/拒绝而非放行；(b) 参数 JSON 无法解析的文件类调用 → 判拒绝（不静默放行）；(c) 只读标志缺失/类别不明 → 按有副作用处理（验证：引擎单测对三类畸形调用分别断言不被直接放行）。（AC15/N7）
+- [x] 加载两层配置：两文件存在时按 server 名合并、同名 server 项目级完整覆盖用户级（验证：单测构造两层文件断言合并结果与字段来源）。(AC1/F1)
+- [x] 配置降级：任一文件缺失视为空、格式非法跳过该文件 + stderr 告警 + 其它正常加载，不致启动失败（验证：单测分别投喂缺失与非法 YAML，断言 `load_config` 不抛异常且其它层 server 仍在）。(AC1/N1)
+- [x] 字段校验：stdio 缺 command、http 缺 url、`type` 非法或缺失，均跳过该 server + stderr 给出原因，其它 server 不受影响（验证：单测分别构造各非法 server）。(AC2/N2)
+- [x] `${VAR}` 展开：env / headers 的值被展开；未定义变量展开为空串 + 一次性告警；command / args / 工具名 / server 名不展开（验证：单测覆盖各分支，含 `command: ${X}` 应保留字面量）。(AC3/F3)
+- [x] stdio 连接 + 握手 + 列工具：能拉起一个 MCP server 子进程并由 SDK 完成 `session.initialize()` + `session.list_tools()`；`env` 被注入到子进程环境（验证：用单测脚本启动一个最小 echo MCP server 或 tmux 实跑 `@modelcontextprotocol/server-everything`）。(AC4/F4/F6)
+- [x] HTTP 连接 + 自定义 headers：能对 HTTP MCP server 完成握手 + 列工具；`headers` 真正出现在每个 HTTP 请求中（验证：用 `pytest-httpx` 或 `httpx.MockTransport` 起一个最小 HTTP 端点 + 注入 `Authorization` 头，断言 server 端收到该头）。(AC5/F5/F6/N6)
+- [x] 工具命名：所有 MCP 工具的 `name` 形如 `mcp__<server>__<tool>`；前缀拼接后含 LLM 工具名禁用字符（非 `[A-Za-z0-9_-]`）的工具被跳过并告警（验证：单测构造含 `.` 的 server 名 / 工具名，断言 `adapt_tool` 返回 `None`）。(AC6/AC7/F8)
+- [x] 命名空间隔离：同一 tool 名在不同 server 互不覆盖；与 6 个内置工具天然不重名（验证：registry 注册后断言全名集合无重复）。(AC7/F8)
+- [x] 工具适配字段：description 空 → 兜底文案；schema 透传为 `dict[str, Any]`、空 schema 兜底 `{"type": "object"}`；`annotations.readOnlyHint==True` → `read_only is True`，其它（含 None / False）→ `False`（验证：单测覆盖各分支，含 `annotations is None` None-safe）。(AC6/F7)
+- [x] 调用结果聚合：`execute` 把远端多个 text content 块按顺序拼成 `content`；非 text 块（image/audio/resource_link/embedded_resource）静默丢弃 + 单 tool 限一次告警（验证：`test_mcp_tool` 注入 stub 返回混合内容块，断言 collected 仅含 text 且告警计数为 1）。(AC6/F7)
+- [x] 远端错误映射：远端 `isError==True` 时 `ToolResult.is_error is True`，`content` 仍为远端 text（验证：`test_mcp_tool` 注入 stub 返回 `isError=True` + text 块）。(AC6/F7)
+- [x] 协议错与超时回灌：`call_tool` 抛异常或 30s `asyncio.wait_for` 超时 → `is_error is True` 且 `content` 含可读错因，Agent Loop 不中断（验证：`test_mcp_tool` 注入 stub 抛异常 / 阻塞至超时，断言 `is_error` 与文案）。(AC9/F7/F10/N5)
+- [x] 启动失败隔离：有 server 连接 / 握手 / 列工具失败时，只跳过它自身，其它 server 与内置工具集照常注册可用（验证：`test_mcp_manager` 用一个失败 server + 一个 stub 成功 server，断言成功 server 工具被注册）。(AC8/F9/N1)
+- [x] 30s 启动超时：模拟连接卡住的 server 在（测试中缩短的）超时窗口结束后被跳过，启动不阻塞超过该窗口（验证：`test_mcp_manager` 注入连接 stub `await asyncio.Event().wait()` + `monkeypatch.setattr(manager, "connect_timeout", 0.2)`，断言 `new_manager` 在超时窗口附近返回）。(AC8/F9/N1)
+- [x] 退出干净：`Manager.close()` 通过 `AsyncExitStack.aclose()` 终止所有 stdio 子进程、断开 HTTP 会话；某 session 关闭卡住时 5s 兜底返回不阻塞（验证：`test_mcp_manager` 注入 `__aexit__` 阻塞的 fake 上下文 + 短兜底，断言 `close()` 在兜底时间内返回；tmux 实跑退出后 `ps` 无残留子进程）。(AC10/F11/N7)
 
 ## 集成
-
-- [ ] 拒绝回灌不中断：被拒工具调用回灌错误结果，Agent Loop 继续下一轮（验证：脚本化 fake 首轮请求被拒工具，断言结果为错误且进入次轮）。（AC11/F9）
-- [ ] 保序配对回灌：单批同时含「被拒调用 + 放行调用」时，两者结果按原调用下标顺序、各自调用 ID 正确配对回灌（被拒为错误、放行为正常），互不串位（验证：agent 单测构造混合批断言结果数组顺序与 ID 配对）。（AC11/F9/N3）
-- [ ] 人在回路三选一：default 下请求写文件触发多行待批准块；选「允许本次」→执行；「拒绝本次」→回灌错误；「永久」→执行且写本地配置（验证：agent 单测对 `respond` Future 调 `set_result` 各选项断言行为）。（AC10/F8）
-- [ ] 永久放行持久化：选「永久」后，本地层配置文件新增对应精确 allow 条目；以新引擎重新加载配置后，同一调用判放行（验证：单测断言文件内容 + 重载后裁决）。（AC10/F8）
-- [ ] 层级就近优先：本地层 deny 盖过项目层 allow、本地盖项目、项目盖用户（验证：引擎单测构造三层冲突规则断言裁决顺序）。（AC5/F4）
-- [ ] 只读并发不退化：一批连续只读调用不产生任何待批准请求、仍并发执行（`asyncio.gather`）；其中被沙箱拦的只读得错误结果而其余照常并发完成（验证：agent 单测断言无 ApprovalRequest 事件、并发批结果齐备且含被拒项）。（AC13/N3）
-- [ ] 取消安全：人在回路等待中取消本轮 → Loop 干净收尾、对话历史角色合法、不退出程序、无挂起 asyncio task（验证：agent 单测在待批准等待中 `task.cancel()`，超时保护 + `asyncio.all_tasks()` 断言通过）。（AC12/N4）
-- [ ] 运行时切换模式（Shift+Tab）：连续按 Shift+Tab 循环 default→acceptEdits→plan→bypassPermissions→default，当前模式依次正确改变、状态栏左侧常驻显示当前模式（不显示 provider 名）、切换不改已加载规则（验证：tui 单测模拟 shift+tab 断言模式序列与状态栏文本）。（AC9/F7）
-- [ ] 模式跨轮保持：切换模式后发起新一轮对话，模式维持上次切换值、不被本轮启动重置（验证：tui 单测切到 acceptEdits 后 begin_turn 断言模式不变）。（AC9/F7）
-- [ ] 启动默认模式：本地/项目/用户三层配置的默认模式按 本地>项目>用户 生效、皆无则 default（验证：单测三层各设不同默认模式断言生效层；含 default_mode=plan 启动即应用只读工具集+计划提醒）。（AC18/F4）
-- [ ] 配置降级：三层文件缺失时引擎按空规则运行；某文件格式非法时跳过该文件、其余正常、不致引擎构造失败、不抛未捕获异常（验证：单测传非法配置内容断言降级不抛致命错误）。（AC6/N5）
-- [ ] 跨协议一致：provider 适配层无 permission 相关改动（验证：按实际 provider 模块路径核对 diff 无改动）；anthropic 与 openai 各跑同一拦截场景行为一致。（AC14/N6）
-- [ ] 可扩展性：新增一档模式只改模式兜底表、新增一层防御只在流水线插一层，改动不触及 provider 适配层（验证：核对正常改动的 diff 范围局限在 permission 模块）。（AC19/N9）
-- [ ] 不破坏既有 Agent Loop / Plan Mode：多轮连环、用户取消、流出错恢复、历史一致、缓存命中、规划按轮次注入仍成立（验证：跑既有端到端关键场景；`pytest` 通过）。（AC16/N3）
+- [x] 权限链路自然命中：无规则时 `readOnlyHint=True` 的 MCP 工具走 Read 兜底（default 直接放行）、其余走 Exec 兜底（default Ask）；allow 规则 `mcp__<server>__*` 命中时直接放行；bypass 模式放行（验证：用 `PermissionEngine` 对 mcp 全名调用断言裁决；tmux 实跑见场景 4）。(AC11/F12/N4)
+- [x] permission 包仅最小必要改动：`engine.check` 把「未知工具 Ask」移到规则命中之后（否则 `mcp__<server>__*` allow 规则永不命中）；`persist.rule_for` 为 `mcp__` 前缀工具直接生成精确 allow 规则（否则「永久允许」写不出规则）；内置工具行为不变，由 `tests/test_permission.py` 新增 mcp 用例守护。(N4)
+- [x] provider 适配层零改动：`src/endless_code/llm/anthropic_provider.py`、`src/endless_code/llm/openai_provider.py` 无修改（验证：核对 diff）。(AC12/N3)
+- [x] 黑名单 / 沙箱对 MCP 工具自动跳过：MCP 工具调用 `extract_target` 返回 `("", False, False)` → 黑名单层因 `target==""` 不命中、沙箱层因 `is_file is False` 不进入（验证：用 permission 的 `check` 对一次 mcp 全名调用断言不被黑名单/沙箱直接 Deny）。(AC11/F12)
+- [x] 既有能力不退化：`pytest` 全过，既有用例不需要适配（验证：运行测试套件）。(AC13/N5)
 
 ## 编译与测试
+- [x] `python -m endless_code` 在合法配置下能进 TUI（含 / 不含 mcp 配置两种）。
+- [x] `ruff format --check .` 无 diff。
+- [x] `ruff check .` 无告警。
+- [x] `pytest` 通过（含 `tests/test_mcp_config.py` / `tests/test_mcp_tool.py` / `tests/test_mcp_manager.py`，以及既有 config / conversation / tool / agent / prompt / permission / tui 单测）。
+- [x] `pytest --asyncio-mode=auto tests/test_mcp_manager.py` 无悬挂 task / 死锁、无 `RuntimeWarning: coroutine ... was never awaited`（重点守护 Manager 并发连接、共享状态、close 兜底）。(N7/N8)
+- [x] （可选）`mypy src/endless_code/mcp` 通过。
+- [x] 凭据不落盘：配置示例 / 文档 / 测试 fixture 全用 `${VAR}`；`git grep -E '(Bearer|sk-|ghp_|github_pat_)[A-Za-z0-9_-]{16,}'` 在本次开发期间无命中。(AC14/N6)
 
-- [ ] `python -m endless_code` 能正常启动（在合法配置下进入 TUI）。
-- [ ] `python examples/smoke.py` 在 `Mode.BYPASS` 下不阻塞、跑完。
-- [ ] `python -m ruff check .` 无告警（含 permission 子包）。
-- [ ] `python -m ruff format --check .` 通过（或本地 `ruff format .` 已统一格式）。
-- [ ] `python -m pytest` 通过（config/conversation/tool/agent/prompt/permission/tui 单测）。
-- [ ] `pytest --timeout=30 tests/test_agent.py tests/test_permission_*.py tests/test_tui.py` 无超时（重点守护人在回路阻塞/取消）。（N4）
-- [ ] （可选）`python -m mypy src/endless_code` 通过（含 permission 子包）。
-- [ ] 含密钥的本地配置层已被 gitignore（验证：`git check-ignore .endless-code/settings.local.yaml` 命中）；对话区与任何输出均不出现 api_key（验证：检索输出）。（AC17）
-
-## 端到端场景（Textual TUI 自动化/手动实跑）
-
-- [ ] 场景 1（default 写需确认）：default 模式下让模型写一个新文件 → 弹出多行人在回路待批准块（工具名 + 参数 + 触发原因 + 三选菜单）；选「允许本次」→ 文件被写，Loop 继续。（AC10/F8）
-- [ ] 场景 2（拒绝→改路径→完成闭环）：让模型写项目外路径 → 被拒（含「路径在项目目录之外」原因）→ 模型在后续轮改写到项目内合法路径并成功完成任务，体现「拒绝回灌让模型调整而非终止」。（AC11/F9）
-- [ ] 场景 3（菜单交互）：待批准块用 ↑↓ 移动高亮 + 回车确认；数字键 1/2/3 亦可直选；默认高亮「允许本次」。（AC10/F8）
-- [ ] 场景 4（永久放行 + 文件产物）：对某调用选「永久」→ (a) 用 cat/grep 确认本地层配置文件出现该精确 allow 条目；(b) 重启 endless-code 后同调用不再弹窗直接执行。（AC10/F8）
-- [ ] 场景 5（acceptEdits）：Shift+Tab 切到 acceptEdits（状态栏左侧显示 `ACCEPT EDITS`）后再改文件不弹窗直接执行，但命令执行仍弹窗。（AC7/F5）
-- [ ] 场景 6（bypass + 黑名单兜底）：Shift+Tab 循环到 bypassPermissions（状态栏左侧显示 `BYPASS`）后普通命令不弹窗；但让模型跑 `rm -rf /` 仍被黑名单拦下、回灌被拒。（AC1/AC7/N1）
-- [ ] 场景 7（沙箱拦截）：让模型读 `/etc/passwd` 或写项目外路径 → 被沙箱拦、回灌「路径在项目目录之外」，模型据此停手或改项目内路径。（AC2/F2）
-- [ ] 场景 8（plan 不变）：`/plan` 仅放只读工具产出计划、`/do` 执行——沿用现有 Plan Mode 行为不退步。（AC9/F7）
-- [ ] 场景 9（取消）：人在回路弹窗时按 Esc → 干净回到空闲、不退出程序；再发一条消息可继续、不报 400。（AC12/N4）
+## 端到端场景（tmux 实跑）
+> 注：本周期在 Windows 环境无 tmux、无真实模型 API key，场景 2/4/5/7 需在 Unix + 交互式 TUI + 真实模型的条件下人工实跑。其余场景已用等价手段验证：场景 1（临时项目无 mcp 配置实跑）、场景 3（坏 server + 好 server 实跑）、场景 6（e2e 脚本断言无残留子进程）、场景 8（`tests/test_mcp_http.py` 起真实本地 HTTP server 验证）。
+- [x] 场景 1（无 MCP 配置）：仓库内不存在 `.endless-code/mcp.yaml` 与 `~/.config/endless-code/mcp.yaml` 时，endless-code 正常进 TUI；registry 仅含 6 个内置工具；stderr 无 mcp 相关告警。(AC1)
+- [ ] 场景 2（stdio server 接入）：在 `.endless-code/mcp.yaml` 配置 `@modelcontextprotocol/server-everything` 一类真实 server，启动后日志显示 server 连接成功 + 工具数；TUI 中让模型调用其中一个工具（如 echo），default 模式弹人在回路 → 「允许本次」→ 工具结果回灌 → 模型续答。(AC4/AC6/AC11)
+- [x] 场景 3（失败隔离）：配置一个不存在 command 的 server + 一个能跑的 server，启动 stderr 有第一个 server 的失败告警；能跑的 server 工具仍可用、能正常调用。(AC8)
+- [ ] 场景 4（永久放行 + 重启）：场景 2 中选「永久允许」→ `.endless-code/settings.local.yaml` 出现对应 `mcp__<server>__<tool>` allow 规则；重启 endless-code 后再调该工具不再弹窗直接执行。(AC11)
+- [ ] 场景 5（凭据展开）：配置 `env: { GITHUB_TOKEN: "${GITHUB_TOKEN}" }`；`unset GITHUB_TOKEN` 启动时 stderr 有 undefined 告警但 server 仍尝试启动（server 自决报错与否）；`export GITHUB_TOKEN=...` 后正常工作。(AC3/AC14)
+- [x] 场景 6（退出干净）：退出 endless-code（`/exit` 或 Ctrl+C）后 `ps -ef | grep server-everything`（或对应 server 进程名）确认子进程无残留。(AC10)
+- [ ] 场景 7（bypass + 黑名单兜底）：Shift+Tab 切到 bypassPermissions，MCP 工具调用不弹窗；让模型跑内置 `bash` 工具 `rm -rf /` 仍被黑名单拦下、回灌被拒。(AC11/N4)
+- [x] 场景 8（HTTP server，可选）：本地起一个最小 HTTP MCP server 或用 `pytest-httpx` mock，配置 http 类型 + `headers: { Authorization: "Bearer ${TOKEN}" }`；启动后工具被注册；调用时 server 端日志可见 Authorization 头。(AC5)
+```

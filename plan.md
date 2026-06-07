@@ -1,348 +1,311 @@
-# 权限系统 Plan
+~~~Markdown
+# MCP 客户端 Plan
 
-> 技术栈：Python 3.12+；沿用 `anthropic` / `openai` 官方 SDK（本阶段不改 provider 适配层）。权限判定全部落在 agent 编排层与新增的 `endless_code.permission` 模块，与协议无关。
+> 技术栈：Python 3.12+；使用 **官方 SDK** `mcp`（`pip install mcp` / `uv add mcp`，import 名 `mcp`）承载协议层（JSON-RPC 编解码、`initialize` 握手、stdio 与 Streamable HTTP 传输）。本章新增 **`endless_code.mcp` 子包** 与入口装配，**不改 tool / agent / llm / config / conversation / prompt**；permission / tui 各有一处最小必要改动（见下）。
 
 ## 架构概览
 
-本阶段新增一个 **permission 子包**承载前四层防御与配置加载，并在 **agent 模块**把判定接入工具执行链、由 agent 编排承担第五层人在回路；**tui 模块**新增「待批准」交互态；**cli** 负责装配引擎并注入。`llm` / provider 适配层不改（N6 跨协议一致天然成立）。
+- **`endless_code.mcp` 子包（新增）**：承载 MCP 客户端的全部职责——配置加载与两层合并、`${VAR}` 展开、字段校验、调用 SDK 建立 stdio / HTTP 会话、把远端工具适配成内置 `Tool` 协议、统一管理生命周期。仅依赖 `endless_code.tool`、SDK 与标准库；不依赖 agent / tui / permission / conversation。
+- **`endless_code.cli`（改造）**：在 `tool.default_registry()` 之后、`permission.PermissionEngine(...)` 与 `EndlessCodeApp(...).run()` 之前，加载 mcp 配置 → 启动 Manager → 把 Manager 产出的工具注册进 registry → 退出时 `await manager.close()`（包在 `try/finally` 中）。
+- **`endless_code.tool` 包（零改）**：`Registry.register` 与 `Tool` 协议本就是开放抽象，直接吃 `McpTool` 实例；`is_read_only` 对 MCP 工具返回正确值。
+- **agent / tui 包（零改）**：工具流转链路对工具来源透明。
+- **permission 包（最小必要改动）**：`friendly_name` 对未知名原样返回 → 规则可写 `mcp__<server>__<tool>`；`categorize` 在 `read_only==True` 时走 CategoryRead、否则归 CategoryExec → 模式兜底矩阵自然命中；`extract_target` 对未知工具返回 `("", False, False)`，黑名单与沙箱自动跳过。两处必要适配：① `engine.check` 把「未知工具 Ask」移到规则命中之后，否则 `mcp__<server>__*` allow 规则永不命中；② `persist.rule_for` 为 `mcp__` 前缀工具直接生成精确 allow 规则（含无 pattern 段），否则「永久允许」写不出 MCP 规则。内置工具行为不变，由新增单测守护。tui 另有一处取消修复（`_turn_cancel` None-safe 判空，原代码永不触发 set()）。
+- **llm / provider（零改）**：工具定义透传，协议无关。
 
-> 五层边界澄清：`permission.Engine.check` 实现**前四层**（黑名单/沙箱/规则/模式兜底），以返回 `Ask` 作为「请走第五层」的信号；第五层人在回路由 agent 在 Ask 后编排驱动（发 ApprovalRequest 事件、await 用户决策）。二者合称五层。
-
-- **permission 子包（新增）**：定义 `Mode`（四档 IntEnum）、`Decision`（Allow/Deny/Ask）、`Category`（Read/Write/Exec）、`Outcome`（三选一）；实现前四层判定 `check`；持有黑名单正则集、沙箱（项目根 + 符号链接解析）、三级规则集（user/project/local 三个配置文件）、模式兜底矩阵、友好名映射与路径提取。对外暴露 `check`、本地规则持久化、配置加载。仅依赖 `llm`（取 `ToolCall`）与标准库 + `pyyaml`。
-- **agent 模块（改造）**：`Mode` 类型从本模块迁到 `endless_code.permission`；`Agent` 增加 `engine` 字段；工具执行前调用 `engine.check`。Allow 执行，Deny 直接构造 `ToolResult(is_error=True)` 回灌，Ask 发 `ApprovalRequest` 事件并 await 用户决策。
-- **tui 模块（改造）**：`EndlessCodeApp.mode` 改为 `permission.Mode`，持有 `Engine`；新增 `APPROVING` 态与待批准请求渲染/按键处理；全局 ctrl+c/esc 分派覆盖 `STREAMING | APPROVING`；新增 `shift+tab` 循环切换权限模式（仅 idle 态生效）；状态栏左侧改为常驻显示当前权限模式（取代 provider 名）。
-- **cli / smoke（改造）**：`cli.main` 用 `Path.cwd().resolve()` 构造 `permission.Engine` 注入 TUI；`examples/smoke.py` 用 cwd 构造引擎并以 `Mode.BYPASS` 运行，避免无人在回路时阻塞在 Ask。
-
-数据流（单个工具调用）：
+数据流（单次调用）：
 ```
 agent.execute_batched(calls, mode)
-   └─ read_only 实参由批类别决定（只读批=True / 串行批=False，等价于 registry.is_read_only(name)）
-     decision, reason = engine.check(mode, call, read_only)   # 前四层，短路
-       ① 黑名单(仅 Exec 类)      → 命中 Deny
-       ② 沙箱(仅文件类)          → 逃逸 Deny
-       ③ 规则引擎(三级)          → 命中 allow→Allow / deny→Deny
-       ④ 模式兜底矩阵            → Allow 或 Ask
-  decision==Allow → await tool.execute(...)
-  decision==Deny  → ToolResult(tool_call_id, content=reason, is_error=True) 回灌
-  decision==Ask   →  emit ApprovalRequest(name, args, reason, respond_future)
-                       → await respond_future
-              用户三选一(↑↓+回车 / 数字键 1/2/3) → AllowOnce(执行) /
-                        AllowForever(engine.persist_local_allow+执行) / DenyOnce(回灌)
+  └→ engine.check(...)  → Allow → registry.execute(name, args)
+       └→ McpTool.execute(args)                        [本章新增工具实现]
+            ├→ await asyncio.wait_for(..., timeout=30)
+            ├→ session.call_tool(remote_name, arguments=map)
+            └→ 拼接 text content / 映射 is_error / 协议错转 is_error
+       └→ ToolResult(content, is_error)                ── 回灌 conv
 ```
 
-## 核心数据结构与接口
+## 核心数据结构
 
-### permission.Mode（迁自 agent + 扩展）
+### `endless_code.mcp.Config` / `endless_code.mcp.ServerConfig`（对外）
 ```python
-from enum import IntEnum
-
-
-class Mode(IntEnum):
-    DEFAULT = 0  # 只读 Allow / 文件写 Ask / 命令执行 Ask
-    ACCEPT_EDITS = 1  # 文件写 Allow / 命令执行 Ask
-    PLAN = 2  # 仅只读工具可见（沿用现有 Plan Mode）；矩阵兜底同 default
-    BYPASS = 3  # 全 Allow（黑名单/沙箱仍拦）
-
-
-def parse_mode(s: str) -> tuple[Mode, bool]:
-    """大小写不敏感识别四档名；未知返回 (Mode.DEFAULT, False)。"""
-```
-
-### permission.Decision / Category / Outcome
-```python
-class Decision(IntEnum):
-    ALLOW = 0
-    DENY = 1
-    ASK = 2
-
-
-class Category(IntEnum):
-    READ = 0
-    WRITE = 1
-    EXEC = 2
-
-
-class Outcome(IntEnum):
-    DENY_ONCE = 0  # 拒绝本次
-    ALLOW_ONCE = 1  # 允许本次，不留规则
-    ALLOW_FOREVER = 2  # 永久允许，写本地层精确规则并执行
-```
-
-### permission.Rule / RuleSet
-```python
-@dataclass
-class Rule:
-    tool: str  # 友好名：Bash/Read/Write/Edit/Glob/Grep
-    pattern: str  # 模式段；"" 表示匹配该工具全部调用
-    allow: bool
-
+from dataclasses import dataclass, field
+from typing import Literal
 
 @dataclass
-class RuleSet:
-    allow: list[Rule]
-    deny: list[Rule]
+class ServerConfig:
+    """单个 MCP server 的完整定义（已展开 ${VAR}、已校验）。"""
+    type: Literal["stdio", "http"]
+    command: str = ""                       # stdio 必填
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    url: str = ""                           # http 必填
+    headers: dict[str, str] = field(default_factory=dict)
 
-    def match(self, friendly: str, target: str) -> tuple[Decision, bool]:
-        """先 deny 后 allow；返回 (Allow|Deny, 是否命中)。"""
+@dataclass
+class Config:
+    """mcp_servers 在内存中的归一化形式（已合并）。"""
+    servers: dict[str, ServerConfig] = field(default_factory=dict)
 ```
 
-### permission.Settings（单个 YAML 文件结构）
+### `endless_code.mcp.Manager`（对外不透明）
 ```python
-@dataclass
-class PermissionsBlock:
-    allow: list[str] = field(default_factory=list)
-    deny: list[str] = field(default_factory=list)
+import asyncio
+from contextlib import AsyncExitStack
+from mcp import ClientSession
 
+class Manager:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._sessions: list[_Session] = []        # 成功建立的会话（供 close）
+        self._tools: list[McpTool] = []            # 适配好的工具（供 cli 注册）
+        self._stack = AsyncExitStack()             # 持有 stdio / http 上下文，close 时统一退栈
 
 @dataclass
-class Settings:
-    default_mode: str = ""  # default/acceptEdits/plan/bypassPermissions
-    permissions: PermissionsBlock = field(default_factory=PermissionsBlock)
+class _Session:
+    name: str
+    session: ClientSession
 ```
 
-### permission.Engine（核心，前四层 + 配置）
+### 工具适配（包内私有）
 ```python
+# McpTool 实现 endless_code.tool.Tool 协议。
 @dataclass
-class Engine:
-    root: str  # 项目根（绝对、已解析符号链接）
-    blacklist: list[re.Pattern]  # 内置危险命令正则（不可配置，N1）
-    user: RuleSet  # 用户级
-    project: RuleSet  # 项目级
-    local: RuleSet  # 本地级
-    local_path: str  # 本地层写入目标（.endless-code/settings.local.yaml）
-    start_mode: Mode  # 启动默认模式
-```
+class McpTool:
+    full_name: str                    # "mcp__<server>__<tool>"
+    remote_name: str                  # server 上的原始工具名
+    description: str
+    parameters: dict[str, Any]        # JSON Schema 透传
+    read_only: bool                   # 仅来自远端 annotations.readOnlyHint==True
+    caller: CallerSession             # 协议形式持有，便于单测注入 stub
 
-### agent.ApprovalRequest（新增，人在回路）
-```python
-@dataclass
-class ApprovalRequest:
-    name: str  # 工具内部名，用于展示
-    args: str  # 原始参数 JSON；TUI 展示前会脱敏/摘要
-    reason: str  # 触发 Ask 的原因（模式 + 类别）
-    respond: asyncio.Future[Outcome]  # 单次 future：TUI 回传用户选择
+class CallerSession(Protocol):
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any] | None
+    ) -> CallToolResult: ...
 ```
-当前 `event.Event` 新增一个可选字段 `approval: ApprovalRequest | None = None`。
 
 ## 核心接口
 
-### permission 子包
 ```python
-def new_engine(root: str) -> tuple[Engine, Exception | None]:
-    """
-    解析项目根、加载三层配置、编译黑名单、确定启动模式。
-    即使发生致命错误（仅当项目根不可解析时），也返回非 None 的空规则安全引擎 + err。
-    配置文件格式错误绝不导致引擎构造失败，只降级跳过该文件。
-    """
+# 加载并合并两层配置；返回归一化的 Config。
+# - root: 项目根（用来定位 <root>/.endless-code/mcp.yaml）
+# - 文件不存在 → 视为空层；格式非法 → 跳过该层 + stderr 告警（降级，N1）
+# - 内部完成 ${VAR} 展开与字段校验（非法 server 直接剔除，N2）
+# - 永不抛出（签名只返 Config）
+def load_config(root: str) -> Config: ...
 
+# 启动 Manager：并发连接所有 server，每个 server 30s 超时，失败仅跳过 + 告警。
+# 阻塞直到所有 server 的尝试结束（成功 / 失败 / 超时）。
+# version 透传到 Implementation.version（便于 server 端识别 endless-code 版本）。
+async def new_manager(cfg: Config, version: str) -> Manager: ...
 
-def check(
-    engine: Engine, mode: Mode, call: ToolCall, read_only: bool
-) -> tuple[Decision, str]:
-    """前四层判定，返回 (裁决, 理由)。"""
+# 返回适配好的工具列表（按 server 名 → 工具名 稳定排序）。
+def Manager.tools(self) -> list[McpTool]: ...
 
-
-def persist_local_allow(engine: Engine, call: ToolCall) -> None:
-    """把精确 allow 规则写入本地层文件 + 内存。"""
-```
-这些函数也可挂为 `Engine` 方法（`engine.check(...)`、`engine.persist_local_allow(...)`）。
-
-**check → reason 文案来源表：**
-
-| 裁决来源 | reason 文案（示例） |
-|---|---|
-| 黑名单命中 | `命中危险命令黑名单：<命令片段>` |
-| 沙箱逃逸 | `路径在项目目录之外：<target>` |
-| deny 规则命中 | `匹配 deny 规则：<Tool(pattern)>` |
-| 模式兜底 Ask | `<mode> 模式下 <category> 类操作需确认` |
-| Allow（各来源） | 空串 |
-
-**内部辅助函数：**
-```python
-# settings.py
-def friendly_name(internal: str) -> str:
-    """bash→Bash, read_file→Read, write_file→Write,
-    edit_file→Edit, glob→Glob, grep→Grep；未知原样返回。"""
-
-
-def categorize(internal: str, read_only: bool) -> Category:
-    """read_only→READ；否则 write_file/edit_file→WRITE；其余（含 bash、未知）→EXEC。"""
-
-
-def extract_target(call: ToolCall) -> tuple[str, bool, bool]:
-    """解析参数；返回 (target, is_file, ok)。"""
-
-
-# rule.py
-def parse_rule(s: str) -> tuple[Rule, bool]: ...
-def match_pattern(pattern: str, target: str) -> bool: ...
-
-
-# engine.py
-def mode_fallback(mode: Mode, cat: Category) -> Decision:
-    """只产 Allow/Ask。"""
-
-
-# blacklist.py
-def hits_blacklist(command: str) -> bool: ...
-
-
-# sandbox.py
-def sandbox_ok(engine: Engine, path: str) -> bool: ...
-```
-
-**`extract_target` 解析与失败归属（N7/AC15）：**
-- `call.input`（str 或 dict）做 json 解析（若是 str）；`read_file/write_file/edit_file` 取 `path`；`glob/grep` 取搜索根 `path`（空 → "."）；`bash` 取 `command`；未知工具返回 `("", False, False)`。
-- 返回 `(target, is_file, ok)`；`ok=False` 表示解析失败或缺必填字段。
-- 失败归属：
-  - 文件类工具 `ok=False` → `check` 在沙箱层直接判 Deny（无法解析文件路径参数，安全拒绝），不静默放行。
-  - bash `ok=False` → 命令视为空串，不命中黑名单，落到规则/模式兜底（Exec→Ask），由人在回路兜底，绝不直接 Allow。
-  - 未知工具 → `is_file=False`，走 Exec 类模式兜底 Ask。
-
-### agent 模块（改造现有类，不新增工厂）
-```python
-class Agent:
-    def __init__(
-        self,
-        provider: Provider,
-        registry: Registry,
-        version: str = "0.1.0",
-        engine: Engine | None = None,
-    ) -> None: ...
-```
-`Agent` 在 TUI/CLI/smoke 中统一注入 `engine`；若未传入可退化为 `permission.new_engine(str(Path.cwd().resolve()))[0]`，方便测试与脚本使用。
-
-### tui 模块（现有 EndlessCodeApp，不拆分文件）
-```python
-class EndlessCodeApp(App):
-    def __init__(
-        self,
-        providers: list[ProviderConfig],
-        registry: Registry | None = None,
-        version: str = __version__,
-        engine: Engine | None = None,
-    ) -> None: ...
+# 关闭所有会话（stdio 子进程终止、HTTP DELETE）；总超时 5s 兜底，绝不阻塞退出。
+async def Manager.close(self) -> None: ...
 ```
 
 ## 模块设计
 
-### permission 子包
-
-**职责：** 前四层判定、配置加载与合并、黑名单、沙箱、规则匹配、模式矩阵、本地规则写入。
-
+### `src/endless_code/mcp/config.py`
+**职责：** 加载两层 YAML、合并、展开 `${VAR}`、校验。
 **关键点：**
-- **check 流水线（F6，短路）**：
-  1. `cat == Category.EXEC and target != "" and hits_blacklist(target)` → `DENY`（N1，最高优先级，bypass 也拦）。
-  2. 文件类（`is_file`）：`not ok` → `DENY`（路径参数不可解析）；否则 `not sandbox_ok(target)` → `DENY`。
-  3. 规则引擎：按 `local → project → user` 顺序，每层 `match(friendly, target)`；命中 allow→Allow、deny→Deny，就近命中即返回。
-  4. 未命中 → `mode_fallback(mode, cat)` → Allow 或 Ask。
-- **黑名单（F1/N1）**：模块级一组编译好的 `re.Pattern`，匹配命令串。示例模式：`rm -rf /`、`dd of=/dev/`、fork bomb、`mkfs.`、重定向覆盖磁盘设备、`chmod -R 777 /` 等。注释标明「启发式、非完备、不可配置放开」。
-- **沙箱（F2/N2）**：`sandbox_ok(path)`：空 path 视为 root；相对路径相对 root；`resolved = eval_symlinks_or_ancestor(abs_path)`（存在则 `Path.resolve(strict=True)`；不存在则逐级回退到最近已存在祖先解析后拼接剩余段）；返回 `resolved == root or resolved.startswith(root + os.sep)`。用 `pathlib` / `os.sep`，不硬编码 `/`。
-- **规则解析**：`parse_rule("Bash(git *)")` → `Rule(tool="Bash", pattern="git *", allow=True)`；`parse_rule("Read")` → `pattern=""` 全匹配。加载时 allow/deny 两列分别解析；非法条目跳过并降级（N5）。
-- **匹配（match_pattern）**：命令串用 glob；`*` 匹配任意字符（含空格），`**` 等价 `*`；文件路径按 `/` 分段，`*` 段内任意字符，`**` 跨段（参考 `tool/glob_tool.py` 的实际遍历思路）。
-- **persist_local_allow（永久放行）**：据 `extract_target` 生成精确规则（`Bash(<command>)` / `Write(<relpath>)` 等），追加到本地文件 `permissions.allow` 且去重，并同步内存；失败向上抛，由 agent 侧捕获仅记日志不阻断。
-- **配置加载**：`load_settings(path)`：文件不存在 → 空 Settings、不抛；`yaml.safe_load` 失败 → 抛 `SettingsError`，由 `new_engine` 降级跳过。`new_engine` 依次加载 user/project/local；`start_mode` 依次取 local/project/user 的 `default_mode`（`parse_mode` 成功者优先，local 优先），皆无 → `Mode.DEFAULT`。
+- 内部 `@dataclass class _RawServer`（含全部可能字段：type / command / args / env / url / headers，可选）。
+- `_load_file(path: Path) -> dict[str, _RawServer]`：
+  - 文件不存在 → 返回空 `{}`；
+  - 读 / `yaml.safe_load` 失败 → stderr 告警一行 + 返回空 `{}`（调用方降级）；
+  - 取 `mcp_servers` 段，缺失视为空。
+- `_expand_vars(s: str) -> tuple[str, list[str]]`：正则 `\$\{([A-Za-z_][A-Za-z0-9_]*)\}`，用 `os.environ.get` 取值；未定义变量名记录到 `undefined`（供告警）。**仅作用于 env / headers 的值**。
+- `_apply_expansion(name: str, srv: _RawServer) -> None`：对 `srv.env`、`srv.headers` 每个值跑 `_expand_vars`；未定义变量在 stderr 输出 `[mcp] warn: undefined env var ${X} referenced by server <name>`（同 server 同变量限一次，用局部 `set` 去重）。
+- `_merge_servers(user: dict, project: dict) -> dict`：复制 user，遍历 project，同名直接整对象覆盖。
+- `_validate_server(name: str, srv: _RawServer) -> ServerConfig | None`：
+  - `srv.type` 必为 `"stdio"` 或 `"http"`，否则跳过；
+  - `stdio` 必填 `command`；`http` 必填 `url`；缺失则跳过；
+  - 违规时 stderr 告警 `[mcp] warn: skip server <name>: <reason>`。
+- `load_config(root: str) -> Config`：
+  - 用户级 = `Path.home() / ".config" / "endless-code" / "mcp.yaml"`；项目级 = `Path(root) / ".endless-code" / "mcp.yaml"`。
+  - 两层各自 `_load_file` + `_apply_expansion`；任一层解析失败 stderr 一行告警并跳过（该层视为空）。
+  - `_merge_servers` 后逐个 `_validate_server`，组装 `Config`。
 
-**依赖：** `llm`（`ToolCall`）、`pyyaml`、标准库（`re`、`pathlib`、`json`、`os`）。不依赖 agent/tool/tui。
-
-### agent 模块（`agent/__init__.py`）
-
-**职责：** 在工具执行链接入前四层判定；承担第五层人在回路；模式类型迁移。
-
+### `src/endless_code/mcp/manager.py`
+**职责：** 连接 server、缓存会话、关闭。
 **关键点：**
-- `Mode` 相关定义从本模块删除，`from endless_code.permission import Mode`；`run` 形参 `mode: Mode`；`mode == Mode.PLAN` 沿用只读工具集 + `plan_reminder` 注入。
-- `Agent` 增加 `engine: Engine`；`__init__` 增加形参。
-- `ApprovalRequest` 加入 `Event` 联合（直接增加可选字段）。
-- `request_approval`：创建 `asyncio.Future[Outcome]`，`yield Event(approval=ApprovalRequest(...))`，然后 `return await respond`；`asyncio.CancelledError` 原样上抛走取消收尾。
-- 工具执行：Allow 执行；Deny 统一构造 `ToolResult(tool_call_id=..., content=reason, is_error=True)`；Ask 按 `Outcome` 处理：AllowOnce 执行、AllowForever 先 `persist_local_allow`（异常仅日志）再执行、DenyOnce 构造被拒结果。
-- 只读批：逐个 `engine.check(..., True)`；Deny 直接预置 `ToolResult(is_error=True)` 且不进入 `asyncio.gather`；Allow 仍并发执行（只读永不 Ask，N3）。
-- 有副作用批：串行 `engine.check(..., False)`；Ask 时暂停等待用户决策。
+- `connect_timeout`、`close_timeout` 作为模块级变量（非常量），便于单测临时改小，结束 restore。生产值 30s / 5s。
+- `async def new_manager(cfg: Config, version: str) -> Manager`：
+  - 内部 `mgr = Manager()`；为每个 `(name, srv)` 起一个 task：`asyncio.create_task(_connect_one(mgr, name, srv, version))`。
+  - `await asyncio.gather(*tasks, return_exceptions=True)`（异常吸收，单 server 出错不影响其它）；
+  - 全部完成后稳定排序 `mgr._tools`（按 `full_name`）。
+- `async def _connect_one(mgr, name, srv, version)`：
+  - `try: await asyncio.wait_for(_do_connect(mgr, name, srv, version), timeout=connect_timeout)`；
+  - `except asyncio.TimeoutError`: stderr 告警 `[mcp] warn: connect server <name> timeout after 30s` 并 return；
+  - `except Exception as e`: stderr 告警 `[mcp] warn: connect server <name> failed: <e>` 并 return。
+- `async def _do_connect(mgr, name, srv, version)`：
+  - 按 `srv.type` 构造 transport 上下文：
+    - **stdio**：
+      ```python
+      from mcp import StdioServerParameters
+      from mcp.client.stdio import stdio_client
+      params = StdioServerParameters(
+          command=srv.command,
+          args=srv.args,
+          env={**os.environ, **srv.env},   # 同名宿主变量被覆盖
+      )
+      ctx = stdio_client(params)
+      ```
+    - **http**：
+      ```python
+      from mcp.client.streamable_http import streamablehttp_client
+      ctx = streamablehttp_client(srv.url, headers=srv.headers or None)
+      ```
+  - 用一个**包级 `AsyncExitStack`**（挂在 `Manager._stack`）持有 transport 与 `ClientSession` 上下文：
+    ```python
+    transport = await mgr._stack.enter_async_context(ctx)
+    read, write = transport[0], transport[1]    # http 返回 3 元组，第三个是 metadata
+    session = await mgr._stack.enter_async_context(
+        ClientSession(read, write, client_info=Implementation(name="endless-code", version=version))
+    )
+    await session.initialize()                  # 握手
+    listed = await session.list_tools()
+    ```
+  - 对 `listed.tools` 中每个 `Tool` 调 `adapt_tool(name, t, session)`；成功的入临时 list。
+  - 在 `async with mgr._lock:` 内统一 append `_sessions` / `_tools`。
+- `async def Manager.close(self)`：
+  - 用 `asyncio.wait_for(self._stack.aclose(), timeout=close_timeout)` 包裹；
+  - `TimeoutError` → stderr 告警 `[mcp] warn: close timeout (5s), some sessions may leak`，不再等。
+- `Manager.tools()`：返回 `list(self._tools)` 副本（防外部修改）。
 
-### tui 模块（`tui/app.py`，不新建 stream/view）
-
-**职责：** 新增待批准交互态；模式切换命令；状态栏模式徽标；全局取消覆盖 approving 态。
-
+### `src/endless_code/mcp/tool.py`
+**职责：** 把 SDK 返回的 `mcp.types.Tool` 适配为 endless-code `Tool` 协议。
 **关键点：**
-- `EndlessCodeApp.mode: permission.Mode`（初值 `engine.start_mode()`）；加 `engine`、`pending: ApprovalRequest | None`、`approve_cursor: int = 0`。
-- `SessionState.APPROVING` 枚举值；`on_key` 在 `APPROVING` 分派 `update_approving`；全局 ctrl+c/esc 分派条件从仅 `STREAMING` 改为 `STREAMING | APPROVING`；approving 态取消时先 `self.pending.respond.set_result(Outcome.DENY_ONCE)`，再取消本轮并收尾。
-- `shift+tab`：仅 `IDLE` 生效，`self.mode = next_mode(self.mode)`，`next_mode = Mode((int(m) + 1) % 4)`，循环 `DEFAULT→ACCEPT_EDITS→PLAN→BYPASS→DEFAULT`；写一行提示。
-- `submit` 保留 `/plan`（→`Mode.PLAN`）、`/do`（→`Mode.DEFAULT`，固定回 default 并注入执行指令）、`/exit`；不新增 `/mode` 命令。
-- `status_bar` 左侧改为常驻显示当前权限模式（取代 provider 名）；右侧模型名 + token 用量不变。
-- `ApprovalRequest` 渲染：多行待批准块 `● <动作名>(<参数摘要>)`、灰色触发原因、三行菜单（当前项 `> ` + 高亮），底部灰色键位提示。
+- 包级 `_VALID_NAME = re.compile(r"^[A-Za-z0-9_-]+$")`。
+- 包级 `_non_text_warn_once: set[str] = set()`，配 `asyncio.Lock`（或在单线程 asyncio 中直接用 set）记录已告警的 `full_name`。
+- `def adapt_tool(server_name: str, t: mcp.types.Tool, session: CallerSession) -> McpTool | None`：
+  - `full_name = f"mcp__{server_name}__{t.name}"`。
+  - **禁用字符校验**：`_VALID_NAME.fullmatch(full_name)` 不通过 → 返回 `None` + stderr 告警 `[mcp] warn: skip tool <full_name>: name contains illegal characters`。
+  - `description`：`t.description` 为空时兜底 `f"来自 MCP server {server_name} 的工具 {t.name}"`。
+  - `parameters`：`t.inputSchema` 转 `dict[str, Any]`（已是 dict 则 `dict(...)` 浅拷贝；为空时给 `{"type": "object"}` 兜底，避免 provider 拒收）。
+  - `read_only`：`bool(t.annotations and t.annotations.readOnlyHint)`（None-safe）。
+- `McpTool.name / description / parameters / read_only`：通过 dataclass 字段直接暴露（endless-code `Tool` 协议要求的属性/方法返回字段值）。
+- `async def McpTool.execute(self, args: dict[str, Any] | None) -> ToolResult`：
+  - `arg_map = args if args else None`（空 dict / None 视作无参数）；
+  - ```python
+    try:
+        result = await asyncio.wait_for(
+            self.caller.call_tool(self.remote_name, arg_map),
+            timeout=30,
+        )
+    except asyncio.TimeoutError:
+        return ToolResult(content="MCP 工具调用超时 (30s)", is_error=True)
+    except Exception as e:
+        return ToolResult(content=f"MCP 工具调用失败: {e}", is_error=True)
+    ```
+  - 遍历 `result.content`：`isinstance(block, mcp.types.TextContent)` → 收集 `block.text`；其余块计数，首次出现时 stderr 告警 `[mcp] warn: tool <full_name> returned non-text content blocks (dropped)`（per `full_name` 限一次）。
+  - 用 `"\n".join(texts)` 拼出 `content`；返回 `ToolResult(content=content, is_error=bool(result.isError))`。
 
-### cli / smoke
+### `src/endless_code/cli.py`（改造）
+位置：在 `registry = tool.default_registry()` 之后、`PermissionEngine(...)` 之前插入：
+```python
+import asyncio
+from endless_code import mcp as mcp_client
 
-- `cli.py`：`root = str(Path.cwd().resolve())`；`engine, err = permission.new_engine(root)`；`if err is not None: print(..., file=sys.stderr)` 后继续；`app = EndlessCodeApp(cfg.providers, registry, version=__version__, engine=engine)`。
-- `examples/smoke.py`：`cwd = str(Path.cwd().resolve())`；`engine, _ = permission.new_engine(cwd)`；`agent = Agent(provider, new_default_registry(), version, engine)`；`await agent.run(conversation, mode=Mode.BYPASS)`。
+async def _amain() -> int:
+    ...
+    registry = tool.default_registry()
+    mcp_cfg = mcp_client.load_config(root)
+    mcp_mgr = await mcp_client.new_manager(mcp_cfg, version=__version__)
+    try:
+        for t in mcp_mgr.tools():
+            registry.register(t)
+        engine = PermissionEngine(root)
+        app = EndlessCodeApp(cfg.providers, registry=registry, engine=engine)
+        await app.run_async()
+    finally:
+        await mcp_mgr.close()
+    return 0
 
-## 模块交互
-
+def main() -> None:
+    raise SystemExit(asyncio.run(_amain()))
 ```
-cli → permission.new_engine(root) → tui.EndlessCodeApp(..., engine=engine)
-TUI ── shift+tab            → self.mode 循环切换 DEFAULT→ACCEPT_EDITS→PLAN→BYPASS→DEFAULT（跨轮保持）
-TUI ── begin_turn           → Agent(provider, registry, version, engine).run(conv, self.mode)
-  agent.execute_batched(calls, mode):
-    decision, reason = engine.check(mode, call, read_only(批类别))   # 前四层
-    Allow  → await tool.execute(...)
-    Deny   → ToolResult(content=reason, is_error=True) ──回灌──→ conv.add_tool_results
-    Ask    → ApprovalRequest(..., respond) ──→ TUI(APPROVING)
-                 → TUI responds: respond.set_result(outcome)
-                 → ALLOW_FOREVER 时 engine.persist_local_allow(call)
-                 → 执行(ALLOW_ONCE/ALLOW_FOREVER) 或回灌(DENY_ONCE)
-```
-
-依赖方向（无环）：`tui → {agent, permission, config, llm, ...}`；`agent → {permission, llm, tool, conversation, prompt}`；`permission → llm`。`llm` 不 import permission。
+（`root` 复用现有 `os.getcwd()` 结果；version 复用 `__version__`。）
 
 ## 文件组织
 
-```text
+```
 endless-code/
-├── src/endless_code/permission/
-│   ├── __init__.py           # 新：Mode 四档 + str/parse_mode；Decision/Category/Outcome；Engine/new_engine/持久化导出
-│   ├── engine.py             # 新：Engine、new_engine、check 前四层流水线、mode_fallback、start_mode
-│   ├── blacklist.py          # 新：内置危险命令正则集 + hits_blacklist（不可配，N1）
-│   ├── sandbox.py            # 新：resolve_root、sandbox_ok、eval_symlinks_or_ancestor（N2）
-│   ├── rule.py               # 新：Rule/RuleSet、parse_rule、match、match_pattern（glob）
-│   ├── settings.py           # 新：Settings YAML、load_settings、to_rule_set、friendly_name、categorize、extract_target
-│   └── persist.py            # 新：rule_for、persist_local_allow（写本地层文件）
-├── src/endless_code/agent/__init__.py  # 改：删 Mode（迁 permission）；Agent 加 engine；执行链接入 check；request_approval；ApprovalRequest 事件；Deny 用 ToolResult 构造
-├── src/endless_code/tui/app.py          # 改：mode→permission.Mode、加 engine/pending/approve_cursor；Approving 态分派；全局 ctrl+c/esc 覆盖 approving；shift+tab 循环模式
-├── src/endless_code/cli.py              # 改：构造 permission.Engine 注入 tui
-├── examples/smoke.py                    # 改：cwd + 构造引擎、Mode.BYPASS 运行
+├── pyproject.toml                       — 改：dependencies 增加 "mcp>=1.0"
+├── src/endless_code/
+│   ├── mcp/
+│   │   ├── __init__.py                  — 新：暴露 Config / ServerConfig / Manager / load_config / new_manager
+│   │   ├── config.py                    — 新：Config / ServerConfig、load_config、_load_file、_expand_vars、_merge_servers、_validate_server
+│   │   ├── manager.py                   — 新：Manager、new_manager（并发 + 30s 超时）、close（5s 兜底）、tools；模块级 connect_timeout / close_timeout
+│   │   └── tool.py                      — 新：CallerSession Protocol、McpTool、adapt_tool、execute
+│   └── cli.py                           — 改：装配 Manager，注册 MCP 工具，finally 关闭
 ├── tests/
-│   ├── test_permission_*.py             # 新：黑名单/沙箱(含祖先回退)/规则/优先级/矩阵/加载降级/解析失败
-│   ├── test_agent.py                    # 改：权限集成(Allow/Deny/Ask/永久)、保序、只读并发不退化、取消、模式迁移
-│   └── test_tui.py                      # 改：shift+tab 循环、approval 态按键回传、Esc 取消兜底、状态栏模式、模式跨轮保持
-├── .gitignore                           # 改：追加 .endless-code/settings.local.yaml
-└── .endless-code/settings.yaml.example  # 新：权限配置示例
+│   ├── test_mcp_config.py               — 新：两层合并 / 变量展开 / 字段校验 / 降级 单测
+│   ├── test_mcp_tool.py                 — 新：命名拼接 / 禁用字符 / Execute 各分支（成功/远端 IsError/超时/协议错/非 text 块）
+│   └── test_mcp_manager.py              — 新：连接成功/失败/超时、close 不死锁、共享状态并发安全
+├── docs/mcp/
+│   ├── spec.md / plan.md / task.md / checklist.md
+│   └── mcp-servers.example.yaml         — 新：配置示例（用 ${VAR}）
+└── （其它包零改）
 ```
 
 ## 技术决策
 
 | 决策点 | 选择 | 理由 |
 |---|---|---|
-| 权限判定落点 | 独立 `permission` 子包（前四层） + agent 编排层（第五层） | 与 provider 解耦（N6 免费）；逻辑内聚、可单测；不污染 tool/llm。 |
-| 五层短路 | `check` 顺序 黑名单→沙箱→规则→模式，单函数 early-return；Ask 作第五层信号 | 满足 F6；黑名单/沙箱按类别跳过；规则就近命中即返回；人在回路在 agent。 |
-| 黑名单不可配 | 模块内编译好的 `re.Pattern` 常量列表、无加载入口 | N1：任何配置/模式都碰不到；bypass 也拦。 |
-| 黑名单完备性 | 启发式、显式声明非完备 | 不可能穷尽危险命令；纵深由沙箱、规则 + 人在回路补。 |
-| 沙箱解析顺序 | 先 `Path.resolve(strict=True)`（或最近祖先）再前缀比对 | N2：防软链接逃逸；新建文件按已存在祖先判，避免误判。 |
-| 沙箱不管 bash | bash 不做路径围栏 | 无法可靠静态解析任意命令的文件访问；交黑名单、规则、模式兜底。 |
-| glob/grep 沙箱盲区 | extract_target 取搜索根 `path` 做围栏；pattern 不参与沙箱 | glob/grep 遍历由工具内部 `Path.glob/rglob`（不跟随目录软链接）限制；沙箱对搜索根尽力围栏。 |
-| Mode 归属 | 迁到 `permission` 模块、四档统一 | 权限概念共享给 agent/tui；四档全循环含 BYPASS。 |
-| 模式切换方式 | Shift+Tab 循环四档；保留 `/plan`、`/do` | 与项目既有 Plan Mode 兼容；`/do` 固定回 default；不新增 `/mode` 命令。 |
-| 状态栏左侧内容 | 常驻显示当前权限模式，取代 provider 名 | 用户拍板「别展示 provider 名、展示权限模式」；右侧模型名 + token 用量不变。 |
-| plan 语义 | 沿用现有 Plan Mode 硬化：仅只读工具集 + plan reminder；`/do` 执行 | `/plan` 与 default_mode=plan 都按 `Mode.PLAN` 应用。 |
-| 模式兜底值域 | 只产 Allow/Ask（无 Deny 档） | 用户拍板矩阵；Deny 仅来自黑名单/沙箱/deny 规则/人在回路拒绝。 |
-| 规则优先级 | 本地>项目>用户；同一层 deny 优先 allow | 用户拍板「越靠近会话越优先」；deny 优先更安全。 |
-| 永久放行落点 | 写 `.endless-code/settings.local.yaml`（gitignore） | 不进 git、不影响队友；对齐 Claude Code don't-ask-again。 |
-| 自动规则泛化 | 不泛化，只生成精确规则 | 自动猜泛化有误放行风险；泛化交由用户手写配置。 |
-| 规则命名 | 友好名 Bash/Read/Write/Edit/Glob/Grep → 内部名映射 | 与用户示例一致，规则可读。 |
-| 参数解析失败归属 | 文件类不可解析→Deny；bash 缺 command→Ask；未知工具→Exec/Ask | N7/AC15 安全默认，绝不静默 Allow。 |
-| 人在回路选项目 | 三选一（允许本次/永久/拒绝），菜单 ↑↓+回车、数字键直选、默认高亮允许本次 | 用户拍板；永久精确写本地配置。 |
-| 人在回路回传 | ApprovalRequest 事件 + agent 内 `await asyncio.Future` | Textual 单线程事件循环；future 可被用户选择/取消解阻塞（N4）。 |
-| approving 态取消 | 全局 ctrl+c/esc 分派覆盖 Approving | 否则 approving 态 ctrl+c 会退出程序，违反 N4。 |
-| 会话/永久规则写入位置 | agent 在 Loop 内调引擎；TUI 只回传 Outcome | 引擎状态变更集中一处；职责清晰。 |
-| 只读权限检查 | 批内逐个 check，但只读永不 Ask | N3：保留既有并发；只读最多被沙箱/deny 规则拦为 Deny，无交互。 |
-| settings 与 config 分离 | 新增 `.endless-code/settings.yaml` 而非塞进 config.yaml | provider 凭据与权限规则职责不同；config.yaml 已 gitignore 含密钥；项目级权限设置可提交。 |
-| smoke 运行模式 | Mode.BYPASS、基于 cwd | 非交互无法人在回路；bypass 跳过 Ask（黑名单/沙箱仍在）；用例落 cwd 内。 |
-| new_engine 失败处理 | 致命错误（仅 resolve_root）也返回非 None 安全引擎 + err | cli 注入永不 None；check 不抛；配置格式错只降级（N5）。 |
+| 协议层实现 | 官方 Python SDK（`mcp`，PyPI 包名 `mcp`） | 用户拍板；避免自研 JSON-RPC / 握手 / 帧；SDK 已处理 stdio (`stdio_client`) 与 Streamable HTTP (`streamablehttp_client`) |
+| 配置文件位置 | 项目级 `<root>/.endless-code/mcp.yaml` + 用户级 `~/.config/endless-code/mcp.yaml` | 用户拍板；项目级 dotfile 一眼可见、与现有 `.endless-code/config.yaml`（providers 凭据）分离 |
+| 配置层数 | 仅两层，无本地级 | 用户拍板；`${VAR}` 已让密钥不入配置，本地层冗余 |
+| 合并语义 | server 名维度，项目级完整覆盖 | 避免字段级半合并出畸形 server |
+| server 类型字段 | 显式 `type: stdio\|http` | 不靠字段嗅探（防止误判）；未来扩展易加（如 sse） |
+| 变量展开范围 | 仅 env / headers 的值 | 避免 command / args / server 名 / 工具名被环境间接影响；凭据走 env / headers 已足够 |
+| 未定义变量 | 空串 + 一次性告警（不阻断） | server 自决无凭据时是否能跑；endless-code 不替它拍板 |
+| 工具命名 | `mcp__<server>__<tool>` | 用户拍板；Claude Code 风格；LLM 工具名安全字符；一眼识别来源 |
+| 启动连接策略 | 同步进 TUI 前完成 + `asyncio.gather` 并发每 server `asyncio.wait_for(30s)` 超时 + 失败跳过 | 进 TUI 时工具集稳定；asyncio 并发缩短总时延；隔离避免单 server 拖死启动 |
+| 调用超时 | 30s 硬编码 `asyncio.wait_for`，转 is_error | 与连接同值；不中断 Loop；避免长卡 |
+| readOnly 适配 | 严格只信 `annotations.readOnlyHint==True` | 默认走 Ask，最严；声明只读才放行 |
+| 资源 / 提示词 / 采样 / roots | 不实现 | 本章只覆盖工具能力 |
+| 独立 SSE 通道 | 不订阅（不消费 `streamablehttp_client` 返回的服务端推送流） | 只用请求-响应；省一条长连接；减少复杂度 |
+| 非 text 内容块 | 静默丢弃 + 一次性告警 | 模型只能消费文本；丢弃比假装回灌更诚实 |
+| 错误回灌 | 协议错 / 超时均转 is_error | 与不中断 Loop 的契约一致 |
+| 退出关闭 | 单一 `AsyncExitStack.aclose()` + 5s `wait_for` 兜底 | 让 SDK 的 async context 管理器统一收尾；避免某 server 卡死阻塞退出 |
+| permission 接入方式 | 零改动；靠 `friendly_name` 原样 + `categorize` 按 read_only 优先 | 复用现成链路；权限规则可写 `mcp__server__tool` 与 `mcp__server__*` |
+| HTTP 自定义 headers | SDK 的 `streamablehttp_client(url, headers=...)` 原生支持 | 不引入额外抽象 |
+| OAuth | 不实现完整流程 | 用户预换 token 写 headers；本章范围最小化 |
+| execute 接口注入 | `McpTool` 持 `CallerSession` Protocol 而非具体 `ClientSession` | 单测可注入 stub；生产代码无运行时开销 |
+
+## 模块交互
+
+```
+cli._amain()
+  ├─ tool.default_registry()                       # 6 内置工具
+  ├─ mcp.load_config(root)                         # 读两层 yaml + ${VAR} 展开 + 校验
+  ├─ await mcp.new_manager(cfg, version)           # asyncio.gather 并发连接所有 server，30s/各
+  │     └─ 对每个 server：
+  │         ├─ 构造 transport（stdio: stdio_client / http: streamablehttp_client）
+  │         ├─ 进入 ClientSession 上下文
+  │         ├─ await session.initialize()          # 握手
+  │         ├─ await session.list_tools()
+  │         └─ adapt_tool 包装成 McpTool
+  ├─ for t in mgr.tools(): registry.register(t)
+  ├─ PermissionEngine(root)
+  ├─ await EndlessCodeApp(...).run_async()
+  └─ finally: await mgr.close()                    # AsyncExitStack.aclose() + 5s 兜底
+```
+
+调用链（Agent 视角，工具来源透明）：
+```
+agent.execute_batched(calls, mode)
+  └ engine.check(mode, call, registry.is_read_only(call.name))
+       (MCP 工具：friendly_name 原样；categorize：read_only==True→Read, 否则→Exec；
+        extract_target(未知工具)→is_file=False, target="" → 黑名单/沙箱自动跳过)
+  └ Allow → registry.execute(name, args)
+       └ McpTool.execute(args)
+            ├ asyncio.wait_for(..., timeout=30)
+            └ session.call_tool → 拼接 text / 映射 is_error / 协议错转 is_error
+  └ ToolResult 回灌 conv
+```
+
+依赖方向（无环）：`endless_code.cli → endless_code.mcp → {endless_code.tool, mcp(SDK), 标准库}`；`endless_code.mcp` 不依赖 agent / tui / permission / conversation。
+~~~

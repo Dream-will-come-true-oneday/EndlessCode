@@ -525,7 +525,10 @@ class EndlessCodeApp(App):
                     self._update_approving(key)
                 event.stop()
                 return
-        await super()._on_key(event)
+        # 注意：这里不能调用 super()._on_key(event)。Textual 的 _get_dispatch_methods
+        # 会沿 MRO 单独分派基类 App._on_key（负责 _check_bindings 绑定与 dispatch_key），
+        # 子类再调一次会让绑定动作执行两遍（例如退格一次删两个字符）。
+        # 审批键已在上方处理并 stop；其余键交给基类 App._on_key 正常处理。
 
     async def action_quit(self) -> None:
         task = self._stream_task

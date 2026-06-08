@@ -141,6 +141,21 @@ async def test_mount_registers_widgets_and_exits_cleanly() -> None:
 
 
 @pytest.mark.asyncio
+async def test_input_backspace_deletes_single_char() -> None:
+    """回归：非审批态下 _on_key 不得重复分派基类 App._on_key，退格一次只删一个字符。"""
+    app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+    async with app.run_test() as pilot:
+        await _wait_for_state(app, pilot, SessionState.IDLE)
+        inp = app.query_one("#user-input", Input)
+        await pilot.press("h", "e", "l", "l", "o")
+        assert inp.value == "hello"
+        await pilot.press("backspace")
+        assert inp.value == "hell", f"退格应删一个字符，实际 {inp.value!r}"
+        await pilot.press("backspace")
+        assert inp.value == "hel", f"退格应删一个字符，实际 {inp.value!r}"
+
+
+@pytest.mark.asyncio
 async def test_history_usage_and_iteration_are_updated_once() -> None:
     provider = FakeProvider(
         [

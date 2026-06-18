@@ -10,6 +10,7 @@ from endless_code.llm import (
     ROLE_ASSISTANT,
     ROLE_TOOL,
     Message,
+    PromptTooLongError,
     Request,
     StreamEvent,
     System,
@@ -118,6 +119,18 @@ def _coerce_request(
     )
 
 
+def _wrap_prompt_too_long(exc: Exception) -> Exception:
+    """将 OpenAI 兼容接口的上下文超限错误归一化。"""
+    code = str(getattr(exc, "code", "") or "").lower()
+    text = f"{exc} {getattr(exc, 'body', '')}".lower()
+    markers = ("context_length_exceeded", "prompt is too long", "maximum context")
+    if code == "context_length_exceeded" or any(marker in text for marker in markers):
+        wrapped = PromptTooLongError("openai prompt too long")
+        wrapped.__cause__ = exc
+        return wrapped
+    return exc
+
+
 class OpenAIProvider:
     """OpenAI 兼容适配器，支持工具调用全流程。"""
 
@@ -212,4 +225,4 @@ class OpenAIProvider:
                 )
             yield StreamEvent(done=True)
         except Exception as exc:  # noqa: BLE001
-            yield StreamEvent(err=exc)
+            yield StreamEvent(err=_wrap_prompt_too_long(exc))

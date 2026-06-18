@@ -108,7 +108,9 @@ class DeepSeekProvider(OpenAIProvider):
                 )
             yield StreamEvent(done=True)
         except Exception as exc:  # noqa: BLE001
-            yield StreamEvent(err=exc)
+            from endless_code.llm.openai_provider import _wrap_prompt_too_long
+
+            yield StreamEvent(err=_wrap_prompt_too_long(exc))
 
     @staticmethod
     def _messages_for_request(request: Request) -> list[dict[str, Any]]:

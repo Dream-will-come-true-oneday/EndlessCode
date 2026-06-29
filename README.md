@@ -16,6 +16,7 @@ Endless Code 是一个运行在终端中的智能编程助手。它以可取消�
 - **流式响应与可取消**：实时显示文本、工具调用、结果、迭代轮次和 Token usage；支持 `Esc` 与 `Ctrl+C` 取消。
 - **系统提示工程化**：稳定提示模块化，环境信息、缓存前缀和 `system-reminder` 分离管理。
 - **缓存 usage 观测**：兼容 Anthropic、OpenAI 和 DeepSeek 返回的缓存读写字段。
+- **长会话上下文管理**：超大工具结果自动落盘并保留稳定预览；接近 Provider 上下文窗口时自动摘要、恢复最近文件和可用工具，避免长任务因历史膨胀中断。
 - **输出脱敏**：API key 不会显示在工具预览、错误信息或对话界面中。
 
 ## 支持的 Provider
@@ -80,11 +81,15 @@ providers:
     protocol: anthropic
     model: claude-3-5-sonnet-latest
     api_key: $ANTHROPIC_API_KEY
+    # 可选；未配置时 Anthropic 默认 200000
+    context_window: 200000
 
   - name: openai
     protocol: openai
     model: gpt-4o
     api_key: $OPENAI_API_KEY
+    # 可选；未配置时 OpenAI 默认 128000
+    context_window: 128000
     # 可选：第三方 OpenAI 兼容服务
     # base_url: https://example.com/v1
 
@@ -94,6 +99,8 @@ providers:
     base_url: https://api.deepseek.com
     api_key: $DEEPSEEK_API_KEY
     thinking: false
+    # 可选；未配置时 DeepSeek 默认 128000
+    context_window: 128000
 ```
 
 `api_key` 支持 `$VAR_NAME` 环境变量引用，也支持明文值，但生产环境应优先使用环境变量。配置文件查找顺序为：
@@ -149,10 +156,19 @@ mcp_servers:
 | `Enter` | 提交消息 |
 | `/plan` | 进入只读计划模式 |
 | `/do` | 退出计划模式并执行当前计划 |
+| `/compact` | 立即压缩当前会话历史，不等待自动阈值 |
 | `Esc` | 取消当前回合 |
 | `Ctrl+C` | 运行时取消回合，空闲时退出 |
 | `Ctrl+D` | 退出程序 |
 | `/exit`、`/quit` | 退出程序 |
+
+## 长会话上下文管理
+
+Endless Code 会在每次请求前检查工具结果和会话长度：单条超过 50KB 的工具结果会保存到 `.endless-code/sessions/<会话 ID>/tool-results/`，会话中仅保留头部预览与 `read_file` 重读路径；同一轮工具结果合计过大时也会按大小继续落盘。
+
+当估算用量接近当前 Provider 的 `context_window` 时，Agent 会自动生成结构化摘要，并补回最近读取的文件、当前可用工具和边界提示。界面会显示压缩开始与完成状态。遇到 Provider 报告上下文超限时，程序会先紧急压缩，再仅重试原请求一次。
+
+`/compact` 可在空闲时手动触发摘要。会话目录不会自动删除，便于检查被落盘的工具原文；该目录已被 Git 忽略。
 
 ## 系统提示与缓存
 

@@ -14,6 +14,8 @@ from endless_code.compact.state import (
     RecoveryState,
     SessionContext,
     new_session_context,
+    open_session_context,
+    parse_session_time,
 )
 from endless_code.compact.token import estimate_tokens, usage_anchor
 
@@ -31,6 +33,8 @@ __all__ = [
     "manage_context",
     "new_session_context",
     "offload_and_snip",
+    "open_session_context",
+    "parse_session_time",
     "spill_single",
     "usage_anchor",
 ]

@@ -10,15 +10,14 @@ providers:
     protocol: anthropic
     model: claude-3-5-sonnet-latest
     api_key: $ANTHROPIC_API_KEY      # 环境变量引用
-    context_window: 200000           # 可选；未配置时 Anthropic 默认 200000
+    context_window: 1000000          # 可选；未配置时默认 1000000
 
   - name: deepseek
-    protocol: deepseek
+    protocol: openai                   # DeepSeek 走 OpenAI 兼容协议
     model: deepseek-chat
     base_url: https://api.deepseek.com
     api_key: $DEEPSEEK_API_KEY        # 环境变量引用
-    thinking: false                    # 是否启用扩展思考（仅 DeepSeek 生效）
-    context_window: 128000             # 可选；未配置时 DeepSeek 默认 128000
+    context_window: 1000000           # 可选；未配置时默认 1000000
 
   - name: openai
     protocol: openai
@@ -26,4 +25,4 @@ providers:
     # base_url 可省略，默认使用 OpenAI 官方端点
     api_key: $OPENAI_API_KEY           # 环境变量引用
     thinking: false                    # OpenAI 忽略此字段
-    context_window: 128000             # 可选；未配置时 OpenAI 默认 128000
+    context_window: 1000000           # 可选；未配置时默认 1000000

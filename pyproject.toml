@@ -1,0 +1,21 @@
+[project]
+name = "endless-code"
+version = "0.1.0"
+description = "CLI AI assistant with streaming multi-turn conversation"
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=0.52",
+    "rich>=13.0",
+    "openai>=1.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+endless-code = "endless_code.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/endless_code"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

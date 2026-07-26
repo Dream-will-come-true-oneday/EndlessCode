@@ -1,0 +1,26 @@
+# 真实密钥文件（不提交）
+.endless-code/config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# uv
+uv.lock
+
+# OS
+.DS_Store
+Thumbs.db

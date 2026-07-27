@@ -1,35 +1,66 @@
 """LLM 层：协议无关的 Provider 接口、消息/流式事件类型、工厂函数。"""
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Protocol
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
     from endless_code.config import ProviderConfig  # noqa: F401
+
+ROLE_USER = "user"
+ROLE_ASSISTANT = "assistant"
+ROLE_TOOL = "tool"
+
+
+@dataclass
+class ToolCall:
+    """协议无关地承载模型发起的一次工具调用。"""
+
+    id: str
+    name: str
+    input: str
+
+
+@dataclass
+class ToolResult:
+    """协议无关地承载一次工具执行结果。"""
+
+    tool_call_id: str
+    content: str
+    is_error: bool = False
+
+
+@dataclass
+class ToolDefinition:
+    """注册中心导出的协议无关工具定义。"""
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
 
 
 @dataclass
 class Message:
     """单条对话消息。"""
 
-    role: Literal["user", "assistant"]
-    content: str
+    role: Literal["user", "assistant", "tool"]
+    content: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_results: list[ToolResult] = field(default_factory=list)
 
 
 @dataclass
 class StreamEvent:
-    """流式事件。text / done / err 互斥语义——调用方按字段判断。"""
+    """流式事件：text 增量 / tool_calls 请求 / done 结束 / err 错误。"""
 
     text: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
     done: bool = False
     err: Exception | None = None
 
 
 class Provider(Protocol):
-    """协议无关的 LLM Provider 接口。
-
-    所有适配器实现此 Protocol，上层（TUI）只依赖此接口。
-    """
+    """协议无关的 LLM Provider 接口。"""
 
     @property
     def name(self) -> str: ...
@@ -37,15 +68,9 @@ class Provider(Protocol):
     @property
     def model(self) -> str: ...
 
-    def stream(self, msgs: list[Message]) -> AsyncIterator[StreamEvent]:
-        """发起一轮流式对话，返回 async generator 逐个产出 StreamEvent。
-
-        适配器内部负责：
-        - 注入内置 system prompt
-        - 根据配置启用/禁用扩展思考
-        - 思考增量内部丢弃，只产出文本增量和结束/错误事件
-        """
-        ...
+    def stream(
+        self, msgs: list[Message], tools: list[ToolDefinition]
+    ) -> AsyncIterator[StreamEvent]: ...
 
 
 def new_provider(cfg: "ProviderConfig") -> Provider:

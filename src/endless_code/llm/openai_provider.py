@@ -1,20 +1,63 @@
-"""OpenAI 适配器 —— 基于 AsyncOpenAI 的流式对话。"""
+"""OpenAI 适配器 —— 基于 AsyncOpenAI 的流式对话，支持工具调用。"""
 
+import json
 from collections.abc import AsyncIterator
 
 from openai import AsyncOpenAI
 
 from endless_code.config import ProviderConfig
-from endless_code.llm import Message, Provider, StreamEvent
+from endless_code.llm import (
+    ROLE_ASSISTANT,
+    ROLE_TOOL,
+    Message,
+    StreamEvent,
+    ToolCall,
+    ToolDefinition,
+)
 from endless_code.prompt import SYSTEM_PROMPT
 
 
-class OpenAIProvider:
-    """OpenAI 适配器，封装 AsyncOpenAI。
+def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.input_schema,
+            },
+        }
+        for t in tools
+    ]
 
-    使用标准 OpenAI chat completions 流式 API。
-    thinking 配置被忽略（OpenAI 不支持通过 chat.completions 返回思考内容）。
-    """
+
+def _to_openai_messages(msgs: list[Message]) -> list[dict]:
+    out: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for m in msgs:
+        if m.role == ROLE_ASSISTANT:
+            msg: dict = {"role": "assistant", "content": m.content or None}
+            if m.tool_calls:
+                msg["tool_calls"] = [
+                    {
+                        "id": c.id,
+                        "type": "function",
+                        "function": {"name": c.name, "arguments": c.input or "{}"},
+                    }
+                    for c in m.tool_calls
+                ]
+            out.append(msg)
+        elif m.role == ROLE_TOOL:
+            for r in m.tool_results:
+                out.append(
+                    {"role": "tool", "tool_call_id": r.tool_call_id, "content": r.content}
+                )
+        else:
+            out.append({"role": m.role, "content": m.content})
+    return out
+
+
+class OpenAIProvider:
+    """OpenAI 适配器，支持工具调用全流程。"""
 
     def __init__(self, cfg: ProviderConfig) -> None:
         self._cfg = cfg
@@ -31,25 +74,54 @@ class OpenAIProvider:
     def model(self) -> str:
         return self._cfg.model
 
-    async def stream(self, msgs: list[Message]) -> AsyncIterator[StreamEvent]:
+    async def stream(
+        self, msgs: list[Message], tools: list[ToolDefinition]
+    ) -> AsyncIterator[StreamEvent]:
         try:
-            messages: list[dict] = [
-                {"role": "system", "content": SYSTEM_PROMPT}
-            ]
-            for m in msgs:
-                messages.append({"role": m.role, "content": m.content})
+            messages = _to_openai_messages(msgs)
+            params: dict = {
+                "model": self._cfg.model,
+                "messages": messages,
+                "stream": True,
+            }
+            if tools:
+                params["tools"] = _to_openai_tools(tools)
 
-            response = await self._client.chat.completions.create(
-                model=self._cfg.model,
-                messages=messages,
-                stream=True,
-            )
+            response = await self._client.chat.completions.create(**params)
+
+            tool_calls_buf: dict[int, dict[str, str]] = {}
 
             async for chunk in response:
-                if chunk.choices:
-                    delta = chunk.choices[0].delta
-                    if delta and delta.content:
-                        yield StreamEvent(text=delta.content)
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                delta = choice.delta
+
+                if delta and delta.content:
+                    yield StreamEvent(text=delta.content)
+
+                if delta and delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in tool_calls_buf:
+                            tool_calls_buf[idx] = {"id": "", "name": "", "args": ""}
+                        if tc.id:
+                            tool_calls_buf[idx]["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            tool_calls_buf[idx]["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            tool_calls_buf[idx]["args"] += tc.function.arguments
+
+            if tool_calls_buf:
+                calls = [
+                    ToolCall(
+                        id=v["id"],
+                        name=v["name"],
+                        input=v["args"] or "{}",
+                    )
+                    for _, v in sorted(tool_calls_buf.items())
+                ]
+                yield StreamEvent(tool_calls=calls)
 
             yield StreamEvent(done=True)
 

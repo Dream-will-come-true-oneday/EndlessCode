@@ -8,6 +8,8 @@ from endless_code.tool import Result, _truncate
 
 
 class ReadFileTool:
+    read_only = True
+
     def name(self) -> str:
         return "read_file"
 

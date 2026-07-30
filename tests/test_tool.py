@@ -2,11 +2,20 @@
 
 import asyncio
 import json
+import os
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from endless_code.tool import Registry, Result, new_default_registry
+from endless_code.tool import Registry, new_default_registry
+
+
+def _python_command(code: str) -> str:
+    args = [sys.executable, "-c", code]
+    return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
 
 
 @pytest.fixture
@@ -22,6 +31,15 @@ class TestRegistry:
     def test_definitions_names(self, registry: Registry) -> None:
         names = [d.name for d in registry.definitions()]
         assert names == ["read_file", "write_file", "edit_file", "bash", "glob", "grep"]
+
+    def test_read_only_definitions(self, registry: Registry) -> None:
+        names = [d.name for d in registry.read_only_definitions()]
+        assert names == ["read_file", "glob", "grep"]
+
+    def test_read_only_lookup(self, registry: Registry) -> None:
+        assert registry.is_read_only("read_file")
+        assert not registry.is_read_only("write_file")
+        assert not registry.is_read_only("no_such_tool")
 
     def test_get_hit(self, registry: Registry) -> None:
         assert registry.get("read_file") is not None
@@ -106,11 +124,26 @@ class TestBash:
         assert "exit_code: 0" in r.content
 
     @pytest.mark.asyncio
-    async def test_timeout(self) -> None:
+    async def test_nonzero_exit(self, registry: Registry) -> None:
+        command = _python_command("raise SystemExit(7)")
+        r = await registry.execute("bash", json.dumps({"command": command}))
+        assert r.is_error
+        assert "exit_code: 7" in r.content
+
+    @pytest.mark.asyncio
+    async def test_timeout_stops_child(self, tmp_path: Path) -> None:
+        marker = tmp_path / "late-marker.txt"
+        code = (
+            "import time; from pathlib import Path; "
+            f"time.sleep(0.6); Path({str(marker)!r}).write_text('late', encoding='utf-8')"
+        )
+        command = _python_command(code)
         reg = new_default_registry()
-        r = await reg.execute("bash", json.dumps({"command": "sleep 10"}), timeout=0.5)
+        r = await reg.execute("bash", json.dumps({"command": command}), timeout=0.1)
         assert r.is_error
         assert "超时" in r.content
+        await asyncio.sleep(0.8)
+        assert not marker.exists()
 
 
 class TestGlob:

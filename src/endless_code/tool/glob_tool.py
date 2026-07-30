@@ -9,6 +9,8 @@ from endless_code.tool import Result
 
 
 class GlobTool:
+    read_only = True
+
     def name(self) -> str:
         return "glob"
 

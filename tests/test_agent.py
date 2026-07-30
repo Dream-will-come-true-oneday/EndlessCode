@@ -25,7 +25,12 @@ class FakeProvider:
     def model(self) -> str:
         return "fake-model"
 
-    async def stream(self, msgs: list[Message], tools: list[ToolDefinition]):
+    async def stream(
+        self,
+        msgs: list[Message],
+        tools: list[ToolDefinition],
+        system_suffix: str = "",
+    ):
         script = self._scripts[self._call_count]
         self._call_count += 1
         for ev in script:

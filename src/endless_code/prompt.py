@@ -46,5 +46,5 @@ def render_banner(version: str, cwd: str) -> str:
         f"{CAT_BANNER}\n"
         f"  endless-code v{version}\n"
         f"  cwd: {cwd}\n"
-        f'  Type /exit to quit, Alt+Enter for newline.\n'
+        f"  Type /exit to quit, Alt+Enter for newline.\n"
     )

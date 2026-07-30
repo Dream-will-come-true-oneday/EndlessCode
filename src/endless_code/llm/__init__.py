@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
-    from endless_code.config import ProviderConfig  # noqa: F401
+    from endless_code.config import ProviderConfig
 
 ROLE_USER = "user"
 ROLE_ASSISTANT = "assistant"

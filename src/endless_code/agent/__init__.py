@@ -145,7 +145,9 @@ class Agent:
                 unknown_run = 0
 
             execution = _ExecutionState(results=[None] * len(round_state.calls))
-            async for event in self._execute_events(round_state.calls, cancel, execution):
+            async for event in self._execute_events(
+                round_state.calls, cancel, execution
+            ):
                 yield event
 
             tool_results = [
@@ -154,7 +156,9 @@ class Agent:
                     content=result.content,
                     is_error=result.is_error,
                 )
-                for call, result in zip(round_state.calls, execution.results, strict=True)
+                for call, result in zip(
+                    round_state.calls, execution.results, strict=True
+                )
                 if result is not None
             ]
             conv.add_tool_results(tool_results)
@@ -183,7 +187,9 @@ class Agent:
         cancel: asyncio.Event,
         state: _RoundState,
     ) -> AsyncIterator[Event]:
-        stream = self._provider.stream(conv.messages(), definitions, system_suffix).__aiter__()
+        stream = self._provider.stream(
+            conv.messages(), definitions, system_suffix
+        ).__aiter__()
         cancel_task = asyncio.create_task(cancel.wait())
         next_task: asyncio.Task[StreamEvent] | None = None
         try:
@@ -251,7 +257,9 @@ class Agent:
 
                 end = index + 1
                 if self._registry.is_read_only(calls[index].name):
-                    while end < len(calls) and self._registry.is_read_only(calls[end].name):
+                    while end < len(calls) and self._registry.is_read_only(
+                        calls[end].name
+                    ):
                         end += 1
 
                 batch_indices = list(range(index, end))
@@ -269,7 +277,9 @@ class Agent:
                 task_indices: dict[asyncio.Task[Result], int] = {}
                 for current in batch_indices:
                     call = calls[current]
-                    task = asyncio.create_task(self._registry.execute(call.name, call.input))
+                    task = asyncio.create_task(
+                        self._registry.execute(call.name, call.input)
+                    )
                     active_tasks.add(task)
                     task_indices[task] = current
 
@@ -284,7 +294,7 @@ class Agent:
                         current = task_indices[task]
                         try:
                             state.results[current] = task.result()
-                        except Exception as exc:
+                        except Exception as exc:  # noqa: BLE001
                             state.results[current] = Result(
                                 content=f"工具 {calls[current].name} 异常: {exc}",
                                 is_error=True,

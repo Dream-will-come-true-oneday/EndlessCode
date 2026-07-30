@@ -55,7 +55,11 @@ def _to_openai_messages(msgs: list[Message], system_suffix: str = "") -> list[di
         elif m.role == ROLE_TOOL:
             for r in m.tool_results:
                 out.append(
-                    {"role": "tool", "tool_call_id": r.tool_call_id, "content": r.content}
+                    {
+                        "role": "tool",
+                        "tool_call_id": r.tool_call_id,
+                        "content": r.content,
+                    }
                 )
         else:
             out.append({"role": m.role, "content": m.content})
@@ -109,8 +113,12 @@ class OpenAIProvider:
                         usage_seen = True
                         yield StreamEvent(
                             usage=Usage(
-                                input_tokens=getattr(chunk_usage, "prompt_tokens", 0) or 0,
-                                output_tokens=getattr(chunk_usage, "completion_tokens", 0) or 0,
+                                input_tokens=getattr(chunk_usage, "prompt_tokens", 0)
+                                or 0,
+                                output_tokens=getattr(
+                                    chunk_usage, "completion_tokens", 0
+                                )
+                                or 0,
                             )
                         )
 
@@ -147,5 +155,5 @@ class OpenAIProvider:
 
             yield StreamEvent(done=True)
 
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             yield StreamEvent(err=exc)

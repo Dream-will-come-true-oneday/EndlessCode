@@ -24,7 +24,10 @@ class EditFileTool:
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "要编辑的文件路径"},
-                "old_string": {"type": "string", "description": "要替换的原文片段（必须唯一匹配）"},
+                "old_string": {
+                    "type": "string",
+                    "description": "要替换的原文片段（必须唯一匹配）",
+                },
                 "new_string": {"type": "string", "description": "替换后的新文本"},
             },
             "required": ["path", "old_string", "new_string"],

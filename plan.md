@@ -158,6 +158,7 @@ def last_role(self) -> str:
 ```python
 def redact_sensitive(text: str, secrets: Collection[str] = ()) -> str: ...
 
+
 def summarize_tool_args(
     tool_name: str,
     raw_args: str,
@@ -300,7 +301,7 @@ EXECUTE_DIRECTIVE = "请按上面的计划开始执行。"
 主要字段：
 
 ```python
-self._tool_registry: Registry       # 避免覆盖 Textual App._registry
+self._tool_registry: Registry  # 避免覆盖 Textual App._registry
 self._mode: Mode = Mode.NORMAL
 self._iteration: int = 0
 self._usage_in: int = 0

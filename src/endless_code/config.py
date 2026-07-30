@@ -35,8 +35,6 @@ class Config:
 class ConfigError(Exception):
     """配置相关错误。"""
 
-    pass
-
 
 def _expand_env(value: str) -> str:
     """展开字符串中的环境变量引用 ``$VAR_NAME``。"""
@@ -132,8 +130,6 @@ def load(path: str | None = None) -> Config:
     if not raw_providers or not isinstance(raw_providers, list):
         raise ConfigError("配置文件缺少 providers 列表或格式不正确。")
 
-    providers = [
-        _validate_provider(i, p) for i, p in enumerate(raw_providers)
-    ]
+    providers = [_validate_provider(i, p) for i, p in enumerate(raw_providers)]
 
     return Config(providers=providers)

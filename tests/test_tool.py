@@ -66,9 +66,23 @@ class TestReadFile:
 
     @pytest.mark.asyncio
     async def test_read_not_exist(self, registry: Registry) -> None:
-        r = await registry.execute("read_file", json.dumps({"path": "/no/such/file.txt"}))
+        r = await registry.execute(
+            "read_file", json.dumps({"path": "/no/such/file.txt"})
+        )
         assert r.is_error
         assert "不存在" in r.content
+
+    @pytest.mark.asyncio
+    async def test_read_file_truncates_large_input(
+        self, registry: Registry, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "large.txt"
+        target.write_text("\n".join(f"line-{index}" for index in range(2100)))
+        result = await registry.execute("read_file", json.dumps({"path": str(target)}))
+        assert not result.is_error
+        assert "[truncated]" in result.content
+        assert "line-1999" in result.content
+        assert "line-2000" not in result.content
 
 
 class TestWriteFile:
@@ -88,7 +102,8 @@ class TestEditFile:
         f = tmp_path / "e.txt"
         f.write_text("aaa bbb ccc")
         r = await registry.execute(
-            "edit_file", json.dumps({"path": str(f), "old_string": "bbb", "new_string": "XXX"})
+            "edit_file",
+            json.dumps({"path": str(f), "old_string": "bbb", "new_string": "XXX"}),
         )
         assert not r.is_error
         assert f.read_text() == "aaa XXX ccc"
@@ -98,7 +113,8 @@ class TestEditFile:
         f = tmp_path / "e2.txt"
         f.write_text("aaa bbb ccc")
         r = await registry.execute(
-            "edit_file", json.dumps({"path": str(f), "old_string": "zzz", "new_string": "X"})
+            "edit_file",
+            json.dumps({"path": str(f), "old_string": "zzz", "new_string": "X"}),
         )
         assert r.is_error
         assert "未找到" in r.content
@@ -108,7 +124,8 @@ class TestEditFile:
         f = tmp_path / "e3.txt"
         f.write_text("aaa aaa aaa")
         r = await registry.execute(
-            "edit_file", json.dumps({"path": str(f), "old_string": "aaa", "new_string": "X"})
+            "edit_file",
+            json.dumps({"path": str(f), "old_string": "aaa", "new_string": "X"}),
         )
         assert r.is_error
         assert "3" in r.content
@@ -145,6 +162,14 @@ class TestBash:
         await asyncio.sleep(0.8)
         assert not marker.exists()
 
+    @pytest.mark.asyncio
+    async def test_bash_truncates_long_output(self, registry: Registry) -> None:
+        command = _python_command("print('x' * 31000)")
+        result = await registry.execute("bash", json.dumps({"command": command}))
+        assert not result.is_error
+        assert len(result.content) <= 30020
+        assert result.content.endswith("[truncated]")
+
 
 class TestGlob:
     @pytest.mark.asyncio
@@ -155,12 +180,40 @@ class TestGlob:
         assert not r.is_error
         assert ".py" in r.content
 
+    @pytest.mark.asyncio
+    async def test_glob_limits_results(
+        self, registry: Registry, tmp_path: Path
+    ) -> None:
+        for index in range(101):
+            (tmp_path / f"{index:03}.txt").touch()
+        result = await registry.execute(
+            "glob", json.dumps({"pattern": "*.txt", "path": str(tmp_path)})
+        )
+        assert not result.is_error
+        assert "[truncated:" in result.content
+        assert len(result.content.splitlines()) == 101
+
 
 class TestGrep:
     @pytest.mark.asyncio
     async def test_grep_keyword(self, registry: Registry) -> None:
         r = await registry.execute(
-            "grep", json.dumps({"pattern": "class Registry", "path": "src/endless_code"})
+            "grep",
+            json.dumps({"pattern": "class Registry", "path": "src/endless_code"}),
         )
         assert not r.is_error
         assert "Registry" in r.content
+
+    @pytest.mark.asyncio
+    async def test_grep_limits_results(
+        self, registry: Registry, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "hits.txt"
+        target.write_text("\n".join(f"needle {index}" for index in range(101)))
+        result = await registry.execute(
+            "grep",
+            json.dumps({"pattern": "needle", "path": str(tmp_path)}),
+        )
+        assert not result.is_error
+        assert "[truncated:" in result.content
+        assert len(result.content.splitlines()) == 101

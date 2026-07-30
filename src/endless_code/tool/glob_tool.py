@@ -43,13 +43,11 @@ class GlobTool:
             return Result(content=f"路径不存在: {root}", is_error=True)
 
         matches: list[str] = []
-        count = 0
-        for p in root.glob(pattern):
+        for count, p in enumerate(root.glob(pattern), 1):
             if p.is_file():
                 matches.append(str(p))
                 if len(matches) >= 100:
                     break
-            count += 1
             if count % 100 == 0:
                 await asyncio.sleep(0)
 

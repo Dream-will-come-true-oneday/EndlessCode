@@ -75,18 +75,18 @@ def test_layer1_offloads_large_result_and_is_stable(tmp_path) -> None:
     context = new_session_context(str(tmp_path))
     source = Message(
         role="tool",
-        tool_results=[ToolResult(tool_call_id="large", content="x" * 60_000)],
+        tool_results=[ToolResult(tool_call_id="large", content="x" * 260_000)],
     )
     first = offload_and_snip([source], state, context)
     second = offload_and_snip(first, state, context)
     preview = first[0].tool_results[0].content
-    assert "original size: 60000 bytes" in preview
+    assert "original size: 260000 bytes" in preview
     assert "[head preview]" in preview
     assert "[saved to]" in preview
     assert "read_file" in preview
     assert preview == second[0].tool_results[0].content
-    assert (Path(context.spill_dir) / "large").stat().st_size == 60_000
-    assert source.tool_results[0].content == "x" * 60_000
+    assert (Path(context.spill_dir) / "large").stat().st_size == 260_000
+    assert source.tool_results[0].content == "x" * 260_000
 
 
 def test_layer1_limits_aggregate_results(tmp_path) -> None:
@@ -95,8 +95,8 @@ def test_layer1_limits_aggregate_results(tmp_path) -> None:
     message = Message(
         role="tool",
         tool_results=[
-            ToolResult(tool_call_id=f"id-{index}", content="x" * 80_000)
-            for index in range(3)
+            ToolResult(tool_call_id=f"id-{index}", content="x" * 300_000)
+            for index in range(5)
         ],
     )
     result = offload_and_snip([message], state, context)[0]
@@ -105,7 +105,7 @@ def test_layer1_limits_aggregate_results(tmp_path) -> None:
         for item in result.tool_results
         if "[tool result offloaded" not in item.content
     )
-    assert remaining <= 200_000
+    assert remaining <= 1_000_000
     assert (
         sum("[tool result offloaded" in item.content for item in result.tool_results)
         >= 2

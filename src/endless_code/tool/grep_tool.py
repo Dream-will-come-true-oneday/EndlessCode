@@ -10,6 +10,8 @@ from endless_code.tool import Result
 
 
 class GrepTool:
+    read_only = True
+
     def name(self) -> str:
         return "grep"
 
@@ -51,7 +53,9 @@ class GrepTool:
             if not fp.is_file():
                 continue
             try:
-                with open(fp, encoding="utf-8", errors="replace") as f:
+                with open(  # noqa: ASYNC230
+                    fp, encoding="utf-8", errors="replace"
+                ) as f:
                     for lineno, line in enumerate(f, 1):
                         if len(line) > 1_000_000:
                             continue

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
-    from endless_code.config import ProviderConfig  # noqa: F401
+    from endless_code.config import ProviderConfig
 
 ROLE_USER = "user"
 ROLE_ASSISTANT = "assistant"
@@ -28,6 +28,14 @@ class ToolResult:
     tool_call_id: str
     content: str
     is_error: bool = False
+
+
+@dataclass
+class Usage:
+    """一次模型请求的输入与输出 Token 用量。"""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 @dataclass
@@ -55,6 +63,7 @@ class StreamEvent:
 
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: Usage | None = None
     done: bool = False
     err: Exception | None = None
 
@@ -69,7 +78,10 @@ class Provider(Protocol):
     def model(self) -> str: ...
 
     def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition]
+        self,
+        msgs: list[Message],
+        tools: list[ToolDefinition],
+        system_suffix: str = "",
     ) -> AsyncIterator[StreamEvent]: ...
 
 

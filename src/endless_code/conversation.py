@@ -25,3 +25,7 @@ class Conversation:
 
     def messages(self) -> list[Message]:
         return list(self._messages)
+
+    def last_role(self) -> str:
+        """返回最后一条消息的角色；空历史返回空字符串。"""
+        return self._messages[-1].role if self._messages else ""

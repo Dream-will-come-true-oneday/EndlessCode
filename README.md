@@ -1,38 +1,91 @@
 # endless-code
 
-一个基于 Textual TUI 的命令行 AI 编程助手，支持流式多轮对话与工具调用，能读写文件、执行命令、搜索代码——从聊天机器人到能干活的 Agent。
+> 一个会持续执行，直到任务完成的终端 AI 编程 Agent。
 
-## 特性
+endless-code 是一个基于 Textual 的轻量级 TUI 编程助手。它连接 DeepSeek、OpenAI
+及 OpenAI 兼容端点，让模型在同一个用户回合中持续分析、调用工具、读取结果并调整行动，
+直到自然完成或触发明确的停止条件。
 
-- 终端内交互式对话界面，回复以流式逐字显示
-- 多供应商支持：OpenAI、DeepSeek（及任何 OpenAI 兼容端点）
-- 多轮对话，进程内保留上下文记忆
-- **工具系统**：模型可自主调用 6 个核心工具（read_file、write_file、edit_file、bash、glob、grep）
-- **单轮闭环**：模型请求工具 → 执行 → 结果回灌 → 最终答复
-- Claude Code 风格工具行呈现（`● read_file(path)` + 结果摘要）
-- 结构化错误处理，工具失败不中断会话
-- 助手回复支持 Markdown 渲染
-- 扩展思考模式（DeepSeek）
+它的核心不是“在终端里聊天”，而是让模型真正完成代码库中的多步工作。
 
-## 安装
+## 核心能力
 
-```bash
-git clone <repo-url>
-cd endless-code
-pip install -e .
+- **自主 Agent Loop**：连续执行“判断 -> 调用工具 -> 回灌结果 -> 继续判断”，无需用户逐步催促。
+- **六个内置工具**：读取、写入、精确编辑文件，执行 Shell 命令，以及 Glob/Grep 搜索。
+- **Plan / Do 工作流**：`/plan` 只开放只读工具进行调研，`/do` 恢复全部工具并按计划执行。
+- **保序并发调度**：连续只读工具并发执行；写文件、编辑和命令等副作用工具保持串行边界。
+- **可取消、可恢复**：流式响应或工具运行期间可随时取消，清理任务和子进程后继续对话。
+- **完整运行反馈**：实时展示文本、工具调用、结果摘要、迭代轮次和累计 Token 用量。
+- **双 Provider 支持**：DeepSeek 与 OpenAI 共用一致的流式工具调用和历史回灌语义。
+- **输出脱敏**：API 密钥不会出现在工具预览、结果摘要、错误信息或对话界面中。
+
+## 工作方式
+
+```text
+用户任务
+   |
+   v
+模型流式响应 ---- 无工具调用 ----> 最终答复
+   |
+   | 工具调用
+   v
+只读工具并发 / 副作用工具串行
+   |
+   v
+结果按原顺序写回会话
+   |
+   +--------------------------> 下一轮模型判断
 ```
 
-要求 Python 3.12 及以上版本。
+循环会在模型自然完成、达到 25 轮上限、连续请求未知工具、响应出错或用户取消时停止。
+所有停止路径都会补全合法会话历史，下一条消息可以正常继续。
+
+## 快速开始
+
+要求 Python 3.12 或更高版本。
+
+```bash
+git clone https://github.com/Dream-will-come-true-oneday/Endless-Coding.git
+cd Endless-Coding
+python -m pip install -e .
+```
+
+复制示例配置：
+
+```bash
+# macOS / Linux
+cp .endless-code/config.yaml.example .endless-code/config.yaml
+
+# Windows PowerShell
+Copy-Item .endless-code/config.yaml.example .endless-code/config.yaml
+```
+
+推荐通过环境变量提供 API 密钥：
+
+```bash
+# macOS / Linux
+export DEEPSEEK_API_KEY="your-key"
+export OPENAI_API_KEY="your-key"
+```
+
+```powershell
+# Windows PowerShell
+$env:DEEPSEEK_API_KEY = "your-key"
+$env:OPENAI_API_KEY = "your-key"
+```
+
+启动应用：
+
+```bash
+endless-code
+
+# 或
+python -m endless_code
+```
 
 ## 配置
 
-1. 复制示例配置：
-
-```bash
-cp .endless-code/config.yaml.example .endless-code/config.yaml
-```
-
-2. 编辑 `.endless-code/config.yaml`，填入你的 API 密钥：
+`.endless-code/config.yaml` 可以配置一个或多个 Provider：
 
 ```yaml
 providers:
@@ -40,88 +93,109 @@ providers:
     protocol: deepseek
     model: deepseek-chat
     base_url: https://api.deepseek.com
-    api_key: $DEEPSEEK_API_KEY   # 支持环境变量引用或明文
-    thinking: false              # 是否启用扩展思考（仅 DeepSeek 生效）
+    api_key: $DEEPSEEK_API_KEY
+    thinking: false
 
   - name: openai
     protocol: openai
     model: gpt-4o
-    api_key: $OPENAI_API_KEY     # base_url 可省略，默认使用官方端点
-    thinking: false              # OpenAI 忽略此字段
+    api_key: $OPENAI_API_KEY
 ```
 
-`api_key` 支持环境变量引用（`$VAR_NAME`）或明文。推荐使用环境变量引用以避免泄露密钥。
+`api_key` 支持 `$VAR_NAME` 环境变量引用或明文值。建议始终使用环境变量，避免密钥进入配置文件、
+终端历史或版本控制。
 
 配置文件按以下顺序查找：
 
 1. 当前目录 `.endless-code/config.yaml`
 2. 用户目录 `~/.config/endless-code/config.yaml`
 
-> 注意：配置中没有 `active` 字段。若只配置了一个供应商则自动启用；若配置了多个，启动时会出现选择列表，输入编号选择即可。
+只配置一个 Provider 时自动启用；配置多个 Provider 时，启动后输入编号选择。OpenAI 兼容服务可通过
+`protocol: openai` 与自定义 `base_url` 接入。DeepSeek 可设置 `thinking: true` 启用扩展思考。
 
 ## 使用
 
-```bash
-# 直接运行
-endless-code
+直接描述希望完成的结果，例如：
 
-# 或通过 python 模块运行
-python -m endless_code
+```text
+检查这个项目的测试失败，定位原因，修复后运行相关测试。
 ```
 
-启动后：
+Agent 会根据需要自行搜索代码、读取文件、修改实现并执行验证。常用命令和快捷键如下：
 
-- 单供应商：直接进入对话界面
-- 多供应商：先显示编号列表，输入编号选择供应商后进入对话
+| 输入 | 行为 |
+|---|---|
+| `Enter` | 提交消息 |
+| `/plan` | 进入只读计划模式 |
+| `/do` | 退出计划模式并立即执行已有计划 |
+| `Esc` | 取消当前 Agent 回合 |
+| `Ctrl+C` | 运行时取消当前回合；空闲时退出 |
+| `Ctrl+D` | 退出程序 |
+| `/exit`、`/quit` | 退出程序 |
 
-### 快捷键 / 命令
+### Plan / Do 示例
 
-- `Enter` —— 提交消息
-- `Ctrl`+`D` —— 退出程序
-- `/exit` 或 `/quit` —— 退出程序
+```text
+/plan
+分析认证模块的耦合点，并给出重构计划。
 
-## 支持的供应商
+/do
+```
 
-| 供应商 | protocol | 说明 |
-|--------|----------|------|
-| OpenAI | `openai` | GPT-4o 等模型，`base_url` 可省略 |
-| DeepSeek | `deepseek` | 支持 `thinking: true` 启用扩展思考 |
+Plan Mode 同时通过系统提示和工具定义限制写入：模型只能使用 `read_file`、`glob`、`grep`。
+执行 `/do` 后恢复 `write_file`、`edit_file`、`bash`，并立即基于上文计划开始工作。
+
+## 工具与调度
+
+| 工具 | 类型 | 用途 |
+|---|---|---|
+| `read_file` | 只读 | 带行号读取文件 |
+| `glob` | 只读 | 按 Glob 模式查找文件 |
+| `grep` | 只读 | 使用正则搜索文件内容 |
+| `write_file` | 有副作用 | 写入文件并创建父目录 |
+| `edit_file` | 有副作用 | 对唯一匹配内容进行替换 |
+| `bash` | 有副作用 | 执行 Shell 命令并返回退出码与输出 |
+
+同一轮中的连续只读调用可以并发执行。副作用工具构成串行边界，所有结果仍按模型原始调用顺序展示并回灌。
+大文件、长命令输出和大量搜索结果会被截断并明确标记。
+
+## 安全边界
+
+endless-code 会清理取消或超时后的异步任务和命令子进程，并对可见输出进行密钥脱敏。
+
+当前版本**没有文件系统沙箱，也没有工具执行前审批**。模型可以访问当前用户有权限访问的路径，
+并可执行 Shell 命令。请在可信代码库和权限受限的开发环境中运行，并在执行前使用 `/plan`
+检查高风险任务的操作方案。
 
 ## 项目结构
 
-```
+```text
 src/endless_code/
-├── cli.py              # CLI 入口：加载配置、构造工具注册中心、启动 TUI
-├── config.py           # 配置层：加载、校验、环境变量展开
-├── conversation.py     # 会话层：进程内多轮历史管理（含工具调用回合）
-├── prompt.py           # 系统提示词与启动 banner
-├── llm/
-│   ├── __init__.py     # Provider 抽象接口、ToolCall/ToolResult/ToolDefinition
-│   ├── openai_provider.py   # OpenAI 适配器（含工具调用解析与回灌）
-│   └── deepseek_provider.py # DeepSeek 适配器
-├── tool/
-│   ├── __init__.py     # Tool Protocol、Registry、Result、new_default_registry
-│   ├── read_file.py    # 读文件（带行号）
-│   ├── write_file.py   # 写文件（自动创建父目录）
-│   ├── edit_file.py    # 唯一匹配替换
-│   ├── bash.py         # 执行 shell 命令（带超时）
-│   ├── glob_tool.py    # 按模式查找文件
-│   └── grep_tool.py    # 正则搜索文件内容
-├── agent/
-│   └── __init__.py     # Agent 单轮闭环编排
-└── tui/
-    ├── __init__.py
-    └── app.py          # Textual TUI 主应用、工具行渲染
+├── agent/              # 可取消 ReAct Agent Loop、停止条件与工具调度
+├── llm/                # Provider 抽象、DeepSeek 与 OpenAI 适配器
+├── tool/               # 工具协议、注册中心和六个内置工具
+├── tui/                # Textual 界面、事件渲染、模式与取消交互
+├── config.py           # YAML 配置加载、校验与环境变量展开
+├── conversation.py     # 多轮对话与工具历史
+├── prompt.py           # 系统提示、Plan Mode 与执行指令
+├── security.py         # 输出脱敏与工具参数摘要
+└── cli.py              # 命令行入口
 ```
 
-## 开发流程
+## 开发与验证
 
-本项目采用 Spec 驱动开发，四份递进文档依次细化并经审批：
+```bash
+python -m pytest -q
+python -m ruff format --check .
+python -m ruff check .
+```
 
-- [`spec.md`](spec.md) —— 做什么
-- [`plan.md`](plan.md) —— 怎么做
-- [`task.md`](task.md) —— 按什么顺序做
-- [`checklist.md`](checklist.md) —— 做对了没
+项目采用 Spec 驱动开发：
+
+- [`spec.md`](spec.md)：需求与验收标准
+- [`plan.md`](plan.md)：架构与技术设计
+- [`task.md`](task.md)：实现顺序与验证步骤
+- [`checklist.md`](checklist.md)：功能、集成和端到端验收
 
 ## License
 

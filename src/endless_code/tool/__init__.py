@@ -21,6 +21,8 @@ class Result:
 class Tool(Protocol):
     """统一工具抽象。"""
 
+    read_only: bool
+
     def name(self) -> str: ...
     def description(self) -> str: ...
     def parameters(self) -> dict[str, Any]: ...
@@ -70,15 +72,34 @@ class Registry:
             for n in self._order
         ]
 
-    async def execute(self, name: str, args: str, timeout: float = DEFAULT_TIMEOUT) -> Result:
+    def read_only_definitions(self) -> list[ToolDefinition]:
+        """按注册顺序导出只读工具定义。"""
+        return [
+            ToolDefinition(
+                name=self._tools[n].name(),
+                description=self._tools[n].description(),
+                input_schema=self._tools[n].parameters(),
+            )
+            for n in self._order
+            if self._tools[n].read_only
+        ]
+
+    def is_read_only(self, name: str) -> bool:
+        """已注册且标记为只读时返回 True。"""
+        tool = self.get(name)
+        return tool is not None and tool.read_only
+
+    async def execute(
+        self, name: str, args: str, timeout: float = DEFAULT_TIMEOUT
+    ) -> Result:
         tool = self.get(name)
         if tool is None:
             return Result(content=f"未知工具: {name}", is_error=True)
         try:
             return await asyncio.wait_for(tool.execute(args), timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return Result(content=f"工具 {name} 执行超时（{timeout}s）", is_error=True)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             return Result(content=f"工具 {name} 异常: {e}", is_error=True)
 
 

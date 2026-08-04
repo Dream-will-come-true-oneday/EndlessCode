@@ -10,6 +10,7 @@ from endless_code.llm import (
     StreamEvent,
     ToolCall,
     ToolDefinition,
+    Usage,
 )
 from endless_code.llm.openai_provider import _to_openai_messages, _to_openai_tools
 
@@ -33,14 +34,18 @@ class DeepSeekProvider:
         return self._cfg.model
 
     async def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition]
+        self,
+        msgs: list[Message],
+        tools: list[ToolDefinition],
+        system_suffix: str = "",
     ) -> AsyncIterator[StreamEvent]:
         try:
-            messages = _to_openai_messages(msgs)
+            messages = _to_openai_messages(msgs, system_suffix)
             create_kwargs: dict = {
                 "model": self._cfg.model,
                 "messages": messages,
                 "stream": True,
+                "stream_options": {"include_usage": True},
             }
             if tools:
                 create_kwargs["tools"] = _to_openai_tools(tools)
@@ -51,25 +56,41 @@ class DeepSeekProvider:
 
             tool_calls_buf: dict[int, dict[str, str]] = {}
 
-            async for chunk in response:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
+            usage_seen = False
+            async with response:
+                async for chunk in response:
+                    chunk_usage = getattr(chunk, "usage", None)
+                    if chunk_usage is not None and not usage_seen:
+                        usage_seen = True
+                        yield StreamEvent(
+                            usage=Usage(
+                                input_tokens=getattr(chunk_usage, "prompt_tokens", 0)
+                                or 0,
+                                output_tokens=getattr(
+                                    chunk_usage, "completion_tokens", 0
+                                )
+                                or 0,
+                            )
+                        )
 
-                if delta and delta.content:
-                    yield StreamEvent(text=delta.content)
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
 
-                if delta and delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tool_calls_buf:
-                            tool_calls_buf[idx] = {"id": "", "name": "", "args": ""}
-                        if tc.id:
-                            tool_calls_buf[idx]["id"] = tc.id
-                        if tc.function and tc.function.name:
-                            tool_calls_buf[idx]["name"] = tc.function.name
-                        if tc.function and tc.function.arguments:
-                            tool_calls_buf[idx]["args"] += tc.function.arguments
+                    if delta and delta.content:
+                        yield StreamEvent(text=delta.content)
+
+                    if delta and delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            if idx not in tool_calls_buf:
+                                tool_calls_buf[idx] = {"id": "", "name": "", "args": ""}
+                            if tc.id:
+                                tool_calls_buf[idx]["id"] = tc.id
+                            if tc.function and tc.function.name:
+                                tool_calls_buf[idx]["name"] = tc.function.name
+                            if tc.function and tc.function.arguments:
+                                tool_calls_buf[idx]["args"] += tc.function.arguments
 
             if tool_calls_buf:
                 calls = [
@@ -84,5 +105,5 @@ class DeepSeekProvider:
 
             yield StreamEvent(done=True)
 
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             yield StreamEvent(err=exc)

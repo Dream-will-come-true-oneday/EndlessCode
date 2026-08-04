@@ -123,3 +123,52 @@ async def test_deepseek_stream_preserves_thinking_and_suffix() -> None:
     assert events[1].usage.input_tokens == 3
     assert events[-1].done
     assert response.closed
+
+
+@pytest.mark.asyncio
+async def test_openai_request_injects_reminder_and_cache_usage() -> None:
+    cached_details = SimpleNamespace(cached_tokens=6)
+    usage = SimpleNamespace(
+        prompt_tokens=10,
+        completion_tokens=4,
+        prompt_tokens_details=cached_details,
+    )
+    response = FakeResponse([_chunk(usage=usage)])
+    provider = OpenAIProvider(_config("openai"))
+    client = FakeClient(response)
+    provider._client = client
+    from endless_code.llm import Request, System
+
+    request = Request(
+        messages=[Message(role="user", content="hello")],
+        system=System(stable="stable", environment="environment"),
+        reminder="<system-reminder>notice</system-reminder>",
+    )
+    events = [event async for event in provider.stream(request)]
+    assert (
+        client.chat.completions.kwargs["messages"][0]["content"]
+        == "stable\n\nenvironment"
+    )
+    assert client.chat.completions.kwargs["messages"][-1] == {
+        "role": "user",
+        "content": request.reminder,
+    }
+    event_usage = next(event.usage for event in events if event.usage)
+    assert event_usage.cache_read == 6
+
+
+@pytest.mark.asyncio
+async def test_deepseek_cache_field_defaults_and_is_supported() -> None:
+    usage = SimpleNamespace(
+        prompt_tokens=10,
+        completion_tokens=4,
+        prompt_cache_hit_tokens=8,
+    )
+    response = FakeResponse([_chunk(usage=usage)])
+    provider = DeepSeekProvider(_config("deepseek"))
+    provider._client = FakeClient(response)
+    from endless_code.llm import Request
+
+    events = [event async for event in provider.stream(Request())]
+    event_usage = next(event.usage for event in events if event.usage)
+    assert event_usage.cache_read == 8

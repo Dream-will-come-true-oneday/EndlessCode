@@ -14,7 +14,7 @@ class ProviderConfig:
     """单个 AI 供应商的配置。"""
 
     name: str
-    protocol: Literal["deepseek", "openai"]
+    protocol: Literal["anthropic", "deepseek", "openai"]
     api_key: str  # 原始值，可能含 $ENV_VAR 引用
     model: str
     base_url: str | None = None
@@ -86,9 +86,9 @@ def _validate_provider(idx: int, raw: dict) -> ProviderConfig:
         raise ConfigError(f"第 {idx + 1} 个 provider 缺少必填字段：name")
     if not protocol:
         raise ConfigError(f"provider「{name}」缺少必填字段：protocol")
-    if protocol not in ("deepseek", "openai"):
+    if protocol not in ("anthropic", "deepseek", "openai"):
         raise ConfigError(
-            f"provider「{name}」的 protocol 值不合法：{protocol}（只支持 deepseek 或 openai）"
+            f"provider「{name}」的 protocol 值不合法：{protocol}（只支持 anthropic、deepseek 或 openai）"
         )
     if not api_key:
         raise ConfigError(f"provider「{name}」缺少必填字段：api_key")

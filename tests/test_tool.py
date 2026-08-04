@@ -217,3 +217,11 @@ class TestGrep:
         assert not result.is_error
         assert "[truncated:" in result.content
         assert len(result.content.splitlines()) == 101
+
+
+def test_tool_descriptions_reinforce_conventions() -> None:
+    from endless_code.tool.bash import BashTool
+    from endless_code.tool.edit_file import EditFileTool
+
+    assert "read_file" in EditFileTool().description()
+    assert "专用工具" in BashTool().description()

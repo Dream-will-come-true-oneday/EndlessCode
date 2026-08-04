@@ -84,7 +84,7 @@ class BashTool:
         return "bash"
 
     def description(self) -> str:
-        return "在工作目录下执行 shell 命令，返回 stdout、stderr 与退出码。"
+        return "在工作目录下执行 shell 命令。优先使用 read_file、write_file、edit_file、glob 和 grep 等专用工具；返回 stdout、stderr 与退出码。"
 
     def parameters(self) -> dict[str, Any]:
         return {

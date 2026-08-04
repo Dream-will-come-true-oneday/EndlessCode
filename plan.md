@@ -1,426 +1,222 @@
-# Agent Loop Plan
+# 系统提示工程化 Plan
+
+> 技术栈：Python 3.12+、Textual、OpenAI SDK、Anthropic SDK。保留现有 `endless_code` 包名和 Agent Loop 控制流，新增 Anthropic Provider，并让 OpenAI/DeepSeek 共用兼容协议基础。
 
 ## 架构概览
 
-本阶段在现有 `config -> llm/tool -> conversation -> agent -> tui -> cli` 分层上扩展，不拆分现有包，也不引入新的运行时框架。
+本阶段在现有 Agent Loop 外增加三层：
 
-- `endless_code.llm` 继续负责协议适配，新增统一用量对象、Plan Mode 系统提示后缀和流式用量上报。DeepSeek 与 OpenAI 都沿用 `AsyncOpenAI` 的 Chat Completions 流。
-- `endless_code.tool` 增加只读分类、只读定义导出和可靠的命令进程清理。注册中心继续统一负责工具超时和异常值化。
-- `endless_code.conversation` 继续保存协议无关历史，并增加末尾角色查询，供异常终止时补齐合法历史。
-- `endless_code.agent` 从固定两次请求改为 ReAct 循环，独占 assistant/tool 历史写入，负责停止条件、取消、批次并发和事件顺序。
-- `endless_code.tui` 只添加用户消息并消费 Agent 事件，负责模式切换、取消按键、累计用量、迭代展示和输出脱敏。
-- `endless_code.security` 提供无状态的敏感文本脱敏和工具参数摘要，避免界面直接显示原始参数内容。
+1. **Prompt 层**：将固定系统指令拆成有优先级的模块；单独构造环境信息；按轮次生成 `<system-reminder>`。
+2. **请求层**：使用 `System` 与 `Request` dataclass 区分稳定系统块、动态环境块、持久历史、工具定义和本轮 reminder。
+3. **Provider 层**：Anthropic 使用两块 system 与显式缓存断点；OpenAI/DeepSeek 使用稳定 system 前缀和兼容消息；三者统一解析流式文本、工具调用与 usage。
 
-依赖方向保持无环：
+调用链：
 
 ```text
-config ───────────────┐
-prompt ───────────────┤
-security ─────────────┤
-llm ───────┐          │
-tool ──────┼─> agent ─┼─> tui ─> cli
-conversation ┘        │
+Agent.run
+  -> build_system_prompt + gather_environment
+  -> 根据 mode/iteration 构造 plan reminder
+  -> Request(messages, tools, system, reminder)
+  -> Anthropic/OpenAI/DeepSeek Provider
+  -> StreamEvent(text/tool_calls/usage/done/err)
+  -> Agent Loop 与 TUI
 ```
 
-`llm` 依赖 `config` 与 `prompt`；`tool` 依赖 `llm` 的工具定义类型；`agent` 依赖 `llm/tool/conversation/prompt`；`tui` 依赖上述公开接口与 `security`。
-
-## 需求归属
-
-| 需求 | 架构归属 |
-|---|---|
-| F1/F2 | `agent.Agent.run` 的循环与停止分支 |
-| F3 | `agent.Event`、`ToolEvent` 与 TUI 事件消费 |
-| F4 | 两个 Provider 的分片拼接与 Agent 单轮收集 |
-| F5 | 工具只读分类与 Agent 保序分批执行 |
-| F6 | `Conversation` 与 Agent 统一历史写入/终止收尾 |
-| F7 | TUI 按键、per-turn 取消事件、Agent 流/工具取消 |
-| F8 | `llm.Usage`、Provider usage 提取、TUI 累加展示 |
-| F9 | Agent 迭代事件与 TUI 动态区 |
-| F10 | `Mode`、只读工具定义、系统提示后缀、`/plan`/`/do` |
-| F11 | `DeepSeekProvider`、`OpenAIProvider` 及共享协议测试 |
-| N1/N5 | `Registry` 超时、`BashTool` 进程树清理、Agent task 清理 |
-| N2 | Provider/工具异步执行、TUI 计时器与非阻塞事件消费 |
-| N3/N6 | Agent 批次结果槽位与固定事件顺序 |
-| N4 | 各工具现有截断逻辑与 TUI 结果摘要截断 |
-| N7 | `security` 与所有 TUI 输出入口 |
-| N8 | TUI 启动测试、依赖边界、跨平台测试命令 |
+稳定前缀只包含模块化系统提示和本轮固定工具定义。环境信息、历史与 reminder 在其后动态传递，不写入 `Conversation`。
 
 ## 核心数据结构与接口
 
-### LLM 用量与流事件
+### `prompt.Module`
+
+```python
+@dataclass(frozen=True)
+class Module:
+    name: str
+    priority: int
+    content: str
+```
+
+`fixed_modules()` 返回七个固定模块，优先级 10 至 70；`optional_modules()` 返回三个空槽，优先级 80 至 100。`assemble_system()` 按 priority 升序排序，跳过空内容，以两个换行连接。
+
+### `prompt.Environment`
+
+```python
+@dataclass(frozen=True)
+class Environment:
+    working_dir: str
+    platform: str
+    date: str
+    git_status: str
+    version: str
+    model: str
+
+    def render(self) -> str: ...
+```
+
+`gather_environment(version, model)` 使用标准库收集目录、平台、日期和版本；Git 状态通过有界的 `git status --porcelain` 获取，失败时为空字符串降级，不读取环境变量。
+
+### `llm.System` 与 `llm.Request`
+
+```python
+@dataclass(frozen=True)
+class System:
+    stable: str = ""
+    environment: str = ""
+
+
+@dataclass
+class Request:
+    messages: list[Message] = field(default_factory=list)
+    tools: list[ToolDefinition] = field(default_factory=list)
+    system: System = field(default_factory=System)
+    reminder: str = ""
+```
+
+`Provider.stream(req: Request) -> AsyncIterator[StreamEvent]` 替换现有位置参数接口。兼容测试 Provider 一并迁移到 Request。
+
+### `llm.Usage`
 
 ```python
 @dataclass
 class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
-
-
-@dataclass
-class StreamEvent:
-    text: str = ""
-    tool_calls: list[ToolCall] = field(default_factory=list)
-    usage: Usage | None = None
-    done: bool = False
-    err: Exception | None = None
-
-
-class Provider(Protocol):
-    def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]: ...
+    cache_write: int = 0
+    cache_read: int = 0
 ```
 
-每次 Provider 请求最多产生一个 `usage` 事件。`usage` 在流结束前发出，随后发出 `done=True`。若请求异常，只发 `err`，不伪造用量。
-
-### Agent 模式与事件
-
-```python
-class Mode(Enum):
-    NORMAL = "normal"
-    PLAN = "plan"
-
-
-@dataclass
-class ToolEvent:
-    call_id: str
-    name: str
-    args: str = ""
-    phase: Phase = Phase.START
-    result: str = ""
-    is_error: bool = False
-
-
-@dataclass
-class Event:
-    text: str = ""
-    tool: ToolEvent | None = None
-    usage: Usage | None = None
-    iteration: int | None = None
-    notice: str = ""
-    done: bool = False
-    err: Exception | None = None
-
-
-class Agent:
-    def run(
-        self,
-        conv: Conversation,
-        mode: Mode = Mode.NORMAL,
-        cancel: asyncio.Event | None = None,
-    ) -> AsyncIterator[Event]: ...
-```
-
-事件使用互斥的有效字段；一个事件只表达一种状态。每次 `run` 的所有终止路径最后都发出且只发出一个 `done=True`。错误路径先发 `err`，停止原因先发 `notice`，再以 `done` 收尾。
-
-### 工具只读分类
-
-```python
-class Tool(Protocol):
-    read_only: bool
-
-    def name(self) -> str: ...
-    def description(self) -> str: ...
-    def parameters(self) -> dict[str, Any]: ...
-    async def execute(self, args: str) -> Result: ...
-
-
-class Registry:
-    def read_only_definitions(self) -> list[ToolDefinition]: ...
-    def is_read_only(self, name: str) -> bool: ...
-```
-
-分类固定如下：
-
-| 工具 | `read_only` |
-|---|---|
-| `read_file` | `True` |
-| `glob` | `True` |
-| `grep` | `True` |
-| `write_file` | `False` |
-| `edit_file` | `False` |
-| `bash` | `False` |
-
-未知工具的 `is_read_only` 返回 `False`，因此形成串行批次边界。
-
-### Conversation 末尾角色
-
-```python
-def last_role(self) -> str:
-    """空历史返回空字符串，否则返回最后一条消息的 role。"""
-```
-
-### 安全输出
-
-```python
-def redact_sensitive(text: str, secrets: Collection[str] = ()) -> str: ...
-
-
-def summarize_tool_args(
-    tool_name: str,
-    raw_args: str,
-    secrets: Collection[str] = (),
-) -> str: ...
-```
-
-`redact_sensitive` 先替换当前配置中可解析的确切密钥，再处理常见 `sk-...` 和 `api_key=...` 形式。`summarize_tool_args` 使用 JSON 解析：文件工具展示路径，写入/替换工具只展示内容长度，搜索工具展示模式与路径，bash 展示脱敏后的命令；JSON 非法或未知工具只显示脱敏截断摘要。
+Anthropic 读取 `cache_creation_input_tokens` 和 `cache_read_input_tokens`；OpenAI 读取 `prompt_tokens_details.cached_tokens`；DeepSeek 读取兼容响应中的 prompt cache 命中字段。任何字段缺失均为零。
 
 ## 模块设计
 
-### `endless_code.agent`
+### Prompt 模块
 
-职责：ReAct 循环、停止条件、事件流、工具执行调度和历史一致性。
+**职责：** 稳定系统提示、环境段和动态 reminder 的构造，不依赖 `llm` 包。
 
-内置常量：
+- `modules.py`：模块类型、七个固定模块、三个空可选模块和固定正文。
+- `environment.py`：`Environment`、Git 状态采集和安全渲染。
+- `reminder.py`：`system_reminder()`、完整/精简 Plan reminder、`EXECUTE_DIRECTIVE`。
+- `__init__.py`：导出 `assemble_system`、`build_system_prompt`、`gather_environment`、`Environment`、reminder API，并兼容导出现有 `SYSTEM_PROMPT`、`PLAN_MODE_REMINDER`、`EXECUTE_DIRECTIVE` 名称，减少外部调用迁移风险。
 
-```python
-MAX_ITERATIONS = 25
-MAX_UNKNOWN_RUN = 3
-NOTICE_MAX_ITER = "（已达最大迭代轮数 25，自动停止；可继续发消息推进。）"
-NOTICE_UNKNOWN_TOOLS = "（连续多轮只请求到未注册的工具，自动停止。）"
-NOTICE_STREAM_ERROR = "（请求出错，本轮已中断。）"
-NOTICE_CANCELLED = "（已取消。）"
-NOTICE_EMPTY_FINAL = "（任务已结束，模型未返回文本。）"
-```
+工具使用模块与 `edit_file`、`bash` 的 description 同时强化专用工具优先和编辑前先读。
 
-`Agent.run` 算法：
+### LLM 公共接口
 
-1. `cancel is None` 时创建未触发的 `asyncio.Event`。
-2. `Mode.NORMAL` 使用全部工具和空系统后缀；`Mode.PLAN` 使用只读工具定义与 `PLAN_MODE_REMINDER`。
-3. 对 `1..MAX_ITERATIONS`：
-   - 发出 `Event(iteration=n)`。
-   - 发起一次 Provider 流，实时转发文本，收集完整文本、工具调用和用量。
-   - 收到用量后发出 `Event(usage=...)`。
-   - 无工具调用时，由 Agent 把最终文本写入 Conversation，发出 `done` 并返回。
-   - 有工具调用时，先写入含工具调用的 assistant 消息，再分批执行工具，最后一次性按原顺序写入所有工具结果。
-   - 若执行未取消且未知工具连续计数未触顶，进入下一轮。
-4. 达到未知工具阈值或迭代上限时，追加 assistant 停止说明，发出 `notice` 和 `done`。
-5. 流错误或取消时按“历史收尾”规则追加消息，发出终止事件并返回。
+**文件：** `src/endless_code/llm/__init__.py`
 
-Agent 是 assistant/tool 历史的唯一写入者。TUI 只在启动一轮前添加 user 消息；TUI 的完成处理不得再次调用 `add_assistant`，从根源上消除重复历史。
+新增 `System`、`Request` 与缓存字段；保持 `Message`、`ToolCall`、`ToolResult`、`ToolDefinition` 和 `StreamEvent` 的既有语义。Provider 工厂增加 `anthropic` 分支，保留 `openai` 和 `deepseek`。
 
-#### 可取消的 Provider 流
+### Anthropic Provider
 
-不能只在收到 chunk 后轮询 `cancel`，否则网络长时间无数据时取消不及时。单轮收集器对每次 `anext(stream)` 与一个长期存在的 `cancel.wait()` task 使用 `asyncio.wait(..., FIRST_COMPLETED)`：
+**文件：** `src/endless_code/llm/anthropic_provider.py`
 
-- chunk 先到则消费并继续；
-- cancel 先到则取消并等待 `anext` task，关闭 Provider async generator，标记本轮取消；
-- `finally` 中取消并等待辅助 task，确保没有挂起任务。
+- 使用 `AsyncAnthropic`，配置 `api_key` 和默认 `https://api.anthropic.com`，允许自定义 `base_url`。
+- 将 `Request.system.stable` 序列化为带 `cache_control: {"type": "ephemeral"}` 的文本块；环境块作为无缓存控制的第二文本块。
+- 工具定义置于 system 之前的请求前缀中，工具顺序遵循 Registry 顺序。
+- 将历史消息转换为 Anthropic content blocks；工具调用和工具结果保持 call ID 配对。
+- reminder 非空时追加到末条 user/tool content block；末条不是可追加消息时新建一条 user 消息，保证角色合法。
+- 沿用 DeepSeek 的 thinking 语义只对 DeepSeek 生效；Anthropic 的本阶段不增加额外思考配置。
+- 流式解析文本增量、工具参数分片、usage、完成和错误，并在 generator finally 中关闭响应。
 
-两个 Provider 在读取 SDK 流时使用异步上下文管理器；Agent 关闭生成器后，适配器退出上下文并关闭 HTTP 响应。
+### OpenAI Provider
 
-#### 保序分批执行
+**文件：** `src/endless_code/llm/openai_provider.py`
 
-按调用顺序切分最长连续批次：
+- 将稳定 system 放在消息前缀；环境段追加在稳定 system 后，保持稳定块字节不变。
+- 将 `Request.messages`、`Request.tools` 和 reminder 映射为 OpenAI Chat Completions 请求。
+- reminder 作为尾部 user 消息注入，不写入持久历史。
+- 从 `prompt_tokens_details.cached_tokens` 读取缓存命中；字段不存在时使用零。
+- 保留工具 JSON 分片拼接、流关闭、错误和 usage 事件行为。
 
-- 连续只读工具形成并发批；
-- 每个有副作用工具或未知工具单独形成串行批。
+### DeepSeek Provider
 
-每批执行流程：
+**文件：** `src/endless_code/llm/deepseek_provider.py`
 
-1. 按调用顺序发出全部 `Phase.START` 事件。
-2. 只读批为每个调用创建独立 task；串行批只创建一个 task。
-3. 将工具完成 task 与 `cancel.wait()` 竞速。
-4. 正常完成后把结果写入预分配的原始下标。
-5. 取消时取消并等待未完成 task；已完成结果保留，未完成调用生成 `is_error=True` 的取消结果。
-6. 按调用顺序发出全部 `Phase.END` 事件。
-7. 所有批次结束或取消后，按原顺序构造 `ToolResult` 列表并一次写入 Conversation。
+- 继续复用 OpenAI-compatible message/tool 序列化和流收集逻辑，默认 base URL 保持 `https://api.deepseek.com`。
+- 保留 `thinking` 到 `extra_body` 的配置，不覆盖系统块或 reminder。
+- 解析 DeepSeek 可用的 prompt cache usage 字段；缺失时为零。
+- 通过同一 `Request` 接口支持稳定系统提示、环境段、工具集和 reminder。
 
-并发 task 不写 Conversation，只返回自己的 `Result`；主循环负责合并，因此没有共享历史竞争。
+### 配置层
 
-#### 历史收尾
+**文件：** `src/endless_code/config.py`、`pyproject.toml`
 
-- 流在工具调用入历史前取消或出错：追加 `partial_text + notice` 的 assistant 文本；没有 partial text 时只追加 notice。
-- 工具执行阶段取消：为本轮每个工具调用补齐实际或取消结果，再追加 assistant 取消说明。
-- 未知工具阈值或迭代上限：工具结果已经配对，再追加 assistant 停止说明。
-- 自然完成：只追加模型最终文本；空文本使用 `NOTICE_EMPTY_FINAL`。
+- `ProviderConfig.protocol` 扩展为 `anthropic | deepseek | openai`。
+- 支持 Anthropic 默认 base URL、自定义 base URL、`ANTHROPIC_API_KEY` 环境变量和 model。
+- 保留现有 OpenAI `base_url`，使兼容端点可配置；DeepSeek 行为不变。
+- `new_provider()` 根据 protocol 构造三种 Provider。
+- `pyproject.toml` 增加 `anthropic` 依赖，不改变 Python 和 Textual 版本范围。
 
-所有异常终止后历史均以普通 assistant 文本结尾，下一轮可继续使用。
+### Agent
 
-### `endless_code.llm`
+**文件：** `src/endless_code/agent/__init__.py`
 
-职责：协议无关消息/事件定义、DeepSeek/OpenAI 请求转换、工具调用分片拼接和用量上报。
+- `Agent` 增加 `version` 字段；运行开始时构造稳定 system 和环境段。
+- 增加 `PLAN_REMINDER_INTERVAL = 4`。
+- 每轮按 `Mode.PLAN` 与 iteration 生成完整/精简 reminder，组装 `Request` 后调用 Provider。
+- 将缓存字段透传到既有 Agent `Event.usage`，不改变 TUI 状态栏的输入/输出展示约定。
+- 保留既有取消、错误、工具批次、历史写入和停止条件；动态 reminder 不调用 `Conversation.add_*`。
 
-共享行为：
+### TUI 与 smoke
 
-- `_to_openai_messages(msgs, system_suffix)` 在内置系统提示后拼接非空后缀。
-- 两个 Provider 请求均启用流与工具定义，并请求流式 usage。
-- 每个 chunk 先检查 `chunk.usage`，不能假定 usage chunk 一定没有 choices。
-- 工具调用继续按 `index` 缓冲 `id/name/arguments`，流结束后按 index 生成 `ToolCall`。
-- SDK 流放入 `async with response`，确保取消时关闭连接。
+**文件：** `src/endless_code/tui/app.py`、`src/endless_code/cli.py`、`examples/smoke.py`
 
-`OpenAIProvider`：请求加入 `stream_options={"include_usage": True}`，从 `prompt_tokens` 和 `completion_tokens` 生成 `Usage`。
-
-`DeepSeekProvider`：沿用默认 DeepSeek `base_url` 与现有 `thinking` 请求体，同时加入兼容的 `stream_options={"include_usage": True}`，按同一 usage 字段生成 `Usage`。Plan Mode 仅影响工具定义和系统后缀，不改变 `thinking` 配置。
-
-若兼容端点没有返回 usage，适配器不伪造数字；自动化 Provider 测试验证字段解析，真实 DeepSeek/OpenAI 用量由端到端验收确认。
-
-### `endless_code.tool`
-
-职责：工具分类、超时、结构化错误和命令生命周期。
-
-- `Registry.execute` 保留单一 `asyncio.wait_for` 超时层；Agent 不再重复包装超时。
-- `BashTool` 根据 `returncode != 0` 设置 `Result.is_error`。
-- `BashTool.execute` 捕获 `CancelledError`，终止完整进程树、等待进程退出后重新抛出取消，让 `Registry` 正确返回超时或让 Agent 正确处理用户取消。
-- POSIX 创建独立 session，清理时向进程组发送终止信号，必要时升级为强制结束。
-- Windows 创建独立进程组，清理时使用系统进程树终止能力结束 shell 及其子进程，并等待 shell 回收。
-- stdout/stderr 的现有截断上限不变。
-
-### `endless_code.prompt`
-
-新增：
-
-```python
-PLAN_MODE_REMINDER = (
-    "You are in PLAN MODE. Use only read_file, glob, and grep to investigate. "
-    "Do not write or edit files and do not run shell commands. Produce a clear "
-    "step-by-step plan, then stop and wait for /do."
-)
-
-EXECUTE_DIRECTIVE = "请按上面的计划开始执行。"
-```
-
-`SYSTEM_PROMPT` 增加持续使用工具直到任务完成的约定。Plan Mode 的只读限制同时由提示词和实际注入的工具集合保证。
-
-### `endless_code.security`
-
-职责：所有用户可见输出的密钥脱敏及工具参数摘要。
-
-- 函数保持无状态，便于单测。
-- TUI 初始化时从所有 ProviderConfig 收集明文密钥和当前环境中可解析的密钥引用；未设置的环境变量跳过，不提前阻止应用启动。
-- assistant 最终文本、跨工具 preamble、工具参数、工具结果摘要和异常文本在写入 RichLog 前统一脱敏。
-- 原始对话历史和完整工具结果仍在内部保留；本阶段只保证用户可见输出不回显密钥，不改变模型上下文语义。
-
-### `endless_code.tui`
-
-职责：输入、模式状态、事件渲染、用户取消与会话级统计。
-
-主要字段：
-
-```python
-self._tool_registry: Registry  # 避免覆盖 Textual App._registry
-self._mode: Mode = Mode.NORMAL
-self._iteration: int = 0
-self._usage_in: int = 0
-self._usage_out: int = 0
-self._turn_cancel: asyncio.Event | None = None
-self._cur_tools: list[ToolDisplay] = []
-self._secrets: set[str] = ...
-```
-
-输入处理：
-
-- `/exit`、`/quit`：退出。
-- `/plan`：切换 `Mode.PLAN`，写入脱敏的模式提示，不发起模型请求。
-- `/do`：切换 `Mode.NORMAL`，向 Conversation 添加 `EXECUTE_DIRECTIVE` 用户消息并立即启动 Agent；`/do` 字面值不写入历史。
-- 普通文本：添加 user 消息并按当前模式启动 Agent。
-
-按键：
-
-- `Ctrl+D`：沿用程序退出；若当前有 task，先取消并等待工具清理。
-- `Ctrl+C`：流式状态只 `set()` 当前取消事件；其他状态退出程序。
-- `Esc`：流式状态只 `set()` 当前取消事件；其他状态忽略。
-
-事件消费：
-
-- `text`：累积当前文本；工具开始前将其作为 preamble 写入 scrollback。
-- `tool START`：使用 `summarize_tool_args` 建立 `ToolDisplay` 并加入动态区。
-- `tool END`：按 `call_id` 移除对应动态项，按事件顺序写入工具行和脱敏结果摘要。
-- `usage`：累加输入/输出并刷新状态文本。
-- `iteration`：更新动态区轮次。
-- `notice`：写入系统提示。
-- `err`：提交尚未展示的 partial text，再展示脱敏错误块；等待随后的 `done` 统一清理。
-- `done`：提交剩余最终文本，停止计时器、恢复输入和空闲态；不得写 Conversation。
-
-Provider 状态、模式和累计用量通过 `App.sub_title` 显示，Footer 继续显示快捷键。流式动态区显示当前轮次、计时和所有运行中的工具。
-
-Provider 构造或环境变量解析失败时在界面显示错误并保持选择/空闲状态，不允许异常逃逸导致 TUI 崩溃。
-
-### `endless_code.cli` 与依赖
-
-- CLI 接线保持 `Config -> Registry -> EndlessCodeApp`。
-- TUI 工具字段改名后继续传入同一 Registry 实例。
-- `pyproject.toml` 为 Textual 增加当前主版本上界 `<9`，并分别验证最低声明版本与当前 8.x；避免未来主版本自动进入支持范围。
-- pytest 明确异步 fixture loop scope，消除当前弃用警告。
-- README 更新 Agent Loop、Plan Mode、取消键和用量展示说明。
+- TUI 构造 Agent 时传入应用版本，保留 `/plan`、`/do`、Esc、Ctrl+C 和 Provider 选择行为。
+- TUI 不显示缓存字段；只消费既有 usage/iteration 事件。
+- 新增 smoke 脚本，以配置 Provider 连续发起两轮请求，打印 `input/output/cache_write/cache_read`，用于验证真实端点字段，不写入对话历史。
 
 ## 模块交互
 
-```text
-用户普通输入或 /do
-  -> TUI 添加一条 user 消息
-  -> 创建 turn_cancel，启动 Agent.run
-     -> iteration 事件
-     -> Provider.stream(history, tools(mode), suffix(mode))
-        -> text/tool_calls/usage/done 或 err
-     -> 无工具：Agent 保存 assistant 最终文本 -> done
-     -> 有工具：Agent 保存 assistant(tool_calls)
-        -> 按顺序切分只读并发批/副作用串行批
-        -> START 事件 -> 执行 -> END 事件
-        -> Agent 保存全部 ToolResult
-        -> 下一轮 Provider.stream
-  -> TUI 仅消费事件并渲染
-
-Esc/Ctrl+C
-  -> turn_cancel.set()
-  -> Agent 关闭当前 Provider 流或取消工具 task
-  -> BashTool 在取消传播时终止进程树
-  -> Agent 补齐工具结果与 assistant 取消说明
-  -> notice -> done
-  -> TUI 回到 IDLE
-```
+1. CLI 加载 YAML 配置，Provider 工厂按 protocol 构造 Anthropic/OpenAI/DeepSeek。
+2. TUI 将用户消息写入 Conversation，Agent 只负责 assistant/tool 历史。
+3. Agent 首次运行构造稳定 system 和 Environment；每轮选择全量或只读工具。
+4. Agent 依据模式与轮次生成 reminder，组装 Request。
+5. Provider 按协议序列化 system、environment、history、tools 和 reminder，发起流式请求。
+6. Provider 生成 StreamEvent；Agent 累积完整响应并继续现有 ReAct 循环。
+7. Usage 的输入/输出/缓存字段通过 Agent Event 对外；smoke 额外打印缓存字段。
 
 ## 文件组织
 
 ```text
-endless-code/
-├── pyproject.toml                         # Textual 上界、pytest 异步配置
-├── README.md                              # Agent Loop 与交互说明
+project/
+├── pyproject.toml                         # anthropic 依赖与现有版本范围
+├── spec.md / plan.md / task.md / checklist.md
+├── examples/smoke.py                      # 三 Provider usage/cache 冒烟
 ├── src/endless_code/
-│   ├── cli.py                             # 保持接线，适配 TUI 构造参数
-│   ├── conversation.py                    # 增加 last_role
-│   ├── prompt.py                          # Plan/执行提示和循环约定
-│   ├── security.py                        # 新增脱敏与安全参数摘要
+│   ├── prompt/
+│   │   ├── __init__.py                    # Prompt 公共导出
+│   │   ├── modules.py                     # Module 与模块常量
+│   │   ├── environment.py                 # Environment 与 Git 降级采集
+│   │   └── reminder.py                    # system-reminder 与 Plan reminder
 │   ├── llm/
-│   │   ├── __init__.py                    # Usage、StreamEvent、Provider 签名
-│   │   ├── openai_provider.py             # system_suffix、usage、可关闭流
-│   │   └── deepseek_provider.py           # system_suffix、usage、thinking 保持
-│   ├── tool/
-│   │   ├── __init__.py                    # read_only 接口、Registry 查询
-│   │   ├── bash.py                        # 非零错误、取消时清理进程树
-│   │   └── 其余五个工具                    # read_only 属性
-│   ├── agent/
-│   │   └── __init__.py                    # ReAct 循环、事件、取消、分批执行
-│   └── tui/
-│       └── app.py                         # 模式、状态、事件渲染、脱敏、按键
+│   │   ├── __init__.py                    # System/Request/Usage/Provider
+│   │   ├── anthropic_provider.py           # Anthropic 缓存 system 与流解析
+│   │   ├── openai_provider.py              # OpenAI/兼容端点
+│   │   └── deepseek_provider.py            # DeepSeek 兼容端点
+│   ├── agent/__init__.py                   # Request 组装与 Agent Loop
+│   ├── config.py                           # 三 Provider 配置
+│   ├── tui/app.py                          # TUI
+│   └── tool/                               # 既有工具与描述强化
 └── tests/
-    ├── test_agent.py                      # 重写为多轮/停止/并发/取消测试
-    ├── test_tool.py                       # 分类、非零退出、跨平台超时清理
-    ├── test_conversation.py               # 新增 last_role 测试
-    ├── test_llm.py                        # 新增两 Provider 分片/usage/suffix 测试
-    ├── test_security.py                   # 新增脱敏与参数摘要测试
-    └── test_tui.py                        # 新增 Textual 挂载/历史/命令/取消测试
+    ├── test_config.py                      # 三协议配置与 base_url
+    ├── test_prompt.py                      # 模块、环境与 reminder
+    ├── test_anthropic_provider.py          # system/cache/reminder 序列化
+    ├── test_llm.py                         # OpenAI/DeepSeek Request/usage
+    ├── test_agent.py                       # Request、轮次 reminder、缓存透传
+    ├── test_tui.py                          # 既有 TUI 回归
+    └── test_tool.py                         # 描述与工具回归
 ```
 
 ## 技术决策
 
 | 决策点 | 选择 | 理由 |
 |---|---|---|
-| 循环归属 | 重写 `Agent.run` | 编排与 UI 解耦，Conversation 写入只有一个所有者 |
-| 迭代上限 | 内置 25 | 足够覆盖多步任务，同时限制失控请求和成本 |
-| 未知工具阈值 | 连续 3 个“全为未知工具”的迭代 | 给模型纠偏机会；混入已知工具表示仍有进展并重置 |
-| 取消信号 | per-turn `asyncio.Event` + `asyncio.wait` 竞速 | 既能保留历史收尾，又能在无新 chunk 时及时打断 |
-| 工具并发 | 仅最长连续只读批并发 | 满足顺序语义，不跨副作用边界重排 |
-| 工具超时 | Registry 维持唯一 `wait_for` | 避免双重超时；工具负责 cancellation cleanup |
-| 命令清理 | 独立进程组/树，取消时显式终止并等待 | 单纯取消 `communicate()` 不会停止子进程 |
-| 历史所有权 | Agent 写 assistant/tool，TUI 只写 user | 消除当前重复 assistant 消息并保持协议历史一致 |
-| Plan Mode 防线 | 只读工具集合 + 系统提示后缀 | 即使模型忽略提示，也拿不到写入/执行工具 |
-| 用量来源 | Provider 从最终流式 usage 块上报 | 输入/输出口径来自服务端实际计费统计 |
-| DeepSeek 适配 | 保持 OpenAI 兼容流并保留 `thinking` 请求体 | 与现有实现和配置兼容，改动集中在 usage/suffix |
-| 输出脱敏 | TUI 所有输出入口统一处理，工具参数结构化摘要 | 不污染内部历史，同时覆盖用户可见泄漏面 |
-| TUI 注册中心字段 | `_tool_registry` | 避免覆盖 Textual 的 `_registry` 私有字段 |
-| Textual 版本 | 保留最低版本并增加 `<9` 上界 | 最低声明版本与当前 8.x 都列为显式验证目标，未来主版本需重新验证 |
-| 文件拆分 | 仅新增 `security.py`，其余沿用当前单文件 TUI | 避免把本阶段扩大成无关重构 |
+| Prompt 组织 | `prompt` 子包 + 固定模块 | 让新增指令模块局部接入，并保持稳定顺序 |
+| Provider 请求接口 | `Request` dataclass | 避免继续扩展位置参数，明确稳定/动态边界 |
+| Anthropic 缓存 | stable system block 使用 `cache_control: ephemeral` | 让工具定义和稳定指令形成可复用前缀，环境块不影响前缀 |
+| OpenAI 缓存 | stable system 位于消息前缀 | 兼容官方和自定义 `base_url`，不强制端点一定返回缓存字段 |
+| DeepSeek 缓存 | 复用 OpenAI-compatible 请求并尽力解析 prompt cache 字段 | 保留现有适配器和 thinking 行为 |
+| reminder 位置 | Anthropic 并入末条可追加 content；OpenAI/DeepSeek 追加 user 消息 | 保持协议消息合法，且不污染持久历史 |
+| 环境采集 | 标准库 + 有界 git 命令 | 不依赖敏感环境变量，失败可降级 |
+| TUI 缓存展示 | 不改变现有状态栏，仅 smoke 打印 | 遵循 Spec 中不新增状态栏缓存展示的范围边界 |
+| 配置选择 | protocol 分支 + 可选 base_url | 同时覆盖 Anthropic、OpenAI 兼容端点和 DeepSeek |

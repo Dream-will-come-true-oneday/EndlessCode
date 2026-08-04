@@ -1,6 +1,7 @@
 """Agent 层：可取消的 ReAct 循环与保序工具调度。"""
 
 import asyncio
+import inspect
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
@@ -8,17 +9,20 @@ from enum import Enum
 from endless_code.conversation import Conversation
 from endless_code.llm import (
     Provider,
+    Request,
     StreamEvent,
+    System,
     ToolCall,
     ToolDefinition,
     ToolResult,
     Usage,
 )
-from endless_code.prompt import PLAN_MODE_REMINDER
+from endless_code.prompt import build_system_prompt, gather_environment, plan_reminder
 from endless_code.tool import Registry, Result
 
 MAX_ITERATIONS = 25
 MAX_UNKNOWN_RUN = 3
+PLAN_REMINDER_INTERVAL = 4
 NOTICE_MAX_ITER = "（已达最大迭代轮数 25，自动停止；可继续发消息推进。）"
 NOTICE_UNKNOWN_TOOLS = "（连续多轮只请求到未注册的工具，自动停止。）"
 NOTICE_STREAM_ERROR = "（请求出错，本轮已中断。）"
@@ -79,9 +83,12 @@ class _ExecutionState:
 class Agent:
     """持有 Provider 与注册中心，执行完整 ReAct 循环。"""
 
-    def __init__(self, provider: Provider, registry: Registry) -> None:
+    def __init__(
+        self, provider: Provider, registry: Registry, version: str = "0.1.0"
+    ) -> None:
         self._provider = provider
         self._registry = registry
+        self._version = version
 
     async def run(
         self,
@@ -90,12 +97,12 @@ class Agent:
         cancel: asyncio.Event | None = None,
     ) -> AsyncIterator[Event]:
         cancel = cancel or asyncio.Event()
+        environment = await gather_environment(self._version, self._provider.model)
+        stable_system = build_system_prompt()
         if mode is Mode.PLAN:
             definitions = self._registry.read_only_definitions()
-            system_suffix = PLAN_MODE_REMINDER
         else:
             definitions = self._registry.definitions()
-            system_suffix = ""
 
         unknown_run = 0
         for iteration in range(1, MAX_ITERATIONS + 1):
@@ -107,10 +114,21 @@ class Agent:
 
             yield Event(iteration=iteration)
             round_state = _RoundState()
+            reminder = (
+                plan_reminder((iteration - 1) % PLAN_REMINDER_INTERVAL == 0)
+                if mode is Mode.PLAN
+                else ""
+            )
+            request = Request(
+                messages=conv.messages(),
+                tools=definitions,
+                system=System(stable=stable_system, environment=environment.render()),
+                reminder=reminder,
+            )
             async for event in self._stream_events(
                 conv,
                 definitions,
-                system_suffix,
+                request,
                 cancel,
                 round_state,
             ):
@@ -183,13 +201,13 @@ class Agent:
         self,
         conv: Conversation,
         definitions: list[ToolDefinition],
-        system_suffix: str,
+        request: Request,
         cancel: asyncio.Event,
         state: _RoundState,
     ) -> AsyncIterator[Event]:
-        stream = self._provider.stream(
-            conv.messages(), definitions, system_suffix
-        ).__aiter__()
+        request.messages = conv.messages()
+        request.tools = definitions
+        stream = self._call_provider(request).__aiter__()
         cancel_task = asyncio.create_task(cancel.wait())
         next_task: asyncio.Task[StreamEvent] | None = None
         try:
@@ -237,6 +255,17 @@ class Agent:
             close = getattr(stream, "aclose", None)
             if close is not None:
                 await close()
+
+    def _call_provider(self, request: Request):
+        """Call the Request API while tolerating legacy providers."""
+        stream_fn = self._provider.stream
+        try:
+            legacy = len(inspect.signature(stream_fn).parameters) >= 2
+        except (TypeError, ValueError):
+            legacy = False
+        if legacy:
+            return stream_fn(request.messages, request.tools, request.reminder)
+        return stream_fn(request)
 
     async def _execute_events(
         self,

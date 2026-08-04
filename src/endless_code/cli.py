@@ -21,5 +21,5 @@ def main() -> None:
     print(render_banner(__version__, os.getcwd()))
 
     registry = new_default_registry()
-    app = EndlessCodeApp(cfg.providers, registry)
+    app = EndlessCodeApp(cfg.providers, registry, version=__version__)
     app.run()

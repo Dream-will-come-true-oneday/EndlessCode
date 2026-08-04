@@ -437,3 +437,69 @@ async def test_stream_error_has_terminal_history_and_can_continue() -> None:
     events = await _run(Agent(provider, _registry()), conv)
     assert any(event.text == "ok" for event in events)
     assert conv.messages()[-1].content == "ok"
+
+
+class RequestProvider:
+    name = "request-fake"
+    model = "request-model"
+
+    def __init__(self, scripts):
+        self.scripts = scripts
+        self.requests = []
+        self.index = 0
+
+    async def stream(self, request):
+        self.requests.append(request)
+        script = self.scripts[self.index]
+        self.index += 1
+        for event in script:
+            yield event
+
+
+@pytest.mark.asyncio
+async def test_stable_prefix_plan_reminder_and_history_are_isolated() -> None:
+    provider = RequestProvider(
+        [
+            [_tool_event("one"), StreamEvent(done=True)],
+            [_tool_event("two"), StreamEvent(done=True)],
+            [_tool_event("three"), StreamEvent(done=True)],
+            [_tool_event("four"), StreamEvent(done=True)],
+            [StreamEvent(text="done"), StreamEvent(done=True)],
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("plan")
+    await _run(Agent(provider, _registry(EchoTool())), conv, mode=Mode.PLAN)
+    reminders = [request.reminder for request in provider.requests]
+    assert reminders[0] == PLAN_MODE_REMINDER
+    assert reminders[1] != PLAN_MODE_REMINDER
+    assert reminders[4] == PLAN_MODE_REMINDER
+    assert len({request.system.stable for request in provider.requests}) == 1
+    assert all(
+        [tool.name for tool in request.tools] == ["echo_tool"]
+        for request in provider.requests
+    )
+    assert all("system-reminder" not in message.content for message in conv.messages())
+
+
+@pytest.mark.asyncio
+async def test_cache_usage_is_forwarded_from_request_provider() -> None:
+    provider = RequestProvider(
+        [
+            [
+                StreamEvent(usage=Usage(3, 2, 7, 5)),
+                StreamEvent(text="done"),
+                StreamEvent(done=True),
+            ]
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("work")
+    events = await _run(Agent(provider, _registry()), conv)
+    usage = next(event.usage for event in events if event.usage)
+    assert (
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_write,
+        usage.cache_read,
+    ) == (3, 2, 7, 5)

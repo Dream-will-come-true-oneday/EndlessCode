@@ -1,7 +1,7 @@
 """Conversation 历史尾部查询测试。"""
 
 from endless_code.conversation import Conversation
-from endless_code.llm import ToolCall, ToolResult
+from endless_code.llm import Message, ToolCall, ToolResult
 
 
 def test_last_role_tracks_history() -> None:
@@ -22,3 +22,13 @@ def test_last_role_tracks_history() -> None:
 
     conv.add_assistant("done")
     assert conv.last_role() == "assistant"
+
+
+def test_replace_history_uses_deep_copy_and_accepts_none() -> None:
+    conv = Conversation()
+    messages = [Message(role="user", content="original")]
+    conv.replace_history(messages)
+    messages[0].content = "changed"
+    assert conv.messages()[0].content == "original"
+    conv.replace_history(None)
+    assert conv.messages() == []

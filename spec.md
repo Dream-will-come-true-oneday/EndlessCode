@@ -1,86 +1,98 @@
-# 系统提示工程化 Spec
+# Endless Code 上下文管理 Spec
 
 ## 背景
 
-`endless-code` 已具备可取消的多轮 Agent Loop、Plan Mode，以及 Anthropic、DeepSeek/OpenAI 的流式工具调用能力；但当前系统提示仍以单个固定字符串维护，环境上下文和模式提醒通过零散的字符串拼接传递。稳定指令、工具定义、环境信息和临时提醒没有清晰边界，难以扩展，也无法稳定利用 OpenAI 兼容端点的前缀缓存。
+Endless Code 是一个 Python/Textual 终端编码 Agent。Agent 每轮都把 `Conversation` 中的用户消息、助手消息、工具调用和工具结果重新交给当前 Provider。长时间编码时，`read_file`、`bash`、`grep` 和 MCP 工具结果会持续堆积，最终触发 Provider 的上下文超限错误。
 
-本阶段将系统提示工程化：把稳定指令模块化，把随请求变化的环境信息和提醒移出稳定前缀，并在不破坏既有 Agent Loop 的前提下，为 Anthropic、DeepSeek 与 OpenAI 提供一致的请求装配和缓存用量观测能力。
+当前项目已经具备 Agent ReAct 循环、三类 Provider、工具注册中心、MCP 客户端和权限引擎，但没有长会话上下文管理、工具结果落盘或摘要恢复能力。本功能在不改变现有工具和权限语义的前提下，为单个进程内的 TUI 会话增加可恢复的上下文压缩。
 
 ## 目标
 
-- 将系统级指令拆分为有名称和优先级的模块，形成确定的稳定系统提示。
-- 将稳定指令与工具定义保持为跨轮不变的请求前缀；环境信息、历史和临时提醒按轮动态构造。
-- 为模型提供当前工作目录、平台、日期、Git 状态、应用版本和模型名称等安全的运行环境信息。
-- 通过不写入持久历史的 `<system-reminder>` 机制注入临时系统补充指令。
-- 让 Plan Mode 按 Agent 轮次注入完整或精简提醒，同时继续只开放只读工具。
-- 从 Anthropic、DeepSeek/OpenAI 返回的可用 usage 字段解析缓存命中信息，并保持字段缺失时的兼容性。
+- 长时间单进程会话不会因为历史消息无限增长而轻易撞上 Provider 上下文窗口。
+- 超大工具结果保留在本地，并在对话中使用稳定预览，保持后续请求的缓存前缀稳定。
+- 摘要后保留用户原话、最近文件快照、当前工具定义和边界提示，模型仍能继续当前任务。
+- 自动压缩、手动 `/compact` 和 Provider 上下文超限后的紧急压缩共享摘要核心，但触发和熔断策略不同。
+- 现有 `pytest` 测试和 `/exit`、`/plan`、`/do`、权限审批、MCP 行为不退化。
 
 ## 功能需求
 
-- F1: 模块化稳定系统提示
-  系统提示由按优先级排列的模块拼装，模块间以空行分隔。固定模块包括：身份、系统约束、任务模式、动作执行、工具使用、语气风格和文本输出。保留自定义指令、已激活 Skill、长期记忆三个空模块位置；空内容必须跳过，不留下多余分隔符。新增模块不应要求修改拼装逻辑。
+### F1：工具结果预防性压缩
 
-- F2: 环境信息
-  每个 Agent 回合构造独立环境信息段，包含工作目录、平台、当前日期、Git 状态、应用版本和当前模型。该段与稳定系统提示逻辑分离，并且不得包含 API 密钥或环境变量值。
+1. 每次主对话请求组装前扫描 `Message(role="tool")` 的 `tool_results`。
+2. 单条结果 UTF-8 字节数大于 `50000` 时，完整内容写入 `.endless-code/sessions/<session_id>/tool-results/<tool_use_id>`，对话中替换为稳定预览。
+3. 同一条工具消息的剩余结果合计超过 `200000` 字节时，按结果字节数从大到小继续落盘，直到剩余合计不超过阈值。
+4. 预览必须包含原始字节数、最多 20 行且最多 2048 字节的头部、落盘路径和使用 `read_file` 重读的提示。
+5. 落盘失败时保留原文且不冻结该 id；成功决策后同一 `tool_use_id` 在本会话中不可翻转，预览字符串逐轮复用。
 
-- F3: 稳定前缀与缓存友好请求
-  稳定系统提示和当前工具定义必须保持确定的顺序与字节内容，使其可作为 Anthropic、DeepSeek/OpenAI 兼容请求的稳定前缀。Anthropic 请求在稳定系统块上设置显式缓存断点；OpenAI 兼容端点依赖稳定前缀缓存。环境信息、持久会话历史和本轮 reminder 必须位于动态部分，不能改变稳定模块本身。项目不依赖任何特定端点一定支持前缀缓存。
+### F2：自动摘要
 
-- F4: 缓存用量观测
-  Usage 对外暴露输入、输出、缓存写入和缓存读取数量。Anthropic 解析 `cache_creation_input_tokens` 与 `cache_read_input_tokens`；OpenAI 解析 `prompt_tokens_details.cached_tokens`；DeepSeek 解析其可用的 prompt cache 命中字段。字段缺失、为空或端点不支持时以零处理，不中断会话。缓存写入只有端点提供明确字段时才报告。
+当估算 token 达到 `context_window - 20000 - 13000` 时，在下一次主对话 Provider 请求前执行一次摘要。摘要请求不传工具定义，要求模型先输出 `<analysis>` 草稿，再输出包含以下九节的 `<summary>`：
 
-- F5: 关键工具约定双重强化
-  系统提示的工具使用模块与对应工具描述都必须强调：优先使用专用读写搜索工具，而不是用 `bash` 拼凑；编辑文件前必须先读取目标内容。
+1. 主要请求和意图
+2. 关键技术概念
+3. 文件和代码段
+4. 错误和修复
+5. 问题解决过程
+6. 所有用户消息原文
+7. 待办任务
+8. 当前工作
+9. 可能的下一步
 
-- F6: 补充消息注入
-  系统能以 `<system-reminder>...</system-reminder>` 包裹临时补充指令，并将其加入本轮 provider 请求。该提醒不能写入 `Conversation` 的持久历史，不得被作为普通用户问题展示或回显。
+摘要解析只保留 `<summary>` 内容。
 
-- F7: Plan Mode 轮次提醒
-  `/plan` 后继续只向模型提供 `read_file`、`glob`、`grep`。首轮注入完整 Plan 提醒，固定间隔轮次再次注入完整提醒，其余轮次注入精简提醒；`/do` 恢复完整工具集，并以执行指令开始下一回合。
+### F3：摘要恢复
 
-- F8: 三协议一致性
-  Anthropic、DeepSeek 与 OpenAI Provider 使用相同的稳定系统提示、环境信息和 reminder 语义；三者都保持工具调用、流式文本、usage、取消和历史回灌的既有行为。允许各端点在缓存字段和缓存写入能力上不同。
+摘要后追加一条恢复消息，再追加近期原文。恢复消息包含：
 
-- F9: Provider 配置
-  配置文件支持 `protocol: anthropic`、`protocol: deepseek` 和 `protocol: openai`。Anthropic 使用 `ANTHROPIC_API_KEY`、默认官方 base URL 和配置的 model；OpenAI 使用 `OPENAI_API_KEY`、可选 `base_url` 和配置的 model；DeepSeek 保持现有配置。多 Provider 选择和缺失环境变量降级行为保持不变。
+- 最近成功读取的最多 5 个文件，按最后读取时间倒序；每个文件最多 5000 token，超出保留头部并追加 `(content truncated)`。
+- 当前这次 Agent 迭代实际传给 Provider 的同一份 `ToolDefinition` 列表，名称、描述和 schema 必须一致。
+- 固定边界提示：需要文件原文、错误原文或用户原话时必须使用 `read_file` 重读，不能依赖摘要猜测。
+
+近期原文从会话尾部倒序保留，直到同时满足至少 10000 token 和至少 5 条消息；不得截断 assistant 工具调用与对应 tool 结果的配对，截断点落在配对中间时向前移到调用前。
+
+### F4：token 估算和 Provider 窗口
+
+- 估算锚点为最近一次主对话 Provider 返回的 `input_tokens + output_tokens + cache_read + cache_write`。
+- 锚点之后新增消息按 UTF-8 字符数除以 `3.5` 向上取整。
+- 每次主对话流结束后替换锚点，不累加；摘要请求的 usage 不更新主对话锚点。
+- `ProviderConfig.context_window` 为可选正整数；未配置时 Anthropic 默认 `200000`，OpenAI 和 DeepSeek 默认 `128000`。
+
+### F5：手动压缩和命令分发
+
+- `/exit`、`/quit`、`/plan`、`/do` 和 `/compact` 由统一命令注册表处理，不写入 Conversation，不发送给 LLM。
+- 未知斜杠命令显示可用命令，不发送给 LLM。
+- `/compact` 无条件执行摘要，跳过自动阈值、第一层预防压缩和自动熔断；完成后显示压缩前后 token。
+- 手动压缩与主 Agent 运行互斥。
+
+### F6：上下文超限应急处理
+
+- Provider 报告上下文超限时统一转换为 `PromptTooLongError`。
+- Agent 先强制执行第一层，再执行摘要恢复；摘要成功且估算低于 `context_window - 20000 - 3000` 时只重试原主请求一次。
+- 重试仍超限或压缩后仍超过安全阈值时结束本轮并显示错误，不进行第三次主请求。
+- 摘要请求自身超限时，按用户提交分组丢弃最旧消息重试，最多直接丢一组三次，之后每次丢剩余组数的 20%（向上取整，至少一组）；不能发送空消息摘要请求。
+
+### F7：生命周期和并发
+
+- 进程启动时创建一次 `<unix_ts>-<短随机串>` 会话 id，并按需创建 `.endless-code/sessions/<id>/tool-results/`。
+- `SessionRuntime` 由 `EndlessCodeApp` 持有，跨用户轮次复用替换账本、文件追踪、熔断器、会话目录和 token 锚点。
+- Conversation 的历史替换使用深拷贝；替换账本、文件追踪、熔断器在并发访问下保持一致。
+- 不做跨进程历史持久化，不自动清理会话目录，不引入精确 tokenizer。
 
 ## 非功能需求
 
-- N1: 缓存确定性
-  在相同工具集下，多轮请求的稳定系统提示和工具定义顺序必须一致；环境、日期、轮次和 reminder 不得混入稳定部分。
-
-- N2: 既有行为不回退
-  多轮 Agent Loop、保序工具调度、取消、流错误恢复、历史一致性、TUI 模式切换、Token 统计和密钥脱敏必须继续工作。
-
-- N3: 历史合法性
-  动态 reminder 不持久化，不得造成工具调用/结果配对异常或使后续请求的消息角色序列非法。
-
-- N4: 环境采集可降级
-  Git 信息不可用、目录不是 Git 仓库或平台信息读取失败时，环境信息应省略对应部分而不是阻塞或终止请求。
-
-- N5: 安全性
-  环境信息、日志、TUI 和错误输出均不得泄露 API 密钥或敏感环境变量值。
-
-- N6: 兼容性与工程质量
-  项目在声明的 Python 与 Textual 版本范围内运行；格式检查、静态检查和自动化测试通过。
-
-## 不做的事
-
-- 不做项目重命名、目录迁移或新的模型协议；本阶段仅新增 Anthropic，并保留 DeepSeek 与 OpenAI（含兼容 base_url）。
-- 不加载 `CLAUDE.md`、项目指令文件、长期记忆或真实 Skill 内容；相关模块仅保留为空的扩展位置。
-- 不增加 MCP、自动评测、上下文压缩、缓存 TTL 配置或缓存状态栏展示。
-- 不承诺所有 Anthropic、OpenAI 兼容端点或 DeepSeek 模型均返回缓存统计或提供缓存命中。
-- 不改变工具权限模型，不新增沙箱或工具执行审批。
+- 第一层在请求组装前执行，不调用 LLM；常规字符串处理应保持轻量，落盘不能长期阻塞事件循环。
+- 所有外部 Provider 和文件异常均有降级路径：工具落盘失败保留原文，摘要失败按自动熔断处理。
+- 上下文管理代码集中在 `src/endless_code/compact/`，Agent 只使用窄接口。
+- 核心逻辑必须可使用 fake Provider 离线测试。
 
 ## 验收标准
 
-- AC1: 固定模块按优先级稳定拼装，空的可选模块被跳过；新增测试模块可在不修改拼装逻辑的情况下参与输出。(F1)
-- AC2: 每次请求均含独立环境信息，至少可观察到工作目录、平台、日期、版本和模型；Git 信息不可用时请求仍可正常构造。(F2/N4)
-- AC3: 相同工具集的两轮请求中，稳定系统提示和工具定义序列完全一致；只改变环境或 reminder 不影响稳定部分。(F3/N1)
-- AC4: Anthropic、DeepSeek/OpenAI Provider 在各自可用字段存在时将缓存读写值写入 Usage；字段缺失时 Usage 的缓存值为零且流不中断。(F4)
-- AC5: 工具使用系统提示与 `bash`、`edit_file` 描述都可观察到“专用工具优先”和“编辑前先读”的约定。(F5)
-- AC6: reminder 使用 `<system-reminder>` 标签进入当轮请求，且不会出现在 `Conversation.messages()` 的持久历史中。(F6/N3)
-- AC7: Plan Mode 首轮与间隔轮次使用完整 reminder，其余轮次使用精简 reminder；其工具集始终只读，`/do` 后恢复全部工具。(F7)
-- AC8: 使用 FakeProvider 覆盖多轮工具、取消、流错误和 Plan/Do 场景后，既有 Agent/TUI 历史和事件行为仍通过。(F8/N2/N3)
-- AC9: Anthropic、DeepSeek/OpenAI 的请求装配在系统提示、环境信息、reminder 和缓存 usage 行为上具有一致语义；已有协议差异不导致错误，OpenAI 兼容 `base_url` 可用。(F8/F9)
-- AC10: `ruff format --check .`、`ruff check .`、`python -m compileall -q src` 与全量 pytest 均通过，且测试输出与可见 UI 文本不含测试密钥原文。(N5/N6)
+- AC1：60000 字节工具结果在下一次请求中变成稳定预览，完整文件存在且大小一致。
+- AC2：多条工具结果聚合超过 200000 字节时，剩余对话结果合计不超过阈值。
+- AC3：同一 id 的 keep/replaced 决策跨至少五轮不翻转，替换体逐字节一致。
+- AC4：达到自动阈值会在下一次主请求前摘要，低于阈值不摘要，连续三次自动失败后熔断。
+- AC5：摘要恢复消息包含九节摘要、用户原文、最多五个文件、实际工具 schema 和边界提示。
+- AC6：`/compact` 在低 token 时仍执行且不调用普通 Agent run；未知命令不调用 Provider。
+- AC7：Provider 上下文超限时完成一次紧急压缩和最多一次主请求重试。
+- AC8：Anthropic、OpenAI、DeepSeek 的默认或配置窗口生效，旧配置仍可加载。
+- AC9：现有测试、lint、格式化和 `python -m endless_code` 启动行为通过。

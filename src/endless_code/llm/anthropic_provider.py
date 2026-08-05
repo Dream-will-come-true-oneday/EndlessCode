@@ -10,12 +10,24 @@ from endless_code.llm import (
     ROLE_ASSISTANT,
     ROLE_TOOL,
     Message,
+    PromptTooLongError,
     Request,
     StreamEvent,
     ToolCall,
     ToolDefinition,
     Usage,
 )
+
+
+def _wrap_prompt_too_long(exc: Exception) -> Exception:
+    """将 Anthropic 上下文超限错误归一化。"""
+    text = f"{exc} {getattr(exc, 'body', '')}".lower()
+    markers = ("prompt is too long", "context_length", "context window")
+    if any(marker in text for marker in markers):
+        wrapped = PromptTooLongError("anthropic prompt too long")
+        wrapped.__cause__ = exc
+        return wrapped
+    return exc
 
 
 def _to_anthropic_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -226,4 +238,4 @@ class AnthropicProvider:
                 )
             yield StreamEvent(done=True)
         except Exception as exc:  # noqa: BLE001
-            yield StreamEvent(err=exc)
+            yield StreamEvent(err=_wrap_prompt_too_long(exc))

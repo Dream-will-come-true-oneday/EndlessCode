@@ -19,6 +19,7 @@ class ProviderConfig:
     model: str
     base_url: str | None = None
     thinking: bool = False
+    context_window: int = 0
 
     def resolve_api_key(self) -> str:
         """展开 api_key 中的环境变量引用，返回可用的密钥。"""
@@ -34,6 +35,19 @@ class Config:
 
 class ConfigError(Exception):
     """配置相关错误。"""
+
+
+DEFAULT_ANTHROPIC_CONTEXT_WINDOW = 200_000
+DEFAULT_OPENAI_CONTEXT_WINDOW = 128_000
+
+
+def effective_context_window(provider: ProviderConfig) -> int:
+    """返回 Provider 的显式或协议默认上下文窗口。"""
+    if provider.context_window > 0:
+        return provider.context_window
+    if provider.protocol == "anthropic":
+        return DEFAULT_ANTHROPIC_CONTEXT_WINDOW
+    return DEFAULT_OPENAI_CONTEXT_WINDOW
 
 
 def _expand_env(value: str) -> str:
@@ -94,6 +108,11 @@ def _validate_provider(idx: int, raw: dict) -> ProviderConfig:
         raise ConfigError(f"provider「{name}」缺少必填字段：api_key")
     if not model:
         raise ConfigError(f"provider「{name}」缺少必填字段：model")
+    context_window = raw.get("context_window", 0)
+    if not isinstance(context_window, int) or isinstance(context_window, bool):
+        raise ConfigError(f"provider「{name}」的 context_window 必须是整数")
+    if context_window < 0:
+        raise ConfigError(f"provider「{name}」的 context_window 不能小于 0")
 
     return ProviderConfig(
         name=str(name),
@@ -102,6 +121,7 @@ def _validate_provider(idx: int, raw: dict) -> ProviderConfig:
         model=str(model),
         base_url=raw.get("base_url"),
         thinking=bool(raw.get("thinking", False)),
+        context_window=context_window,
     )
 
 

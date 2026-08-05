@@ -12,6 +12,10 @@ ROLE_ASSISTANT = "assistant"
 ROLE_TOOL = "tool"
 
 
+class PromptTooLongError(Exception):
+    """Provider 上报请求超过上下文窗口时使用的统一异常。"""
+
+
 @dataclass
 class ToolCall:
     """协议无关地承载模型发起的一次工具调用。"""

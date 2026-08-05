@@ -1,222 +1,127 @@
-# 系统提示工程化 Plan
-
-> 技术栈：Python 3.12+、Textual、OpenAI SDK、Anthropic SDK。保留现有 `endless_code` 包名和 Agent Loop 控制流，新增 Anthropic Provider，并让 OpenAI/DeepSeek 共用兼容协议基础。
+# Endless Code 上下文管理 Plan
 
 ## 架构概览
 
-本阶段在现有 Agent Loop 外增加三层：
+新增 `src/endless_code/compact/` 作为上下文管理唯一入口，分为：
 
-1. **Prompt 层**：将固定系统指令拆成有优先级的模块；单独构造环境信息；按轮次生成 `<system-reminder>`。
-2. **请求层**：使用 `System` 与 `Request` dataclass 区分稳定系统块、动态环境块、持久历史、工具定义和本轮 reminder。
-3. **Provider 层**：Anthropic 使用两块 system 与显式缓存断点；OpenAI/DeepSeek 使用稳定 system 前缀和兼容消息；三者统一解析流式文本、工具调用与 usage。
+- `state.py`：会话目录、替换决策账本、文件追踪、自动熔断器。
+- `const.py`：所有硬编码阈值。
+- `token.py`：usage 锚点和增量估算。
+- `layer1.py`：工具结果落盘、预览、聚合预算和决策冻结。
+- `summary_prompt.py`：摘要请求序列化和 `<summary>` 解析。
+- `recovery.py`：文件快照、工具定义和边界提示渲染。
+- `layer2.py`：近期原文、摘要请求、PTL 自重试、自动/强制摘要。
+- `compact.py`：`manage_context` 编排入口和触发类型。
 
-调用链：
+`Agent` 负责每轮选择工具定义、调用 `manage_context`、更新 usage、记录 `read_file` 成功结果和处理主请求 PTL。`EndlessCodeApp` 负责持有 `SessionRuntime`、分发命令和渲染压缩状态。
 
-```text
-Agent.run
-  -> build_system_prompt + gather_environment
-  -> 根据 mode/iteration 构造 plan reminder
-  -> Request(messages, tools, system, reminder)
-  -> Anthropic/OpenAI/DeepSeek Provider
-  -> StreamEvent(text/tool_calls/usage/done/err)
-  -> Agent Loop 与 TUI
-```
+## 核心数据结构和接口
 
-稳定前缀只包含模块化系统提示和本轮固定工具定义。环境信息、历史与 reminder 在其后动态传递，不写入 `Conversation`。
+### `SessionRuntime`
 
-## 核心数据结构与接口
-
-### `prompt.Module`
-
-```python
-@dataclass(frozen=True)
-class Module:
-    name: str
-    priority: int
-    content: str
-```
-
-`fixed_modules()` 返回七个固定模块，优先级 10 至 70；`optional_modules()` 返回三个空槽，优先级 80 至 100。`assemble_system()` 按 priority 升序排序，跳过空内容，以两个换行连接。
-
-### `prompt.Environment`
-
-```python
-@dataclass(frozen=True)
-class Environment:
-    working_dir: str
-    platform: str
-    date: str
-    git_status: str
-    version: str
-    model: str
-
-    def render(self) -> str: ...
-```
-
-`gather_environment(version, model)` 使用标准库收集目录、平台、日期和版本；Git 状态通过有界的 `git status --porcelain` 获取，失败时为空字符串降级，不读取环境变量。
-
-### `llm.System` 与 `llm.Request`
-
-```python
-@dataclass(frozen=True)
-class System:
-    stable: str = ""
-    environment: str = ""
-
-
-@dataclass
-class Request:
-    messages: list[Message] = field(default_factory=list)
-    tools: list[ToolDefinition] = field(default_factory=list)
-    system: System = field(default_factory=System)
-    reminder: str = ""
-```
-
-`Provider.stream(req: Request) -> AsyncIterator[StreamEvent]` 替换现有位置参数接口。兼容测试 Provider 一并迁移到 Request。
-
-### `llm.Usage`
+放在 `src/endless_code/agent/__init__.py` 或同包 `runtime.py`，由 TUI 创建并跨轮复用：
 
 ```python
 @dataclass
-class Usage:
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_write: int = 0
-    cache_read: int = 0
+class SessionRuntime:
+    replacement: ContentReplacementState
+    recovery: RecoveryState
+    auto_tracking: CompactCircuitBreaker
+    session: SessionContext
+    context_window: int
+    usage_anchor: int = 0
+    anchor_msg_len: int = 0
+    run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 ```
 
-Anthropic 读取 `cache_creation_input_tokens` 和 `cache_read_input_tokens`；OpenAI 读取 `prompt_tokens_details.cached_tokens`；DeepSeek 读取兼容响应中的 prompt cache 命中字段。任何字段缺失均为零。
+### `compact.ManageInput/ManageOutput`
 
-## 模块设计
+`ManageInput` 包含当前 `Conversation`、Provider、模型名、context window、本轮实际工具定义列表、所有 SessionRuntime 状态、锚点和入口估算 token。`ManageOutput` 返回 `before_tokens`、`after_tokens` 和是否执行摘要所需的信息。
 
-### Prompt 模块
+```python
+class TriggerKind(Enum):
+    AUTO = "auto"
+    MANUAL = "manual"
+    EMERGENCY = "emergency"
 
-**职责：** 稳定系统提示、环境段和动态 reminder 的构造，不依赖 `llm` 包。
 
-- `modules.py`：模块类型、七个固定模块、三个空可选模块和固定正文。
-- `environment.py`：`Environment`、Git 状态采集和安全渲染。
-- `reminder.py`：`system_reminder()`、完整/精简 Plan reminder、`EXECUTE_DIRECTIVE`。
-- `__init__.py`：导出 `assemble_system`、`build_system_prompt`、`gather_environment`、`Environment`、reminder API，并兼容导出现有 `SYSTEM_PROMPT`、`PLAN_MODE_REMINDER`、`EXECUTE_DIRECTIVE` 名称，减少外部调用迁移风险。
+async def manage_context(input: ManageInput) -> ManageOutput: ...
+```
 
-工具使用模块与 `edit_file`、`bash` 的 description 同时强化专用工具优先和编辑前先读。
+### 状态接口
 
-### LLM 公共接口
+```python
+def new_session_context(workspace: str) -> SessionContext: ...
 
-**文件：** `src/endless_code/llm/__init__.py`
 
-新增 `System`、`Request` 与缓存字段；保持 `Message`、`ToolCall`、`ToolResult`、`ToolDefinition` 和 `StreamEvent` 的既有语义。Provider 工厂增加 `anthropic` 分支，保留 `openai` 和 `deepseek`。
+class ContentReplacementState: ...
 
-### Anthropic Provider
 
-**文件：** `src/endless_code/llm/anthropic_provider.py`
+class RecoveryState: ...
 
-- 使用 `AsyncAnthropic`，配置 `api_key` 和默认 `https://api.anthropic.com`，允许自定义 `base_url`。
-- 将 `Request.system.stable` 序列化为带 `cache_control: {"type": "ephemeral"}` 的文本块；环境块作为无缓存控制的第二文本块。
-- 工具定义置于 system 之前的请求前缀中，工具顺序遵循 Registry 顺序。
-- 将历史消息转换为 Anthropic content blocks；工具调用和工具结果保持 call ID 配对。
-- reminder 非空时追加到末条 user/tool content block；末条不是可追加消息时新建一条 user 消息，保证角色合法。
-- 沿用 DeepSeek 的 thinking 语义只对 DeepSeek 生效；Anthropic 的本阶段不增加额外思考配置。
-- 流式解析文本增量、工具参数分片、usage、完成和错误，并在 generator finally 中关闭响应。
 
-### OpenAI Provider
+class CompactCircuitBreaker: ...
 
-**文件：** `src/endless_code/llm/openai_provider.py`
 
-- 将稳定 system 放在消息前缀；环境段追加在稳定 system 后，保持稳定块字节不变。
-- 将 `Request.messages`、`Request.tools` 和 reminder 映射为 OpenAI Chat Completions 请求。
-- reminder 作为尾部 user 消息注入，不写入持久历史。
-- 从 `prompt_tokens_details.cached_tokens` 读取缓存命中；字段不存在时使用零。
-- 保留工具 JSON 分片拼接、流关闭、错误和 usage 事件行为。
+def offload_and_snip(messages, state, session) -> list[Message]: ...
+def estimate_tokens(anchor, messages, anchor_msg_len) -> int: ...
+```
 
-### DeepSeek Provider
+### Agent 事件
 
-**文件：** `src/endless_code/llm/deepseek_provider.py`
+在现有 `Event` 增加：
 
-- 继续复用 OpenAI-compatible message/tool 序列化和流收集逻辑，默认 base URL 保持 `https://api.deepseek.com`。
-- 保留 `thinking` 到 `extra_body` 的配置，不覆盖系统块或 reminder。
-- 解析 DeepSeek 可用的 prompt cache usage 字段；缺失时为零。
-- 通过同一 `Request` 接口支持稳定系统提示、环境段、工具集和 reminder。
+```python
+class CompactPhase(Enum):
+    BEFORE_AUTO = "before_auto"
+    AFTER_AUTO = "after_auto"
+    BEFORE_EMERGENCY = "before_emergency"
+    AFTER_EMERGENCY = "after_emergency"
 
-### 配置层
 
-**文件：** `src/endless_code/config.py`、`pyproject.toml`
+@dataclass
+class CompactEvent:
+    phase: CompactPhase
+    before_tokens: int = 0
+    after_tokens: int = 0
+    err: Exception | None = None
+```
 
-- `ProviderConfig.protocol` 扩展为 `anthropic | deepseek | openai`。
-- 支持 Anthropic 默认 base URL、自定义 base URL、`ANTHROPIC_API_KEY` 环境变量和 model。
-- 保留现有 OpenAI `base_url`，使兼容端点可配置；DeepSeek 行为不变。
-- `new_provider()` 根据 protocol 构造三种 Provider。
-- `pyproject.toml` 增加 `anthropic` 依赖，不改变 Python 和 Textual 版本范围。
-
-### Agent
-
-**文件：** `src/endless_code/agent/__init__.py`
-
-- `Agent` 增加 `version` 字段；运行开始时构造稳定 system 和环境段。
-- 增加 `PLAN_REMINDER_INTERVAL = 4`。
-- 每轮按 `Mode.PLAN` 与 iteration 生成完整/精简 reminder，组装 `Request` 后调用 Provider。
-- 将缓存字段透传到既有 Agent `Event.usage`，不改变 TUI 状态栏的输入/输出展示约定。
-- 保留既有取消、错误、工具批次、历史写入和停止条件；动态 reminder 不调用 `Conversation.add_*`。
-
-### TUI 与 smoke
-
-**文件：** `src/endless_code/tui/app.py`、`src/endless_code/cli.py`、`examples/smoke.py`
-
-- TUI 构造 Agent 时传入应用版本，保留 `/plan`、`/do`、Esc、Ctrl+C 和 Provider 选择行为。
-- TUI 不显示缓存字段；只消费既有 usage/iteration 事件。
-- 新增 smoke 脚本，以配置 Provider 连续发起两轮请求，打印 `input/output/cache_write/cache_read`，用于验证真实端点字段，不写入对话历史。
+压缩开始和结束均由 Agent yield `Event(compact=...)`，TUI 统一渲染。
 
 ## 模块交互
 
-1. CLI 加载 YAML 配置，Provider 工厂按 protocol 构造 Anthropic/OpenAI/DeepSeek。
-2. TUI 将用户消息写入 Conversation，Agent 只负责 assistant/tool 历史。
-3. Agent 首次运行构造稳定 system 和 Environment；每轮选择全量或只读工具。
-4. Agent 依据模式与轮次生成 reminder，组装 Request。
-5. Provider 按协议序列化 system、environment、history、tools 和 reminder，发起流式请求。
-6. Provider 生成 StreamEvent；Agent 累积完整响应并继续现有 ReAct 循环。
-7. Usage 的输入/输出/缓存字段通过 Agent Event 对外；smoke 额外打印缓存字段。
+1. CLI 加载 ProviderConfig，计算有效 context window，创建 MCP Manager、Registry 和 TUI。
+2. TUI 选择 Provider 后创建 SessionRuntime；每轮复用 runtime，向 Agent 传入同一 runtime。
+3. Agent 每轮开头根据 `Mode` 取得一次 `definitions` 或 `read_only_definitions`，用该同一列表构造 `ManageInput` 和主请求 `Request.tools`。
+4. AUTO 调用 `manage_context`：第一层替换并写回 Conversation，重新估算，达到阈值时触发摘要；MANUAL 跳过第一层和阈值；EMERGENCY 先强制第一层再摘要。
+5. 摘要使用同一 Provider，但 `Request.tools=[]`，解析摘要后以新历史替换 Conversation。
+6. 主请求结束后用最后一次主对话 usage 更新 runtime 锚点；工具执行完成后，在 `add_tool_results` 前记录成功的 `read_file` 内容。
+7. 主请求出现 `PromptTooLongError` 时执行 EMERGENCY，成功后只重试同一轮一次。
 
-## 文件组织
+## TUI 适配
 
-```text
-project/
-├── pyproject.toml                         # anthropic 依赖与现有版本范围
-├── spec.md / plan.md / task.md / checklist.md
-├── examples/smoke.py                      # 三 Provider usage/cache 冒烟
-├── src/endless_code/
-│   ├── prompt/
-│   │   ├── __init__.py                    # Prompt 公共导出
-│   │   ├── modules.py                     # Module 与模块常量
-│   │   ├── environment.py                 # Environment 与 Git 降级采集
-│   │   └── reminder.py                    # system-reminder 与 Plan reminder
-│   ├── llm/
-│   │   ├── __init__.py                    # System/Request/Usage/Provider
-│   │   ├── anthropic_provider.py           # Anthropic 缓存 system 与流解析
-│   │   ├── openai_provider.py              # OpenAI/兼容端点
-│   │   └── deepseek_provider.py            # DeepSeek 兼容端点
-│   ├── agent/__init__.py                   # Request 组装与 Agent Loop
-│   ├── config.py                           # 三 Provider 配置
-│   ├── tui/app.py                          # TUI
-│   └── tool/                               # 既有工具与描述强化
-└── tests/
-    ├── test_config.py                      # 三协议配置与 base_url
-    ├── test_prompt.py                      # 模块、环境与 reminder
-    ├── test_anthropic_provider.py          # system/cache/reminder 序列化
-    ├── test_llm.py                         # OpenAI/DeepSeek Request/usage
-    ├── test_agent.py                       # Request、轮次 reminder、缓存透传
-    ├── test_tui.py                          # 既有 TUI 回归
-    └── test_tool.py                         # 描述与工具回归
-```
+当前 UI 只有 `src/endless_code/tui/app.py`，不新增旧项目的 `stream.py`。在 `EndlessCodeApp` 中：
+
+- `on_mount` 创建 SessionRuntime 或在首次 Provider 激活后创建。
+- `_consume_agent_events` 使用 runtime，不再让每轮 Agent 丢失状态。
+- `_handle_idle_input` 交给 `commands.py` 的 `BUILTIN_COMMANDS`；命令 handler 只操作 TUI 状态或调用 `run_force_compact`。
+- `_update_streaming` 或对应事件分支显示“正在压缩上下文…”、“上下文撞墙，自动压缩中…”和 token 变化。
+- `/compact` 使用 runtime 的锁，与当前 run 串行。
+
+## 配置适配
+
+保留现有 `src/endless_code/config.py` 的 dataclass 和 YAML 结构，只给 `ProviderConfig` 追加 `context_window: int = 0`。在同文件增加 `effective_context_window`：Anthropic 为 200000，OpenAI/DeepSeek 为 128000，显式正数优先。
+
+`.endless-code/config.yaml.example` 为三个 provider 增加可选字段注释。会话目录使用 `.endless-code/sessions`，并加入 `.gitignore`。
 
 ## 技术决策
 
-| 决策点 | 选择 | 理由 |
+| 决策 | 选择 | 理由 |
 |---|---|---|
-| Prompt 组织 | `prompt` 子包 + 固定模块 | 让新增指令模块局部接入，并保持稳定顺序 |
-| Provider 请求接口 | `Request` dataclass | 避免继续扩展位置参数，明确稳定/动态边界 |
-| Anthropic 缓存 | stable system block 使用 `cache_control: ephemeral` | 让工具定义和稳定指令形成可复用前缀，环境块不影响前缀 |
-| OpenAI 缓存 | stable system 位于消息前缀 | 兼容官方和自定义 `base_url`，不强制端点一定返回缓存字段 |
-| DeepSeek 缓存 | 复用 OpenAI-compatible 请求并尽力解析 prompt cache 字段 | 保留现有适配器和 thinking 行为 |
-| reminder 位置 | Anthropic 并入末条可追加 content；OpenAI/DeepSeek 追加 user 消息 | 保持协议消息合法，且不污染持久历史 |
-| 环境采集 | 标准库 + 有界 git 命令 | 不依赖敏感环境变量，失败可降级 |
-| TUI 缓存展示 | 不改变现有状态栏，仅 smoke 打印 | 遵循 Spec 中不新增状态栏缓存展示的范围边界 |
-| 配置选择 | protocol 分支 + 可选 base_url | 同时覆盖 Anthropic、OpenAI 兼容端点和 DeepSeek |
+| 消息替换 | 深拷贝后生成新列表 | 不污染当前请求对象，便于重试和测试 |
+| 并发保护 | `threading.RLock` + async 主循环串行 | 文件追踪测试会使用线程，状态仍需跨线程安全 |
+| 摘要调用 | 复用当前 Provider `stream(Request)` | 不新增 Provider 抽象，兼容现有三种协议 |
+| PTL 识别 | `PromptTooLongError` 哨兵 | Agent 不依赖 SDK 异常类型 |
+| 精度 | usage 锚点 + 字符/3.5 | 不增加 tokenizer 依赖 |
+| 会话持久化 | 只持久化工具结果 | 保留可重读原文，避免持久化完整对话和密钥 |

@@ -14,13 +14,22 @@ from endless_code.agent import (
     NOTICE_STREAM_ERROR,
     NOTICE_UNKNOWN_TOOLS,
     Agent,
+    CompactPhase,
     Event,
-    Mode,
     Phase,
     ToolEvent,
+    new_session_runtime,
 )
 from endless_code.conversation import Conversation
-from endless_code.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
+from endless_code.llm import (
+    Message,
+    PromptTooLongError,
+    StreamEvent,
+    ToolCall,
+    ToolDefinition,
+    Usage,
+)
+from endless_code.permission import Decision, Mode, Outcome, new_engine
 from endless_code.prompt import PLAN_MODE_REMINDER
 from endless_code.tool import Registry, Result
 
@@ -159,6 +168,7 @@ def _tool_event(
 
 
 async def _run(agent: Agent, conv: Conversation, **kwargs) -> list[Event]:
+    kwargs.setdefault("mode", Mode.BYPASS)
     return [event async for event in agent.run(conv, **kwargs)]
 
 
@@ -168,7 +178,7 @@ def test_event_model_and_constants() -> None:
     assert event.iteration == 1
     assert event.usage.output_tokens == 3
     assert tool.phase is Phase.START
-    assert Mode.NORMAL.value == "normal"
+    assert Mode.DEFAULT.value == 0
     assert MAX_ITERATIONS == 25
     assert MAX_UNKNOWN_RUN == 3
 
@@ -348,7 +358,7 @@ async def test_batch_history_is_committed_atomically() -> None:
             provider,
             _registry(TimedTool("reader", True, timeline)),
         )
-        .run(conv)
+        .run(conv, mode=Mode.BYPASS)
         .__aiter__()
     )
 
@@ -503,3 +513,136 @@ async def test_cache_usage_is_forwarded_from_request_provider() -> None:
         usage.cache_write,
         usage.cache_read,
     ) == (3, 2, 7, 5)
+
+
+class EmergencyProvider:
+    name = "emergency-fake"
+    model = "emergency-model"
+
+    def __init__(self) -> None:
+        self.main_calls = 0
+        self.summary_calls = 0
+
+    async def stream(self, request):
+        if not request.system.stable:
+            self.summary_calls += 1
+            yield StreamEvent(text="<summary>## 1 主要请求和意图\n继续任务</summary>")
+            yield StreamEvent(done=True)
+            return
+        self.main_calls += 1
+        if self.main_calls == 1:
+            yield StreamEvent(err=PromptTooLongError("too long"))
+            return
+        yield StreamEvent(text="recovered")
+        yield StreamEvent(done=True)
+
+
+@pytest.mark.asyncio
+async def test_prompt_too_long_compacts_then_retries_once(tmp_path) -> None:
+    provider = EmergencyProvider()
+    conv = Conversation()
+    conv.add_user("继续任务")
+    agent = Agent(
+        provider,
+        _registry(),
+        runtime=new_session_runtime(str(tmp_path), 200_000),
+    )
+    events = await _run(agent, conv)
+    phases = [event.compact.phase for event in events if event.compact is not None]
+    assert provider.main_calls == 2
+    assert provider.summary_calls == 1
+    assert phases == [
+        CompactPhase.BEFORE_EMERGENCY,
+        CompactPhase.AFTER_EMERGENCY,
+    ]
+    assert conv.messages()[-1].content == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_ask_approval_allow_once(tmp_path) -> None:
+    registry = _registry(TimedTool("write_file", False, Timeline()))
+    call = ToolCall(
+        id="w1",
+        name="write_file",
+        input=json.dumps({"path": "src/x.py", "content": "x", "value": "w"}),
+    )
+    provider = FakeProvider(
+        [
+            [StreamEvent(tool_calls=[call]), StreamEvent(done=True)],
+            [StreamEvent(text="done"), StreamEvent(done=True)],
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("go")
+    engine, err = new_engine(str(tmp_path))
+    assert err is None
+    agent = Agent(provider, registry, engine=engine)
+
+    async for event in agent.run(conv, mode=Mode.DEFAULT):
+        if event.approval is not None:
+            event.approval.respond.set_result(Outcome.ALLOW_ONCE)
+
+    assert [message.role for message in conv.messages()] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert conv.messages()[-2].tool_results[0].is_error is False
+
+
+@pytest.mark.asyncio
+async def test_ask_approval_deny_once(tmp_path) -> None:
+    registry = _registry(TimedTool("write_file", False, Timeline()))
+    call = ToolCall(
+        id="w1",
+        name="write_file",
+        input=json.dumps({"path": "src/x.py", "content": "x", "value": "w"}),
+    )
+    provider = FakeProvider(
+        [
+            [StreamEvent(tool_calls=[call]), StreamEvent(done=True)],
+            [StreamEvent(text="done"), StreamEvent(done=True)],
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("go")
+    engine, err = new_engine(str(tmp_path))
+    assert err is None
+    agent = Agent(provider, registry, engine=engine)
+
+    async for event in agent.run(conv, mode=Mode.DEFAULT):
+        if event.approval is not None:
+            event.approval.respond.set_result(Outcome.DENY_ONCE)
+
+    assert conv.messages()[-2].tool_results[0].is_error is True
+
+
+@pytest.mark.asyncio
+async def test_ask_approval_allow_forever_persists(tmp_path) -> None:
+    registry = _registry(TimedTool("write_file", False, Timeline()))
+    call = ToolCall(
+        id="w1",
+        name="write_file",
+        input=json.dumps({"path": "src/x.py", "content": "x", "value": "w"}),
+    )
+    provider = FakeProvider(
+        [
+            [StreamEvent(tool_calls=[call]), StreamEvent(done=True)],
+            [StreamEvent(text="done"), StreamEvent(done=True)],
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("go")
+    engine, err = new_engine(str(tmp_path))
+    assert err is None
+    agent = Agent(provider, registry, engine=engine)
+
+    async for event in agent.run(conv, mode=Mode.DEFAULT):
+        if event.approval is not None:
+            event.approval.respond.set_result(Outcome.ALLOW_FOREVER)
+
+    local = tmp_path / ".endless-code" / "settings.local.yaml"
+    assert "Write(src/x.py)" in local.read_text(encoding="utf-8")
+    engine2, _ = new_engine(str(tmp_path))
+    assert engine2.check(Mode.DEFAULT, call, False)[0] is Decision.ALLOW

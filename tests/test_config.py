@@ -1,6 +1,12 @@
 import pytest
 
-from endless_code.config import ConfigError, ProviderConfig, _validate_provider, load
+from endless_code.config import (
+    ConfigError,
+    ProviderConfig,
+    _validate_provider,
+    effective_context_window,
+    load,
+)
 
 
 def test_protocols_accept_all_supported_values() -> None:
@@ -81,3 +87,19 @@ def test_provider_factory_constructs_all_protocols() -> None:
         "deepseek",
         "openai",
     ]
+
+
+def test_context_window_defaults_and_explicit_value() -> None:
+    assert (
+        effective_context_window(ProviderConfig("a", "anthropic", "k", "m")) == 200_000
+    )
+    assert effective_context_window(ProviderConfig("o", "openai", "k", "m")) == 128_000
+    assert (
+        effective_context_window(ProviderConfig("d", "deepseek", "k", "m")) == 128_000
+    )
+    assert (
+        effective_context_window(
+            ProviderConfig("a", "anthropic", "k", "m", context_window=80_000)
+        )
+        == 80_000
+    )

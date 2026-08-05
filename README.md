@@ -11,10 +11,12 @@ Endless Code 是一个运行在终端中的智能编程助手。它以可取消�
 - **多轮 Agent Loop**：自动完成“分析 -> 调用工具 -> 读取结果 -> 继续行动”的工作流。
 - **Plan / Do 模式**：`/plan` 仅开放只读工具进行调查，`/do` 恢复完整工具集并执行计划。
 - **六个内置工具**：`read_file`、`write_file`、`edit_file`、`glob`、`grep` 和 `bash`。
+- **MCP 客户端接入**：通过 stdio 与 Streamable HTTP 连接 MCP server，远端工具以 `mcp__<server>__<tool>` 命名空间并入既有工具与权限链路，密钥经 `${VAR}` 注入不落盘。
 - **安全的工具调度**：连续只读调用可并发执行，写入和命令调用保持顺序边界。
 - **流式响应与可取消**：实时显示文本、工具调用、结果、迭代轮次和 Token usage；支持 `Esc` 与 `Ctrl+C` 取消。
 - **系统提示工程化**：稳定提示模块化，环境信息、缓存前缀和 `system-reminder` 分离管理。
 - **缓存 usage 观测**：兼容 Anthropic、OpenAI 和 DeepSeek 返回的缓存读写字段。
+- **长会话上下文管理**：超大工具结果自动落盘并保留稳定预览；接近 Provider 上下文窗口时自动摘要、恢复最近文件和可用工具，避免长任务因历史膨胀中断。
 - **输出脱敏**：API key 不会显示在工具预览、错误信息或对话界面中。
 
 ## 支持的 Provider
@@ -79,11 +81,15 @@ providers:
     protocol: anthropic
     model: claude-3-5-sonnet-latest
     api_key: $ANTHROPIC_API_KEY
+    # 可选；未配置时 Anthropic 默认 200000
+    context_window: 200000
 
   - name: openai
     protocol: openai
     model: gpt-4o
     api_key: $OPENAI_API_KEY
+    # 可选；未配置时 OpenAI 默认 128000
+    context_window: 128000
     # 可选：第三方 OpenAI 兼容服务
     # base_url: https://example.com/v1
 
@@ -93,12 +99,47 @@ providers:
     base_url: https://api.deepseek.com
     api_key: $DEEPSEEK_API_KEY
     thinking: false
+    # 可选；未配置时 DeepSeek 默认 128000
+    context_window: 128000
 ```
 
 `api_key` 支持 `$VAR_NAME` 环境变量引用，也支持明文值，但生产环境应优先使用环境变量。配置文件查找顺序为：
 
 1. 当前目录 `.endless-code/config.yaml`
 2. 用户目录 `~/.config/endless-code/config.yaml`
+
+## MCP 工具扩展
+
+Endless Code 内置 MCP（Model Context Protocol）客户端，通过 **stdio** 或 **Streamable HTTP** 连接 MCP server，把远端工具接入本地工具链路。工具命名为 `mcp__<server>__<tool>`（如 `mcp__github__search_repo`），与内置 6 个工具天然不冲突；权限规则可直接写 `mcp__<server>__<tool>` 或 `mcp__<server>__*`。
+
+MCP 配置同样分两层 YAML，同名 server 项目级完整覆盖用户级：
+
+| 位置 | 路径 |
+| --- | --- |
+| 项目级 | `.endless-code/mcp.yaml` |
+| 用户级 | `~/.config/endless-code/mcp.yaml` |
+
+```yaml
+mcp_servers:
+  github:
+    type: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"      # 从宿主环境变量展开，密钥不入配置
+
+  example-http:
+    type: http
+    url: "https://mcp.example.com/mcp"
+    headers:
+      Authorization: "Bearer ${EXAMPLE_TOKEN}"
+```
+
+- `env` / `headers` 的值支持 `${VAR}` 展开；未定义变量展开为空串并在启动时告警，不阻断启动。
+- 每个 server 启动连接超时 30s、调用超时 30s；连接失败 / 配置非法 / 超时的 server 只跳过自身，其余 server 与内置工具照常可用。
+- 远端声明只读（`readOnlyHint`）的工具走只读兜底，其余工具在 default 模式需人在回路确认，行为与内置工具一致。
+- 退出时自动终止所有 stdio 子进程并断开 HTTP 会话。
+- 完整示例见 [`docs/mcp/mcp-servers.example.yaml`](docs/mcp/mcp-servers.example.yaml)。
 
 ## 使用方式
 
@@ -115,10 +156,19 @@ providers:
 | `Enter` | 提交消息 |
 | `/plan` | 进入只读计划模式 |
 | `/do` | 退出计划模式并执行当前计划 |
+| `/compact` | 立即压缩当前会话历史，不等待自动阈值 |
 | `Esc` | 取消当前回合 |
 | `Ctrl+C` | 运行时取消回合，空闲时退出 |
 | `Ctrl+D` | 退出程序 |
 | `/exit`、`/quit` | 退出程序 |
+
+## 长会话上下文管理
+
+Endless Code 会在每次请求前检查工具结果和会话长度：单条超过 50KB 的工具结果会保存到 `.endless-code/sessions/<会话 ID>/tool-results/`，会话中仅保留头部预览与 `read_file` 重读路径；同一轮工具结果合计过大时也会按大小继续落盘。
+
+当估算用量接近当前 Provider 的 `context_window` 时，Agent 会自动生成结构化摘要，并补回最近读取的文件、当前可用工具和边界提示。界面会显示压缩开始与完成状态。遇到 Provider 报告上下文超限时，程序会先紧急压缩，再仅重试原请求一次。
+
+`/compact` 可在空闲时手动触发摘要。会话目录不会自动删除，便于检查被落盘的工具原文；该目录已被 Git 忽略。
 
 ## 系统提示与缓存
 
@@ -136,7 +186,7 @@ Anthropic 使用 `cache_control.type: ephemeral` 标记稳定 system 块；OpenA
 
 `edit_file` 编辑前必须先读取目标文件，`bash` 描述明确优先使用专用读写搜索工具。工具输出、错误信息和 TUI 内容会进行敏感值脱敏。
 
-当前版本不提供文件系统沙箱或工具执行审批。模型可以访问当前用户有权限访问的路径，也可以执行 shell 命令。请在可信代码库和受控开发环境中使用，并在高风险任务前先运行 `/plan`。
+内置五层权限系统：危险命令黑名单、路径沙箱、可配置规则、四档权限模式（default / acceptEdits / plan / bypassPermissions）与人在回路审批。文件读写默认限制在项目根内，命令执行按模式决定是否弹窗确认；`Shift+Tab` 可实时切换权限模式，`/plan` 仍用于只读规划。请在可信代码库和受控开发环境中使用，并在高风险任务前先运行 `/plan`。
 
 ## 开发与验证
 

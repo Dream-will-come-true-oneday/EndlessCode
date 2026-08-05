@@ -1,10 +1,12 @@
-"""Agent 层：可取消的 ReAct 循环与保序工具调度。"""
+"""Agent 层：可取消的 ReAct 循环、保序工具调度与权限人在回路。"""
 
 import asyncio
 import inspect
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 from endless_code.conversation import Conversation
 from endless_code.llm import (
@@ -17,6 +19,8 @@ from endless_code.llm import (
     ToolResult,
     Usage,
 )
+from endless_code.permission import Decision, Mode, Outcome
+from endless_code.permission.engine import Engine, new_engine
 from endless_code.prompt import build_system_prompt, gather_environment, plan_reminder
 from endless_code.tool import Registry, Result
 
@@ -33,11 +37,6 @@ NOTICE_EMPTY_FINAL = "（任务已结束，模型未返回文本。）"
 class Phase(Enum):
     START = "start"
     END = "end"
-
-
-class Mode(Enum):
-    NORMAL = "normal"
-    PLAN = "plan"
 
 
 @dataclass
@@ -63,6 +62,17 @@ class Event:
     notice: str = ""
     done: bool = False
     err: Exception | None = None
+    approval: "ApprovalRequest | None" = None
+
+
+@dataclass
+class ApprovalRequest:
+    """一次待用户批准的工具调用。"""
+
+    name: str
+    args: str
+    reason: str
+    respond: asyncio.Future[Outcome]
 
 
 @dataclass
@@ -81,19 +91,24 @@ class _ExecutionState:
 
 
 class Agent:
-    """持有 Provider 与注册中心，执行完整 ReAct 循环。"""
+    """持有 Provider、注册中心与权限引擎，执行完整 ReAct 循环。"""
 
     def __init__(
-        self, provider: Provider, registry: Registry, version: str = "0.1.0"
+        self,
+        provider: Provider,
+        registry: Registry,
+        version: str = "0.1.0",
+        engine: Engine | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
         self._version = version
+        self._engine = engine or new_engine(str(Path.cwd().resolve()))[0]
 
     async def run(
         self,
         conv: Conversation,
-        mode: Mode = Mode.NORMAL,
+        mode: Mode = Mode.DEFAULT,
         cancel: asyncio.Event | None = None,
     ) -> AsyncIterator[Event]:
         cancel = cancel or asyncio.Event()
@@ -164,7 +179,7 @@ class Agent:
 
             execution = _ExecutionState(results=[None] * len(round_state.calls))
             async for event in self._execute_events(
-                round_state.calls, cancel, execution
+                round_state.calls, cancel, execution, mode
             ):
                 yield event
 
@@ -272,6 +287,7 @@ class Agent:
         calls: list[ToolCall],
         cancel: asyncio.Event,
         state: _ExecutionState,
+        mode: Mode,
     ) -> AsyncIterator[Event]:
         cancel_task = asyncio.create_task(cancel.wait())
         active_tasks: set[asyncio.Task[Result]] = set()
@@ -303,47 +319,131 @@ class Agent:
                         )
                     )
 
-                task_indices: dict[asyncio.Task[Result], int] = {}
-                for current in batch_indices:
-                    call = calls[current]
-                    task = asyncio.create_task(
-                        self._registry.execute(call.name, call.input)
-                    )
-                    active_tasks.add(task)
-                    task_indices[task] = current
-
-                pending = set(task_indices)
-                while pending:
-                    done, _ = await asyncio.wait(
-                        pending | {cancel_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    completed_tasks = done - {cancel_task}
-                    for task in completed_tasks:
-                        current = task_indices[task]
-                        try:
-                            state.results[current] = task.result()
-                        except Exception as exc:  # noqa: BLE001
+                if self._registry.is_read_only(calls[index].name):
+                    task_indices: dict[asyncio.Task[Result], int] = {}
+                    for current in batch_indices:
+                        call = calls[current]
+                        if self._registry.get(call.name) is None:
                             state.results[current] = Result(
-                                content=f"工具 {calls[current].name} 异常: {exc}",
-                                is_error=True,
+                                content=f"未知工具: {call.name}", is_error=True
                             )
-                        pending.remove(task)
-                        active_tasks.discard(task)
+                            continue
+                        decision, reason = self._engine.check(mode, call, True)
+                        if decision is Decision.DENY:
+                            state.results[current] = Result(
+                                content=reason, is_error=True
+                            )
+                            continue
+                        task = asyncio.create_task(
+                            self._registry.execute(call.name, call.input)
+                        )
+                        active_tasks.add(task)
+                        task_indices[task] = current
 
-                    if cancel_task in done:
-                        state.completed = False
-                        for task in pending:
-                            task.cancel()
-                        await asyncio.gather(*pending, return_exceptions=True)
-                        active_tasks.difference_update(pending)
-                        for task in pending:
+                    pending = set(task_indices)
+                    while pending:
+                        done, _ = await asyncio.wait(
+                            pending | {cancel_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        completed_tasks = done - {cancel_task}
+                        for task in completed_tasks:
                             current = task_indices[task]
+                            try:
+                                state.results[current] = task.result()
+                            except Exception as exc:  # noqa: BLE001
+                                state.results[current] = Result(
+                                    content=f"工具 {calls[current].name} 异常: {exc}",
+                                    is_error=True,
+                                )
+                            pending.remove(task)
+                            active_tasks.discard(task)
+
+                        if cancel_task in done:
+                            state.completed = False
+                            for task in pending:
+                                task.cancel()
+                            await asyncio.gather(*pending, return_exceptions=True)
+                            active_tasks.difference_update(pending)
+                            for task in pending:
+                                current = task_indices[task]
+                                state.results[current] = Result(
+                                    content=NOTICE_CANCELLED,
+                                    is_error=True,
+                                )
+                            break
+                else:
+                    for current in batch_indices:
+                        call = calls[current]
+                        if self._registry.get(call.name) is None:
                             state.results[current] = Result(
-                                content=NOTICE_CANCELLED,
-                                is_error=True,
+                                content=f"未知工具: {call.name}", is_error=True
                             )
-                        break
+                            continue
+                        decision, reason = self._engine.check(mode, call, False)
+                        if decision is Decision.DENY:
+                            state.results[current] = Result(
+                                content=reason, is_error=True
+                            )
+                            continue
+                        if decision is Decision.ALLOW:
+                            result = await self._await_serial_call(
+                                call, cancel, cancel_task
+                            )
+                            if result is None:
+                                state.completed = False
+                                state.results[current] = Result(
+                                    content=NOTICE_CANCELLED, is_error=True
+                                )
+                                break
+                            state.results[current] = result
+                            continue
+
+                        respond: asyncio.Future[Outcome] = (
+                            asyncio.get_running_loop().create_future()
+                        )
+                        yield Event(
+                            approval=ApprovalRequest(
+                                name=call.name,
+                                args=call.input,
+                                reason=reason,
+                                respond=respond,
+                            )
+                        )
+                        outcome = await respond
+
+                        if outcome is Outcome.ALLOW_ONCE:
+                            result = await self._await_serial_call(
+                                call, cancel, cancel_task
+                            )
+                            if result is None:
+                                state.completed = False
+                                state.results[current] = Result(
+                                    content=NOTICE_CANCELLED, is_error=True
+                                )
+                                break
+                            state.results[current] = result
+                        elif outcome is Outcome.ALLOW_FOREVER:
+                            try:
+                                self._engine.persist_local_allow(call)
+                            except Exception:
+                                logging.getLogger(__name__).warning(
+                                    "持久化放行规则失败: %s", call.name, exc_info=True
+                                )
+                            result = await self._await_serial_call(
+                                call, cancel, cancel_task
+                            )
+                            if result is None:
+                                state.completed = False
+                                state.results[current] = Result(
+                                    content=NOTICE_CANCELLED, is_error=True
+                                )
+                                break
+                            state.results[current] = result
+                        else:
+                            state.results[current] = Result(
+                                content=reason, is_error=True
+                            )
 
                 for current in batch_indices:
                     result = state.results[current]
@@ -374,6 +474,32 @@ class Agent:
                 await asyncio.gather(*active_tasks, return_exceptions=True)
             cancel_task.cancel()
             await asyncio.gather(cancel_task, return_exceptions=True)
+
+    async def _await_serial_call(
+        self,
+        call: ToolCall,
+        cancel: asyncio.Event,
+        cancel_task: asyncio.Task,
+    ) -> Result | None:
+        """执行单个有副作用工具，支持外部取消；取消返回 None。"""
+        tool_task = asyncio.create_task(self._registry.execute(call.name, call.input))
+        try:
+            done, _ = await asyncio.wait(
+                {tool_task, cancel_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancel_task in done:
+                tool_task.cancel()
+                await asyncio.gather(tool_task, return_exceptions=True)
+                return None
+            try:
+                return tool_task.result()
+            except Exception as exc:  # noqa: BLE001
+                return Result(content=f"工具 {call.name} 异常: {exc}", is_error=True)
+        except asyncio.CancelledError:
+            tool_task.cancel()
+            await asyncio.gather(tool_task, return_exceptions=True)
+            raise
 
     async def _cancel_remaining(
         self,

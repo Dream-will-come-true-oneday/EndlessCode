@@ -3,12 +3,14 @@
 import argparse
 import asyncio
 import sys
+from pathlib import Path
 
 from endless_code import __version__
 from endless_code.agent import Agent
 from endless_code.config import ConfigError, load
 from endless_code.conversation import Conversation
 from endless_code.llm import new_provider
+from endless_code.permission import Mode, new_engine
 from endless_code.security import redact_sensitive
 from endless_code.tool import new_default_registry
 
@@ -46,13 +48,14 @@ async def _run(provider_name: str | None) -> int:
         )
         return 1
     secrets = {secret} if secret else set()
-    agent = Agent(provider, new_default_registry(), __version__)
+    engine, _ = new_engine(str(Path.cwd().resolve()))
+    agent = Agent(provider, new_default_registry(), __version__, engine)
     conversation = Conversation()
     for index, prompt in enumerate(("Reply with 'ready'.", "Reply with 'ok'."), 1):
         conversation.add_user(prompt)
         usage = None
         try:
-            async for event in agent.run(conversation):
+            async for event in agent.run(conversation, mode=Mode.BYPASS):
                 if event.err is not None:
                     print(
                         "Provider error: " + redact_sensitive(event.err, secrets),

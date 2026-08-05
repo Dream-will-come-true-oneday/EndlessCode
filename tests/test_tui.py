@@ -8,9 +8,9 @@ from unittest.mock import patch
 import pytest
 from textual.widgets import Footer, Header, Input, RichLog
 
-from endless_code.agent import Mode
 from endless_code.config import ProviderConfig
 from endless_code.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
+from endless_code.permission import Mode, new_engine
 from endless_code.prompt import EXECUTE_DIRECTIVE, PLAN_MODE_REMINDER
 from endless_code.tool import Registry, Result, new_default_registry
 from endless_code.tui.app import EndlessCodeApp, SessionState
@@ -66,6 +66,16 @@ class SecretTool:
         return Result(content=f"tool-result {TEST_SECRET}")
 
 
+class WriteApprovalTool(SecretTool):
+    read_only = False
+
+    def name(self) -> str:
+        return "write_file"
+
+    async def execute(self, args: str) -> Result:
+        return Result(content="written")
+
+
 class BlockingTool(SecretTool):
     read_only = False
 
@@ -95,6 +105,12 @@ def _config(*, api_key: str = TEST_SECRET) -> ProviderConfig:
     )
 
 
+def _engine() -> "object":
+    engine, _ = new_engine(str(os.getcwd()))
+    engine._start_mode = Mode.BYPASS
+    return engine
+
+
 def _chat_text(app: EndlessCodeApp) -> str:
     return "\n".join(line.text for line in app._chat.lines)
 
@@ -114,7 +130,7 @@ async def test_mount_registers_widgets_and_exits_cleanly() -> None:
         _config(),
         ProviderConfig("deepseek", "deepseek", TEST_SECRET, "deepseek-chat"),
     ]
-    app = EndlessCodeApp(providers, new_default_registry())
+    app = EndlessCodeApp(providers, new_default_registry(), engine=_engine())
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app.state is SessionState.SELECTING
@@ -136,7 +152,7 @@ async def test_history_usage_and_iteration_are_updated_once() -> None:
         ]
     )
     with patch("endless_code.tui.app.new_provider", return_value=provider):
-        app = EndlessCodeApp([_config()], new_default_registry())
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
         async with app.run_test() as pilot:
             await pilot.pause()
             seen_iterations: list[int] = []
@@ -170,7 +186,7 @@ async def test_plan_and_do_command_switch_tools_and_suffix() -> None:
         ]
     )
     with patch("endless_code.tui.app.new_provider", return_value=provider):
-        app = EndlessCodeApp([_config()], new_default_registry())
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
         async with app.run_test() as pilot:
             await pilot.pause()
             app._handle_idle_input("/plan")
@@ -186,7 +202,7 @@ async def test_plan_and_do_command_switch_tools_and_suffix() -> None:
 
             app._handle_idle_input("/do")
             await _wait_for_state(app, pilot, SessionState.IDLE)
-            assert app.mode is Mode.NORMAL
+            assert app.mode is Mode.DEFAULT
             assert len(provider.requests[1][1]) == 6
             assert provider.requests[1][0][-1].content == EXECUTE_DIRECTIVE
             assert all(message.content != "/do" for message in app._conv.messages())
@@ -212,7 +228,7 @@ async def test_render_order_history_and_redaction_e2e() -> None:
     registry = Registry()
     registry.register(SecretTool())
     with patch("endless_code.tui.app.new_provider", return_value=provider):
-        app = EndlessCodeApp([_config()], registry)
+        app = EndlessCodeApp([_config()], registry, engine=_engine())
         async with app.run_test() as pilot:
             await pilot.pause()
             app._start_turn("render")
@@ -236,7 +252,7 @@ async def test_escape_and_ctrl_c_cancel_stream_without_exiting() -> None:
     for action_name in ("action_cancel_turn", "action_cancel_or_quit"):
         provider = BlockingProvider()
         with patch("endless_code.tui.app.new_provider", return_value=provider):
-            app = EndlessCodeApp([_config()], new_default_registry())
+            app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
             async with app.run_test() as pilot:
                 await pilot.pause()
                 app._start_turn("wait")
@@ -264,7 +280,7 @@ async def test_cancel_blocking_tool_cleans_task() -> None:
     registry = Registry()
     registry.register(tool)
     with patch("endless_code.tui.app.new_provider", return_value=provider):
-        app = EndlessCodeApp([_config()], registry)
+        app = EndlessCodeApp([_config()], registry, engine=_engine())
         async with app.run_test() as pilot:
             await pilot.pause()
             app._start_turn("block")
@@ -284,7 +300,7 @@ async def test_stream_error_recovery() -> None:
         ]
     )
     with patch("endless_code.tui.app.new_provider", return_value=provider):
-        app = EndlessCodeApp([_config()], new_default_registry())
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
         async with app.run_test() as pilot:
             await pilot.pause()
             app._start_turn("first")
@@ -301,7 +317,7 @@ async def test_stream_error_recovery() -> None:
 async def test_responsive_iteration_updates_while_stream_waits() -> None:
     provider = BlockingProvider()
     with patch("endless_code.tui.app.new_provider", return_value=provider):
-        app = EndlessCodeApp([_config()], new_default_registry())
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
         async with app.run_test() as pilot:
             await pilot.pause()
             app._start_turn("slow")
@@ -318,9 +334,55 @@ async def test_responsive_iteration_updates_while_stream_waits() -> None:
 async def test_provider_error_stays_in_tui() -> None:
     env_name = "ENDLESS_CODE_TEST_MISSING_KEY"
     os.environ.pop(env_name, None)
-    app = EndlessCodeApp([_config(api_key=f"${env_name}")], new_default_registry())
+    app = EndlessCodeApp(
+        [_config(api_key=f"${env_name}")], new_default_registry(), engine=_engine()
+    )
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app.state is SessionState.SELECTING
         assert "ConfigError" in _chat_text(app)
         assert app.is_running
+
+
+@pytest.mark.asyncio
+async def test_shift_tab_cycles_modes() -> None:
+    engine = _engine()
+    engine._start_mode = Mode.DEFAULT
+    app = EndlessCodeApp([_config()], new_default_registry(), engine=engine)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        for expected in (Mode.ACCEPT_EDITS, Mode.PLAN, Mode.BYPASS, Mode.DEFAULT):
+            app.action_cycle_mode()
+            assert app.mode is expected
+        assert "DEFAULT" in app.sub_title
+        assert "fake" not in app.sub_title.split("|")[0]
+
+
+@pytest.mark.asyncio
+async def test_approval_state_and_forever_response(tmp_path) -> None:
+    call = ToolCall(
+        id="w1",
+        name="write_file",
+        input=json.dumps({"path": "src/x.py", "content": "x"}),
+    )
+    provider = FakeProvider(
+        [
+            [StreamEvent(tool_calls=[call]), StreamEvent(done=True)],
+            [StreamEvent(text="done"), StreamEvent(done=True)],
+        ]
+    )
+    registry = Registry()
+    registry.register(WriteApprovalTool())
+    engine, _ = new_engine(str(tmp_path))
+    engine._start_mode = Mode.DEFAULT
+    with patch("endless_code.tui.app.new_provider", return_value=provider):
+        app = EndlessCodeApp([_config()], registry, engine=engine)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._start_turn("write")
+            await _wait_for_state(app, pilot, SessionState.APPROVING)
+            assert app.pending is not None
+            app.update_approving("2")
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            local = tmp_path / ".endless-code" / "settings.local.yaml"
+            assert "Write(src/x.py)" in local.read_text(encoding="utf-8")

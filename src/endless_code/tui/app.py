@@ -16,8 +16,16 @@ from textual.timer import Timer
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from endless_code import __version__
-from endless_code.agent import Agent, ApprovalRequest, Phase
-from endless_code.config import ConfigError, ProviderConfig
+from endless_code.agent import (
+    Agent,
+    ApprovalRequest,
+    CompactEvent,
+    CompactPhase,
+    Phase,
+    SessionRuntime,
+    new_session_runtime,
+)
+from endless_code.config import ConfigError, ProviderConfig, effective_context_window
 from endless_code.conversation import Conversation
 from endless_code.llm import Provider, new_provider
 from endless_code.permission import Mode, Outcome
@@ -25,6 +33,7 @@ from endless_code.permission.engine import Engine, new_engine
 from endless_code.prompt import EXECUTE_DIRECTIVE
 from endless_code.security import redact_sensitive, summarize_tool_args
 from endless_code.tool import Registry, new_default_registry
+from endless_code.tui.commands import dispatch_command
 
 MODE_LABELS = {
     Mode.DEFAULT: "DEFAULT",
@@ -105,6 +114,8 @@ class EndlessCodeApp(App):
         self._providers = providers
         self._version = version
         self._provider: Provider | None = None
+        self._agent: Agent | None = None
+        self._runtime: SessionRuntime | None = None
         self._tool_registry = registry or new_default_registry()
         self._conv = Conversation()
         self._state = SessionState.SELECTING
@@ -176,6 +187,16 @@ class EndlessCodeApp(App):
     def _activate_provider(self, cfg: ProviderConfig) -> bool:
         try:
             self._provider = new_provider(cfg)
+            self._runtime = new_session_runtime(
+                str(Path.cwd().resolve()), effective_context_window(cfg)
+            )
+            self._agent = Agent(
+                self._provider,
+                self._tool_registry,
+                self._version,
+                self._engine,
+                self._runtime,
+            )
             secret = cfg.resolve_api_key()
             if secret:
                 self._secrets.add(secret)
@@ -250,8 +271,7 @@ class EndlessCodeApp(App):
         self._input.clear()
         if not text:
             return
-        if text in ("/exit", "/quit"):
-            self.exit()
+        if dispatch_command(self, text):
             return
         if self._state is SessionState.SELECTING:
             self._handle_select_input(text)
@@ -261,18 +281,40 @@ class EndlessCodeApp(App):
         self._handle_idle_input(text)
 
     def _handle_idle_input(self, text: str) -> None:
-        if text == "/plan":
-            self._mode = Mode.PLAN
-            self._write_notice("已进入计划模式（只读工具）。")
-            self._update_status()
-            return
-        if text == "/do":
-            self._mode = Mode.DEFAULT
-            self._write_notice("已退出计划模式，开始执行上文计划。")
-            self._update_status()
-            self._start_turn(EXECUTE_DIRECTIVE, display_user=False)
+        if dispatch_command(self, text):
             return
         self._start_turn(text)
+
+    def _command_exit(self) -> None:
+        self.exit()
+
+    def _command_plan(self) -> None:
+        if self._state is not SessionState.IDLE:
+            return
+        self._mode = Mode.PLAN
+        self._write_notice("已进入计划模式（只读工具）。")
+        self._update_status()
+
+    def _command_do(self) -> None:
+        if self._state is not SessionState.IDLE:
+            return
+        self._mode = Mode.DEFAULT
+        self._write_notice("已退出计划模式，开始执行上文计划。")
+        self._update_status()
+        self._start_turn(EXECUTE_DIRECTIVE, display_user=False)
+
+    def _command_compact(self) -> None:
+        if self._state is not SessionState.IDLE:
+            self._write_notice("当前任务尚未结束，暂不能压缩上下文。")
+            return
+        if self._agent is None:
+            self._write_error("尚未选择可用的 Provider。")
+            return
+        self._state = SessionState.STREAMING
+        self._input.disabled = True
+        self._streaming.remove_class("hidden")
+        self._streaming.update("正在压缩上下文...")
+        self._stream_task = asyncio.create_task(self._consume_force_compact())
 
     def _start_turn(self, text: str, *, display_user: bool = True) -> None:
         if self._provider is None:
@@ -388,14 +430,17 @@ class EndlessCodeApp(App):
     async def _consume_agent_events(self) -> None:
         provider = self._provider
         cancel = self._turn_cancel
-        if provider is None or cancel is None:
+        agent = self._agent
+        if provider is None or cancel is None or agent is None:
             self._end_turn()
             return
-        agent = Agent(provider, self._tool_registry, self._version, self._engine)
         terminal = False
         try:
             async for event in agent.run(self._conv, self._mode, cancel):
-                if event.approval is not None:
+                if event.compact is not None:
+                    self._flush_reply()
+                    self._write_notice(format_compact_notice(event.compact))
+                elif event.approval is not None:
                     self._flush_reply()
                     self.pending = event.approval
                     self.approve_cursor = 0
@@ -435,6 +480,23 @@ class EndlessCodeApp(App):
                 SessionState.APPROVING,
             ):
                 self._end_turn()
+
+    async def _consume_force_compact(self) -> None:
+        agent = self._agent
+        if agent is None:
+            self._end_turn()
+            return
+        try:
+            before, after = await agent.run_force_compact(self._conv, self._mode)
+            self._write_notice(
+                format_compact_notice(
+                    CompactEvent(CompactPhase.AFTER_AUTO, before, after)
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._write_error(f"压缩失败: {type(exc).__name__}: {exc}")
+        finally:
+            self._end_turn()
 
     def _handle_tool_event(self, event) -> None:
         args = summarize_tool_args(event.name, event.args, self._secrets)
@@ -541,3 +603,14 @@ class EndlessCodeApp(App):
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
         self.exit()
+
+
+def format_compact_notice(event: CompactEvent) -> str:
+    """统一格式化自动、紧急与手动压缩提示。"""
+    if event.phase is CompactPhase.BEFORE_AUTO:
+        return "正在压缩上下文..."
+    if event.phase is CompactPhase.BEFORE_EMERGENCY:
+        return "上下文撞墙，自动压缩中..."
+    if event.err is not None:
+        return f"压缩失败: {type(event.err).__name__}: {event.err}"
+    return f"已压缩，token 从 {event.before_tokens} 降至 {event.after_tokens}"

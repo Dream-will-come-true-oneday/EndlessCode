@@ -2,6 +2,7 @@
 .endless-code/config.yaml
 .endless-code/settings.local.yaml
 .endless-code/mcp.yaml
+.endless-code/sessions/
 
 # Python
 __pycache__/

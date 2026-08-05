@@ -224,6 +224,26 @@ async def test_plan_and_do_command_switch_tools_and_suffix() -> None:
 
 
 @pytest.mark.asyncio
+async def test_compact_command_uses_summary_path_only() -> None:
+    provider = FakeProvider(
+        [[StreamEvent(text="<summary>brief</summary>"), StreamEvent(done=True)]]
+    )
+    with patch("endless_code.tui.app.new_provider", return_value=provider):
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._conv.add_user("已有历史")
+            app._handle_idle_input("/compact")
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            assert len(provider.requests) == 1
+            assert provider.requests[0][1] == []
+            assert all(
+                message.content != "/compact" for message in app._conv.messages()
+            )
+            assert "已压缩，token 从" in _chat_text(app)
+
+
+@pytest.mark.asyncio
 async def test_render_order_history_and_redaction_e2e() -> None:
     call = ToolCall(
         id="secret-call",

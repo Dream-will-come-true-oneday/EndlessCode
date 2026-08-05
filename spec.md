@@ -1,93 +1,98 @@
-```Markdown
-# MCP 客户端 Spec
+# Endless Code 上下文管理 Spec
+
 ## 背景
-ch06 之后 endless-code 已具备五层权限护栏：一次工具调用在真正执行前必须穿过 黑名单 → 沙箱 → 规则引擎 → 模式兜底 → 人在回路。但工具集是**封闭**的——只有 6 个内置工具，模型无法触达外部世界的数据源与服务。这在 ch02 背景里就被列为预留能力（「在没有工具调用、**权限**、记忆等高级能力之前」）。
 
-本章给 endless-code 接上 **MCP（Model Context Protocol）客户端**：通过官方 `mcp` Python SDK，以 **stdio** 与 **Streamable HTTP** 两种传输拉起远端 MCP server，把远端工具适配成本地 `Tool` 协议后**无缝汇入现有工具流转链路**——权限判定、Agent Loop、结果回灌、TUI 展示对工具来源完全透明。工具命名空间 `mcp__<server>__<tool>` 一眼识别来源，与内置工具天然不冲突。
+Endless Code 是一个 Python/Textual 终端编码 Agent。Agent 每轮都把 `Conversation` 中的用户消息、助手消息、工具调用和工具结果重新交给当前 Provider。长时间编码时，`read_file`、`bash`、`grep` 和 MCP 工具结果会持续堆积，最终触发 Provider 的上下文超限错误。
 
-接入安全护栏：远端工具**默认走既有权限链路**（只读工具按 Read 兜底、其余按 Exec 兜底 Ask），权限规则可写 `mcp__<server>__<tool>` 与 `mcp__<server>__*`；连接失败 / 配置非法 / 超时的 server 只跳过自身、绝不拖垮启动或退出。
+当前项目已经具备 Agent ReAct 循环、三类 Provider、工具注册中心、MCP 客户端和权限引擎，但没有长会话上下文管理、工具结果落盘或摘要恢复能力。本功能在不改变现有工具和权限语义的前提下，为单个进程内的 TUI 会话增加可恢复的上下文压缩。
 
 ## 目标
-- **两层配置、天然降级**：用户级 `~/.config/endless-code/mcp.yaml` + 项目级 `<root>/.endless-code/mcp.yaml` 按 server 名合并，项目级完整覆盖同名 server；任一文件缺失视为空层、格式非法跳过该层 + stderr 告警，**永不抛出**。
-- **${VAR} 展开、密钥不入配置**：env / headers 的值支持 `${VAR}` 从宿主环境展开；未定义变量展开为空串 + 一次性告警，不阻断启动；command / args / 工具名 / server 名**不展开**。
-- **并发连接、失败隔离**：启动时并发连接所有 server，每个 server 30s 超时；失败 / 超时 / 非法只跳过自身 + 告警，其余 server 与内置工具照常注册可用。
-- **工具命名空间**：所有 MCP 工具 `name` 形如 `mcp__<server>__<tool>`；拼合后含 LLM 工具名禁用字符的工具被跳过 + 告警；与内置 6 工具天然不重名，不同 server 同名工具互不覆盖。
-- **调用超时与错误回灌**：远端调用 30s `asyncio.wait_for` 超时、协议异常、远端 `isError` 均映射为 `Result(is_error=True)` 回灌，**不中断 Agent Loop**。
-- **生命周期干净**：退出时统一关闭所有会话（stdio 子进程终止、HTTP 断开），总超时 5s 兜底，绝不阻塞退出。
-- **权限链路零改动**：permission 包与 provider 适配层不改一行，MCP 工具经由既有 `friendly_name` / `categorize` / `extract_target` 自然命中五层防御。
+
+- 长时间单进程会话不会因为历史消息无限增长而轻易撞上 Provider 上下文窗口。
+- 超大工具结果保留在本地，并在对话中使用稳定预览，保持后续请求的缓存前缀稳定。
+- 摘要后保留用户原话、最近文件快照、当前工具定义和边界提示，模型仍能继续当前任务。
+- 自动压缩、手动 `/compact` 和 Provider 上下文超限后的紧急压缩共享摘要核心，但触发和熔断策略不同。
+- 现有 `pytest` 测试和 `/exit`、`/plan`、`/do`、权限审批、MCP 行为不退化。
 
 ## 功能需求
 
-- F1: 两层配置加载与合并
-  从用户级 `~/.config/endless-code/mcp.yaml` 与项目级 `<root>/.endless-code/mcp.yaml` 读取 `mcp_servers` 段，按 server 名合并：项目级同名 server **完整覆盖**用户级（不做字段级半合并）。返回归一化的 `Config(servers={name: ServerConfig})`。
+### F1：工具结果预防性压缩
 
-- F2: 配置校验与降级
-  单个 server 校验：`type` 必为 `stdio` / `http`；`stdio` 必填 `command`；`http` 必填 `url`。违规的 server 跳过 + stderr 告警原因，其余 server 不受影响。文件缺失视为空层；格式非法（YAML 解析失败）跳过该层 + stderr 告警，**不抛未捕获异常**。`Path.home()` 失败时用户层跳过不致错。
+1. 每次主对话请求组装前扫描 `Message(role="tool")` 的 `tool_results`。
+2. 单条结果 UTF-8 字节数大于 `50000` 时，完整内容写入 `.endless-code/sessions/<session_id>/tool-results/<tool_use_id>`，对话中替换为稳定预览。
+3. 同一条工具消息的剩余结果合计超过 `200000` 字节时，按结果字节数从大到小继续落盘，直到剩余合计不超过阈值。
+4. 预览必须包含原始字节数、最多 20 行且最多 2048 字节的头部、落盘路径和使用 `read_file` 重读的提示。
+5. 落盘失败时保留原文且不冻结该 id；成功决策后同一 `tool_use_id` 在本会话中不可翻转，预览字符串逐轮复用。
 
-- F3: ${VAR} 展开
-  对 `env` / `headers` 的**值**做 `${VAR}` 正则展开（`\$\{[A-Za-z_][A-Za-z0-9_]*\}`）；已定义展开为环境值，未定义展开为空串 + stderr 一次性告警（同 server 同变量限一次）。`command` / `args` / 工具名 / server 名不展开，保留字面量。
+### F2：自动摘要
 
-- F4: stdio 连接
-  用 `mcp.client.stdio.stdio_client` 拉起 MCP server 子进程（`command` + `args`，`env` = 宿主环境 ∪ 配置 env，同名宿主变量被覆盖），由 SDK 完成 `initialize` 握手与 `list_tools`。
+当估算 token 达到 `context_window - 20000 - 13000` 时，在下一次主对话 Provider 请求前执行一次摘要。摘要请求不传工具定义，要求模型先输出 `<analysis>` 草稿，再输出包含以下九节的 `<summary>`：
 
-- F5: HTTP 连接
-  用 `mcp.client.streamable_http.streamable_http_client` 连接 Streamable HTTP 端点（`url` + 自定义 `headers`），完成握手与列工具。只消费请求-响应用途，**不订阅**服务端推送长连接。
+1. 主要请求和意图
+2. 关键技术概念
+3. 文件和代码段
+4. 错误和修复
+5. 问题解决过程
+6. 所有用户消息原文
+7. 待办任务
+8. 当前工作
+9. 可能的下一步
 
-- F6: 工具列取与注册
-  对 `list_tools` 返回的每个远端 `Tool` 调 `adapt_tool` 适配为 `McpTool`；把成功适配的工具按 `full_name` 稳定排序后交给 cli 注册进 registry。工具来源对 agent / tui / permission 透明。
+摘要解析只保留 `<summary>` 内容。
 
-- F7: 工具适配与调用结果处理
-  适配：`description` 为空时给兜底文案；`inputSchema` 浅拷贝为 `dict`、空 schema 兜底 `{"type": "object"}`；`read_only` 仅信远端 `annotations.read_only_hint==True`（None-safe）。调用：把远端多个 text 内容块按序拼成 `content`；非 text 块（image / audio / resource_link / embedded_resource）静默丢弃 + 单工具限一次告警；远端 `isError==True` 映射为 `Result.is_error=True` 且保留远端 text。
+### F3：摘要恢复
 
-- F8: 工具命名与命名空间隔离
-  命名规则 `mcp__<server>__<tool>`；拼合后不匹配 `^[A-Za-z0-9_-]+$` 的工具跳过 + 告警。不同 server 同名工具互不覆盖；与内置 6 工具天然不重名。
+摘要后追加一条恢复消息，再追加近期原文。恢复消息包含：
 
-- F9: 连接并发、失败隔离与启动超时
-  启动时对每个 server 起独立连接任务，`asyncio.gather` 并发；每个 server 以 `asyncio.wait_for` 施加 30s 超时。连接 / 握手 / 列工具失败只跳过该 server + 告警，其余 server 与内置工具照常注册。启动只在**全部 server 的建立结果**（成功 / 失败 / 超时）齐备后进入 TUI。
+- 最近成功读取的最多 5 个文件，按最后读取时间倒序；每个文件最多 5000 token，超出保留头部并追加 `(content truncated)`。
+- 当前这次 Agent 迭代实际传给 Provider 的同一份 `ToolDefinition` 列表，名称、描述和 schema 必须一致。
+- 固定边界提示：需要文件原文、错误原文或用户原话时必须使用 `read_file` 重读，不能依赖摘要猜测。
 
-- F10: 调用超时与协议错回灌
-  远端调用以 `asyncio.wait_for` 施加 30s 超时；超时与协议异常均映射为 `Result(is_error=True, content=可读错因)` 回灌，不中断 Agent Loop、不回滚会话历史。
+近期原文从会话尾部倒序保留，直到同时满足至少 10000 token 和至少 5 条消息；不得截断 assistant 工具调用与对应 tool 结果的配对，截断点落在配对中间时向前移到调用前。
 
-- F11: 生命周期关闭
-  退出时统一关闭所有会话：stdio 子进程终止、HTTP 会话断开；总超时 5s 兜底，超时给 stderr 告警后不再等待，绝不阻塞退出。
+### F4：token 估算和 Provider 窗口
 
-- F12: 权限链路自然命中
-  不做任何权限适配。`friendly_name` 对 `mcp__<server>__<tool>` 原样返回 → 规则可写 `mcp__<server>__<tool>` / `mcp__<server>__*`；`categorize` 在 `read_only==True` 走 Read、否则归 Exec → 模式兜底矩阵自然命中；`extract_target` 对未知工具返回 `("", False, False)` → 黑名单 / 沙箱自动跳过。
+- 估算锚点为最近一次主对话 Provider 返回的 `input_tokens + output_tokens + cache_read + cache_write`。
+- 锚点之后新增消息按 UTF-8 字符数除以 `3.5` 向上取整。
+- 每次主对话流结束后替换锚点，不累加；摘要请求的 usage 不更新主对话锚点。
+- `ProviderConfig.context_window` 为可选正整数；未配置时 Anthropic 默认 `200000`，OpenAI 和 DeepSeek 默认 `128000`。
+
+### F5：手动压缩和命令分发
+
+- `/exit`、`/quit`、`/plan`、`/do` 和 `/compact` 由统一命令注册表处理，不写入 Conversation，不发送给 LLM。
+- 未知斜杠命令显示可用命令，不发送给 LLM。
+- `/compact` 无条件执行摘要，跳过自动阈值、第一层预防压缩和自动熔断；完成后显示压缩前后 token。
+- 手动压缩与主 Agent 运行互斥。
+
+### F6：上下文超限应急处理
+
+- Provider 报告上下文超限时统一转换为 `PromptTooLongError`。
+- Agent 先强制执行第一层，再执行摘要恢复；摘要成功且估算低于 `context_window - 20000 - 3000` 时只重试原主请求一次。
+- 重试仍超限或压缩后仍超过安全阈值时结束本轮并显示错误，不进行第三次主请求。
+- 摘要请求自身超限时，按用户提交分组丢弃最旧消息重试，最多直接丢一组三次，之后每次丢剩余组数的 20%（向上取整，至少一组）；不能发送空消息摘要请求。
+
+### F7：生命周期和并发
+
+- 进程启动时创建一次 `<unix_ts>-<短随机串>` 会话 id，并按需创建 `.endless-code/sessions/<id>/tool-results/`。
+- `SessionRuntime` 由 `EndlessCodeApp` 持有，跨用户轮次复用替换账本、文件追踪、熔断器、会话目录和 token 锚点。
+- Conversation 的历史替换使用深拷贝；替换账本、文件追踪、熔断器在并发访问下保持一致。
+- 不做跨进程历史持久化，不自动清理会话目录，不引入精确 tokenizer。
 
 ## 非功能需求
 
-- N1: 降级与失败隔离——配置缺失 / 格式非法 / server 连接失败 / 超时，一律只影响自身：不抛未捕获异常、不中断启动、不拖垮其它 server 与内置工具集。
-- N2: 校验严格但局部——非法 server 跳过并给出原因，判定只依赖 server 自身字段，不牵连合法 server。
-- N3: provider 适配层零改动——`src/endless_code/llm/anthropic_provider.py`、`openai_provider.py` 无修改；工具定义透传，协议无关。
-- N4: permission 包零改动——`src/endless_code/permission/` 无修改；MCP 工具的权限判定完全复用既有链路。
-- N5: 不中断 Agent Loop——调用超时 / 协议错 / 远端错误均以 `is_error` 结果回灌，Loop 继续、历史一致、既有能力（多轮编排、流式、保序分批并发、取消）不退化。
-- N6: 凭据不落盘——配置示例 / 文档 / 测试 fixture 全用 `${VAR}`；密钥经 env / headers 从宿主环境注入，不写入配置文件、不回显。
-- N7: 退出干净——`close()` 终止所有子进程 / 断开 HTTP，5s 兜底防卡死，无残留子进程。
-- N8: 并发安全——连接并发写共享状态经锁保护；`close` 后无悬挂 task、无死锁、无 `coroutine was never awaited` 告警。
-- N9: 代码规范——`ruff format --check .` 无 diff、`ruff check .` 无告警；`pytest` 全过；新增 `tests/test_mcp_*.py`。
-
-## 不做的事
-- **资源 / 提示词 / 采样 / roots**——本章只覆盖工具能力，不实现 MCP 资源、提示词、采样与 roots 语义。
-- **独立 SSE 推送通道**——只消费请求-响应，不订阅 `streamable_http_client` 返回的服务端推送流。
-- **非 text 内容块回灌**——image / audio 等块静默丢弃（模型只能消费文本），仅告警一次。
-- **OAuth 完整流程**——用户预换 token 写进 `headers`；本章范围最小化。
-- **本地级（第三层）MCP 配置**——只两层；`${VAR}` 已让密钥不入配置，本地层冗余。
-- **黑名单 / 沙箱扩展**——MCP 工具的黑名单 / 沙箱行为沿用内置工具的既有判定，不新增作用域。
-- **HTTP server 的交互式建连**——无重连 / 重试 / 心跳，连接失败即跳过。
+- 第一层在请求组装前执行，不调用 LLM；常规字符串处理应保持轻量，落盘不能长期阻塞事件循环。
+- 所有外部 Provider 和文件异常均有降级路径：工具落盘失败保留原文，摘要失败按自动熔断处理。
+- 上下文管理代码集中在 `src/endless_code/compact/`，Agent 只使用窄接口。
+- 核心逻辑必须可使用 fake Provider 离线测试。
 
 ## 验收标准
-- AC1: 两层配置——两文件存在时按 server 名合并，同名 server 项目级完整覆盖用户级（验证：单测构造两层文件断言合并结果与字段来源）。(F1)
-- AC2: 降级与校验——任一文件缺失视为空、格式非法跳过该文件 + stderr 告警且其它层正常加载；stdio 缺 command / http 缺 url / `type` 非法或缺失的 server 被跳过 + 给出原因，其余 server 不受影响；`load_config` 永不抛出。(F2/N1/N2)
-- AC3: ${VAR} 展开——env / headers 的值被展开；未定义展开为空串 + 一次性告警；command / args 中的 `${X}` 保留字面量。(F3)
-- AC4: stdio 连接——能拉起 MCP server 子进程并由 SDK 完成 `initialize` + `list_tools`；`env` 注入到子进程环境（验证：真实 demo server 端到端，或 tmux 实跑 `@modelcontextprotocol/server-everything`）。(F4/F6)
-- AC5: HTTP 连接——能对 HTTP MCP server 完成握手 + 列工具；`headers` 真正出现在每个 HTTP 请求中（验证：`pytest-httpx` / `httpx.MockTransport` 起最小端点断言收到 `Authorization` 头）。(F5/F6/N6)
-- AC6: 工具适配与调用——description 空给兜底；schema 透传 / 空 schema 兜底；`read_only` 仅信 `read_only_hint==True`（None-safe）；多 text 块按序拼接；非 text 块丢弃 + 单工具限一次告警；远端 `isError` 映射（验证：`test_mcp_tool` 注入 stub 覆盖各分支）。(F7)
-- AC7: 命名与命名空间——工具 `name` 形如 `mcp__<server>__<tool>`；含禁用字符的工具被跳过 + 告警；registry 注册后全名集合无重复（与内置 6 工具、跨 server 均不冲突）。(F8)
-- AC8: 失败隔离与启动超时——一个失败 server + 一个正常 server 启动时：前者告警、后者工具照常注册可用；卡住的 server 在（测试缩短的）超时窗口结束后被跳过，启动不阻塞超过该窗口。(F9/N1)
-- AC9: 协议错与超时回灌——远端调用抛异常或 30s 超时 → `Result(is_error=True)` + 可读错因回灌，Agent Loop 不中断。(F10/N5)
-- AC10: 退出干净——`close()` 终止所有 stdio 子进程、断开 HTTP；某 session 关闭卡住时 5s 兜底返回不阻塞；实跑退出后无残留子进程。(F11/N7)
-- AC11: 权限链路自然命中——无规则时 `readOnlyHint=True` 工具走 Read 兜底（default 放行）、其余走 Exec 兜底（default Ask）；allow 规则 `mcp__<server>__*` 命中直接放行；bypass 放行；MCP 工具不被黑名单 / 沙箱误拦（`extract_target` 返回 `("", False, False)`）。(F12/N4)
-- AC12: provider 适配层零改动——`src/endless_code/llm/anthropic_provider.py`、`openai_provider.py` 无修改（验证：核对 diff）。(N3)
-- AC13: 既有能力不退化——`pytest` 全过，既有用例无需适配；Agent Loop / 权限 / 工具链路行为不变。(N5)
-- AC14: 凭据不落盘——配置示例 / 文档 / 测试 fixture 全用 `${VAR}`；`git grep -E '(Bearer|sk-|ghp_|github_pat_)[A-Za-z0-9_-]{16,}'` 在本次开发期间无命中。(N6)
-```
+
+- AC1：60000 字节工具结果在下一次请求中变成稳定预览，完整文件存在且大小一致。
+- AC2：多条工具结果聚合超过 200000 字节时，剩余对话结果合计不超过阈值。
+- AC3：同一 id 的 keep/replaced 决策跨至少五轮不翻转，替换体逐字节一致。
+- AC4：达到自动阈值会在下一次主请求前摘要，低于阈值不摘要，连续三次自动失败后熔断。
+- AC5：摘要恢复消息包含九节摘要、用户原文、最多五个文件、实际工具 schema 和边界提示。
+- AC6：`/compact` 在低 token 时仍执行且不调用普通 Agent run；未知命令不调用 Provider。
+- AC7：Provider 上下文超限时完成一次紧急压缩和最多一次主请求重试。
+- AC8：Anthropic、OpenAI、DeepSeek 的默认或配置窗口生效，旧配置仍可加载。
+- AC9：现有测试、lint、格式化和 `python -m endless_code` 启动行为通过。

@@ -68,6 +68,19 @@ class FakeProvider:
             yield event
 
 
+class MemoryRecorder:
+    def __init__(self) -> None:
+        self.done = asyncio.Event()
+        self.messages: list[Message] = []
+
+    def load_index(self) -> str:
+        return ""
+
+    async def update_async(self, messages: list[Message]) -> None:
+        self.messages = messages
+        self.done.set()
+
+
 class BlockingProvider(FakeProvider):
     def __init__(self) -> None:
         super().__init__([])
@@ -646,3 +659,24 @@ async def test_ask_approval_allow_forever_persists(tmp_path) -> None:
     assert "Write(src/x.py)" in local.read_text(encoding="utf-8")
     engine2, _ = new_engine(str(tmp_path))
     assert engine2.check(Mode.DEFAULT, call, False)[0] is Decision.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_explicit_memory_signal_schedules_background_update(tmp_path) -> None:
+    provider = FakeProvider([[StreamEvent(text="done"), StreamEvent(done=True)]])
+    manager = MemoryRecorder()
+    conv = Conversation()
+    conv.add_user("请记住我偏好中文回复")
+    agent = Agent(
+        provider,
+        _registry(),
+        runtime=new_session_runtime(str(tmp_path)),
+        memory_manager=manager,  # type: ignore[arg-type]
+    )
+
+    await _run(agent, conv)
+    await asyncio.wait_for(manager.done.wait(), timeout=1)
+    assert [message.content for message in manager.messages] == [
+        "请记住我偏好中文回复",
+        "done",
+    ]

@@ -1,8 +1,8 @@
 """上下文压缩的会话级状态。"""
 
+import re
 import secrets
 import threading
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -14,17 +14,44 @@ from endless_code.compact.const import MAX_CONSECUTIVE_AUTO_COMPACT_FAILURES
 @dataclass(frozen=True)
 class SessionContext:
     session_id: str
+    session_dir: str
     spill_dir: str
+
+
+_SESSION_ID_PATTERN = re.compile(r"^(?P<stamp>\d{8}-\d{6})-[0-9a-f]{4}$")
+
+
+def _new_session_id() -> str:
+    """生成可排序、可解析且能避免同秒碰撞的会话标识。"""
+    return f"{datetime.now().astimezone():%Y%m%d-%H%M%S}-{secrets.token_hex(2)}"
+
+
+def parse_session_time(session_id: str) -> datetime | None:
+    """解析新格式会话标识中的本地时间；旧格式返回 ``None``。"""
+    match = _SESSION_ID_PATTERN.fullmatch(session_id)
+    if match is None:
+        return None
+    try:
+        return datetime.strptime(match.group("stamp"), "%Y%m%d-%H%M%S").astimezone()
+    except ValueError:
+        return None
+
+
+def open_session_context(workspace: str, session_id: str) -> SessionContext:
+    """打开现有会话目录，供恢复会话后复用工具结果目录。"""
+    session_dir = Path(workspace) / ".endless-code" / "sessions" / session_id
+    spill_dir = session_dir / "tool-results"
+    spill_dir.mkdir(parents=True, exist_ok=True)
+    return SessionContext(
+        session_id=session_id,
+        session_dir=str(session_dir),
+        spill_dir=str(spill_dir),
+    )
 
 
 def new_session_context(workspace: str) -> SessionContext:
     """创建当前进程唯一的工具结果落盘目录。"""
-    session_id = f"{int(time.time())}-{secrets.token_hex(4)}"
-    spill_dir = (
-        Path(workspace) / ".endless-code" / "sessions" / session_id / "tool-results"
-    )
-    spill_dir.mkdir(parents=True, exist_ok=True)
-    return SessionContext(session_id=session_id, spill_dir=str(spill_dir))
+    return open_session_context(workspace, _new_session_id())
 
 
 class ContentReplacementState:

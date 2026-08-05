@@ -1,6 +1,7 @@
-# 真实密钥文件（不提交）
+# 本地配置（不提交）
 .endless-code/config.yaml
 .endless-code/settings.local.yaml
+.endless-code/mcp.yaml
 
 # Python
 __pycache__/

@@ -44,11 +44,6 @@ class Engine:
         friendly = friendly_name(call.name)
         target, is_file, ok = extract_target(call)
 
-        if not read_only and friendly == call.name:
-            if mode is Mode.BYPASS:
-                return Decision.ALLOW, ""
-            return Decision.ASK, "未知工具需确认"
-
         if category is Category.EXEC and target and hits_blacklist(target):
             return Decision.DENY, f"命中危险命令黑名单：{target}"
 
@@ -64,6 +59,12 @@ class Engine:
             if hit:
                 label = "deny" if decision is Decision.DENY else "allow"
                 return decision, f"匹配{label}规则：{friendly}"
+
+        # 未命中规则时，非只读的未知工具按最严处理（Ask），bypass 除外。
+        if not read_only and friendly == call.name:
+            if mode is Mode.BYPASS:
+                return Decision.ALLOW, ""
+            return Decision.ASK, "未知工具需确认"
 
         decision = mode_fallback(mode, category)
         if decision is Decision.ASK:

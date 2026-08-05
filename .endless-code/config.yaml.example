@@ -6,6 +6,11 @@
 #   2. 用户目录 ~/.config/endless-code/config.yaml
 
 providers:
+  - name: anthropic
+    protocol: anthropic
+    model: claude-3-5-sonnet-latest
+    api_key: $ANTHROPIC_API_KEY      # 环境变量引用
+
   - name: deepseek
     protocol: deepseek
     model: deepseek-chat

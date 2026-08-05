@@ -176,3 +176,37 @@ def test_persist_local_allow_and_reload(tmp_path) -> None:
 
     engine2, _ = new_engine(str(tmp_path))
     assert engine2.check(Mode.DEFAULT, call, False)[0] is Decision.ALLOW
+
+
+def test_mcp_tool_rule_hits_before_unknown_tool_guard(tmp_path) -> None:
+    """MCP 工具的 allow 规则命中时优先于未知工具保护。"""
+    engine, _ = new_engine(str(tmp_path))
+    call = _call("mcp__demo__echo", text="x")
+    # 无规则：未知工具 default 下 Ask
+    assert engine.check(Mode.DEFAULT, call, False)[0] is Decision.ASK
+    # 写入规则后：命中 allow
+    engine.local.allow.append(Rule("mcp__demo__echo", "", True))
+    assert engine.check(Mode.DEFAULT, call, False)[0] is Decision.ALLOW
+
+
+def test_mcp_tool_deny_rule(tmp_path) -> None:
+    """MCP 工具的 deny 规则命中即 Deny。"""
+    engine, _ = new_engine(str(tmp_path))
+    call = _call("mcp__demo__echo", text="x")
+    engine.local.deny.append(Rule("mcp__demo__echo", "", False))
+    assert engine.check(Mode.DEFAULT, call, False)[0] is Decision.DENY
+
+
+def test_persist_local_allow_mcp_tool(tmp_path) -> None:
+    """「永久允许」MCP 工具写入本地精确规则并生效。"""
+    settings_dir = tmp_path / ".endless-code"
+    settings_dir.mkdir()
+    engine, _ = new_engine(str(tmp_path))
+    call = _call("mcp__demo__echo", text="x")
+    engine.persist_local_allow(call)
+
+    local_file = settings_dir / "settings.local.yaml"
+    assert "mcp__demo__echo" in local_file.read_text(encoding="utf-8")
+
+    engine2, _ = new_engine(str(tmp_path))
+    assert engine2.check(Mode.DEFAULT, call, False)[0] is Decision.ALLOW

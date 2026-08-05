@@ -11,6 +11,7 @@ Endless Code 是一个运行在终端中的智能编程助手。它以可取消�
 - **多轮 Agent Loop**：自动完成“分析 -> 调用工具 -> 读取结果 -> 继续行动”的工作流。
 - **Plan / Do 模式**：`/plan` 仅开放只读工具进行调查，`/do` 恢复完整工具集并执行计划。
 - **六个内置工具**：`read_file`、`write_file`、`edit_file`、`glob`、`grep` 和 `bash`。
+- **MCP 客户端接入**：通过 stdio 与 Streamable HTTP 连接 MCP server，远端工具以 `mcp__<server>__<tool>` 命名空间并入既有工具与权限链路，密钥经 `${VAR}` 注入不落盘。
 - **安全的工具调度**：连续只读调用可并发执行，写入和命令调用保持顺序边界。
 - **流式响应与可取消**：实时显示文本、工具调用、结果、迭代轮次和 Token usage；支持 `Esc` 与 `Ctrl+C` 取消。
 - **系统提示工程化**：稳定提示模块化，环境信息、缓存前缀和 `system-reminder` 分离管理。
@@ -100,6 +101,39 @@ providers:
 1. 当前目录 `.endless-code/config.yaml`
 2. 用户目录 `~/.config/endless-code/config.yaml`
 
+## MCP 工具扩展
+
+Endless Code 内置 MCP（Model Context Protocol）客户端，通过 **stdio** 或 **Streamable HTTP** 连接 MCP server，把远端工具接入本地工具链路。工具命名为 `mcp__<server>__<tool>`（如 `mcp__github__search_repo`），与内置 6 个工具天然不冲突；权限规则可直接写 `mcp__<server>__<tool>` 或 `mcp__<server>__*`。
+
+MCP 配置同样分两层 YAML，同名 server 项目级完整覆盖用户级：
+
+| 位置 | 路径 |
+| --- | --- |
+| 项目级 | `.endless-code/mcp.yaml` |
+| 用户级 | `~/.config/endless-code/mcp.yaml` |
+
+```yaml
+mcp_servers:
+  github:
+    type: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"      # 从宿主环境变量展开，密钥不入配置
+
+  example-http:
+    type: http
+    url: "https://mcp.example.com/mcp"
+    headers:
+      Authorization: "Bearer ${EXAMPLE_TOKEN}"
+```
+
+- `env` / `headers` 的值支持 `${VAR}` 展开；未定义变量展开为空串并在启动时告警，不阻断启动。
+- 每个 server 启动连接超时 30s、调用超时 30s；连接失败 / 配置非法 / 超时的 server 只跳过自身，其余 server 与内置工具照常可用。
+- 远端声明只读（`readOnlyHint`）的工具走只读兜底，其余工具在 default 模式需人在回路确认，行为与内置工具一致。
+- 退出时自动终止所有 stdio 子进程并断开 HTTP 会话。
+- 完整示例见 [`docs/mcp/mcp-servers.example.yaml`](docs/mcp/mcp-servers.example.yaml)。
+
 ## 使用方式
 
 直接输入任务，Agent 会自主检索、修改和验证：
@@ -107,10 +141,6 @@ providers:
 ```text
 定位这个项目的测试失败原因，修复后运行相关测试。
 ```
-
-## 效果演示
-
-![示例问题测试](docs/example-question.png)
 
 常用命令：
 

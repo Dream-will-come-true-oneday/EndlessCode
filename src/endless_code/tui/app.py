@@ -498,7 +498,7 @@ class EndlessCodeApp(App):
         self._write_notice(f"已切换到 {MODE_LABELS.get(self._mode)} 模式")
         self._update_status()
 
-    def on_key(self, event) -> None:
+    async def _on_key(self, event) -> None:
         if self._state is SessionState.APPROVING:
             key = event.key
             if key in (
@@ -519,12 +519,13 @@ class EndlessCodeApp(App):
             ):
                 if key in ("escape", "ctrl+c"):
                     self._resolve_pending_deny()
-                    self._turn_cancel and self._turn_cancel.set()
+                    if self._turn_cancel is not None:
+                        self._turn_cancel.set()
                 else:
                     self._update_approving(key)
                 event.stop()
                 return
-        super().on_key(event)
+        await super()._on_key(event)
 
     async def action_quit(self) -> None:
         task = self._stream_task

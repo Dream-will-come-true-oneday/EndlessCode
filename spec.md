@@ -1,109 +1,93 @@
-# 权限系统 Spec
-
+```Markdown
+# MCP 客户端 Spec
 ## 背景
+ch06 之后 endless-code 已具备五层权限护栏：一次工具调用在真正执行前必须穿过 黑名单 → 沙箱 → 规则引擎 → 模式兜底 → 人在回路。但工具集是**封闭**的——只有 6 个内置工具，模型无法触达外部世界的数据源与服务。这在 ch02 背景里就被列为预留能力（「在没有工具调用、**权限**、记忆等高级能力之前」）。
 
-Endless Code 已经完成多轮 Agent Loop 与系统提示工程化：模型能够自主“分析 → 调工具 → 读结果 → 继续行动”。但当前工具执行没有任何闸门——`write_file`/`edit_file` 可以写任意路径，`bash` 可以执行任意命令（含 `rm -rf /`），`read_file`/`glob`/`grep` 可以触碰项目目录之外的任何位置。
+本章给 endless-code 接上 **MCP（Model Context Protocol）客户端**：通过官方 `mcp` Python SDK，以 **stdio** 与 **Streamable HTTP** 两种传输拉起远端 MCP server，把远端工具适配成本地 `Tool` 协议后**无缝汇入现有工具流转链路**——权限判定、Agent Loop、结果回灌、TUI 展示对工具来源完全透明。工具命名空间 `mcp__<server>__<tool>` 一眼识别来源，与内置工具天然不冲突。
 
-本阶段给 Endless Code 装上五层防御的权限系统：危险命令黑名单硬拦截、路径沙箱限定操作范围、可配置规则做细粒度放行/拦截、多档权限模式覆盖信任等级、人在回路作为最后确认。五层串联、逐层短路，一次工具调用在真正执行前必须穿过这道护栏。权限被拒绝时把结构化拒绝**回灌**给模型，让它调整策略，而不是终止 Agent Loop。
+接入安全护栏：远端工具**默认走既有权限链路**（只读工具按 Read 兜底、其余按 Exec 兜底 Ask），权限规则可写 `mcp__<server>__<tool>` 与 `mcp__<server>__*`；连接失败 / 配置非法 / 超时的 server 只跳过自身、绝不拖垮启动或退出。
 
 ## 目标
-
-- **五层串联、逐层短路**：一次工具调用依次经过 黑名单 → 沙箱 → 规则引擎 → 模式兜底 → 人在回路；任一层给出终值（Allow/Deny）即短路返回，只有全部未拦且模式判为 Ask 时才落到人在回路。判定中间值只有 **Allow / Deny / Ask**；模式兜底层只产 **Allow 或 Ask**，Deny 只可能来自黑名单、沙箱、显式 deny 规则、人在回路拒绝。
-- **危险操作黑名单**：用一组内置正则在执行前拦掉已知高危命令（命令执行类工具），这一层不可被任何配置或模式放开。
-- **路径沙箱**：把文件类工具的读写限定在项目根目录内，先解析符号链接再做前缀判断，防止逃逸。
-- **可配置规则**：以「工具名(模式)」声明 allow 或 deny，支持精确匹配与 glob 匹配。
-- **三级优先级合并**：规则按 本地级 > 项目级 > 用户级 逐层判断，越本地越优先。
-- **多档权限模式**：default / acceptEdits / plan / bypassPermissions 四档，按「只读 / 文件写 / 命令执行」三类工具给出 Allow 或 Ask 的兜底裁决；运行时可切换。
-- **人在回路**：模式判为 Ask 时暂停 Loop，把决定权交回用户，支持「允许本次 / 永久 / 拒绝本次」三种选择（↑↓ 移动光标 + 回车确认，数字键 1/2/3 亦可直选，默认高亮「允许本次」）；选「永久」把精确 allow 规则写入本地层配置。
-- **拒绝不中断**：任何一层的 Deny 都包成结构化错误结果回灌给模型，Agent Loop 继续往下走。
-- **跨协议一致**：权限判定发生在 agent 编排层，与 Anthropic / OpenAI / DeepSeek provider 无关。
+- **两层配置、天然降级**：用户级 `~/.config/endless-code/mcp.yaml` + 项目级 `<root>/.endless-code/mcp.yaml` 按 server 名合并，项目级完整覆盖同名 server；任一文件缺失视为空层、格式非法跳过该层 + stderr 告警，**永不抛出**。
+- **${VAR} 展开、密钥不入配置**：env / headers 的值支持 `${VAR}` 从宿主环境展开；未定义变量展开为空串 + 一次性告警，不阻断启动；command / args / 工具名 / server 名**不展开**。
+- **并发连接、失败隔离**：启动时并发连接所有 server，每个 server 30s 超时；失败 / 超时 / 非法只跳过自身 + 告警，其余 server 与内置工具照常注册可用。
+- **工具命名空间**：所有 MCP 工具 `name` 形如 `mcp__<server>__<tool>`；拼合后含 LLM 工具名禁用字符的工具被跳过 + 告警；与内置 6 工具天然不重名，不同 server 同名工具互不覆盖。
+- **调用超时与错误回灌**：远端调用 30s `asyncio.wait_for` 超时、协议异常、远端 `isError` 均映射为 `Result(is_error=True)` 回灌，**不中断 Agent Loop**。
+- **生命周期干净**：退出时统一关闭所有会话（stdio 子进程终止、HTTP 断开），总超时 5s 兜底，绝不阻塞退出。
+- **权限链路零改动**：permission 包与 provider 适配层不改一行，MCP 工具经由既有 `friendly_name` / `categorize` / `extract_target` 自然命中五层防御。
 
 ## 功能需求
 
-- F1: 危险命令黑名单（不可绕过）
-  对命令执行类工具的命令串用一组**内置正则**匹配；命中即判 **Deny**，作为最高优先级层，不受任何规则、模式、配置影响——bypassPermissions 模式也拦得住。覆盖已知高危模式（如递归强删根/家目录、写块设备、fork 炸弹、重定向覆盖磁盘设备、格式化文件系统等）。黑名单是启发式防御而非完备保证，明确不追求穷尽所有危险命令；用户不可增删或关闭黑名单。
+- F1: 两层配置加载与合并
+  从用户级 `~/.config/endless-code/mcp.yaml` 与项目级 `<root>/.endless-code/mcp.yaml` 读取 `mcp_servers` 段，按 server 名合并：项目级同名 server **完整覆盖**用户级（不做字段级半合并）。返回归一化的 `Config(servers={name: ServerConfig})`。
 
-- F2: 路径沙箱
-  对带路径参数的文件类工具（读文件 / 写文件 / 改文件 / 按模式找文件 / 搜内容）提取目标路径，规整为绝对路径并**先解析符号链接、再做前缀判断**，判断是否落在项目根目录内；逃出项目根即判 **Deny**。对尚不存在的目标（如新建文件、含未创建的中间目录）解析其**最近的已存在祖先目录**后再判断，不因目标不存在而误判。解析顺序固定，防止用软链接指向外部目录绕过。**命令执行（Bash）不走沙箱**（其危险由黑名单 + 规则 + 模式兜底覆盖；任意命令的文件访问无法可靠静态解析）。沙箱对读取与写入一视同仁地限制在项目内。
+- F2: 配置校验与降级
+  单个 server 校验：`type` 必为 `stdio` / `http`；`stdio` 必填 `command`；`http` 必填 `url`。违规的 server 跳过 + stderr 告警原因，其余 server 不受影响。文件缺失视为空层；格式非法（YAML 解析失败）跳过该层 + stderr 告警，**不抛未捕获异常**。`Path.home()` 失败时用户层跳过不致错。
 
-- F3: 规则引擎
-  规则以「工具名(模式)」声明，结果只有 **allow** 或 **deny** 两种。工具名用面向用户的友好名（Bash / Read / Write / Edit / Glob / Grep），由引擎映射到对应内置工具。模式段支持**精确匹配**（如 `Bash(git status)`）与 **glob 匹配**（如 `Bash(git *)`、`Write(src/**)`）；不带模式段（如 `Bash`）表示匹配该工具的全部调用。`*` 匹配任意字符序列；`**` 的跨目录段语义仅对文件路径有意义，命令串不解释 `**`（等价于 `*`）。匹配对象：命令执行类比对命令串，文件类工具比对**项目相对路径**。对一次工具调用，引擎在给定规则集内判出 allow / deny / 未命中。
+- F3: ${VAR} 展开
+  对 `env` / `headers` 的**值**做 `${VAR}` 正则展开（`\$\{[A-Za-z_][A-Za-z0-9_]*\}`）；已定义展开为环境值，未定义展开为空串 + stderr 一次性告警（同 server 同变量限一次）。`command` / `args` / 工具名 / server 名不展开，保留字面量。
 
-- F4: 多层配置加载与合并
-  从**用户级、项目级、本地级**三个配置文件读取 allow/deny 规则与可选的默认模式，构成三级规则集。优先级 **本地 > 项目 > 用户**，从高到低逐层判断、就近命中即止；同一层内 deny 优先于 allow。任一文件缺失视为空规则集；配置文件格式错误绝不导致引擎构造失败，只把该文件降级为空规则集（不额外放开任何权限），不崩溃。启动时的默认模式取自配置（本地 > 项目 > 用户），未配置则为 default。
+- F4: stdio 连接
+  用 `mcp.client.stdio.stdio_client` 拉起 MCP server 子进程（`command` + `args`，`env` = 宿主环境 ∪ 配置 env，同名宿主变量被覆盖），由 SDK 完成 `initialize` 握手与 `list_tools`。
 
-- F5: 权限模式与按类别兜底
-  工具分三类：只读（读文件 / 找文件 / 搜内容）、文件写（写文件 / 改文件）、命令执行（Bash）。四档模式给出**规则未命中时**的兜底裁决，**只产 Allow 或 Ask（绝不产 Deny）**：
+- F5: HTTP 连接
+  用 `mcp.client.streamable_http.streamable_http_client` 连接 Streamable HTTP 端点（`url` + 自定义 `headers`），完成握手与列工具。只消费请求-响应用途，**不订阅**服务端推送长连接。
 
-  | 模式 | 只读 | 文件写 | 命令执行 |
-  |---|---|---|---|
-  | default | Allow | Ask | Ask |
-  | acceptEdits | Allow | Allow | Ask |
-  | plan | Allow | Ask | Ask |
-  | bypassPermissions | Allow | Allow | Allow |
+- F6: 工具列取与注册
+  对 `list_tools` 返回的每个远端 `Tool` 调 `adapt_tool` 适配为 `McpTool`；把成功适配的工具按 `full_name` 稳定排序后交给 cli 注册进 registry。工具来源对 agent / tui / permission 透明。
 
-  plan 档额外沿用现有 Plan Mode 行为：仅向模型暴露只读工具定义 + 注入计划提醒，文件写 / 命令执行压根不会被请求（矩阵中 plan 行的 Ask 仅为防御性兜底，即便该类工具被请求也判 Ask）。
+- F7: 工具适配与调用结果处理
+  适配：`description` 为空时给兜底文案；`inputSchema` 浅拷贝为 `dict`、空 schema 兜底 `{"type": "object"}`；`read_only` 仅信远端 `annotations.read_only_hint==True`（None-safe）。调用：把远端多个 text 内容块按序拼成 `content`；非 text 块（image / audio / resource_link / embedded_resource）静默丢弃 + 单工具限一次告警；远端 `isError==True` 映射为 `Result.is_error=True` 且保留远端 text。
 
-- F6: 五层判定流水线
-  一次工具调用在**真正执行前**依次送过：① 黑名单 → ② 沙箱 → ③ 规则引擎 → ④ 模式兜底 → ⑤（兜底为 Ask 时）人在回路。任一层给出 Allow/Deny 即短路返回，不再进入后续层。其中黑名单仅对命令执行类、沙箱仅对文件类工具生效；被跳过的层视为「未拦、继续下一层」（如非命令执行工具跳过黑名单后继续走沙箱/规则，命令执行工具跳过沙箱后继续走规则/模式）。
+- F8: 工具命名与命名空间隔离
+  命名规则 `mcp__<server>__<tool>`；拼合后不匹配 `^[A-Za-z0-9_-]+$` 的工具跳过 + 告警。不同 server 同名工具互不覆盖；与内置 6 工具天然不重名。
 
-- F7: 运行时模式切换
-  用户在会话中按 **Shift+Tab** 循环切换权限模式：default → acceptEdits → plan → bypassPermissions → default（四档全循环）。plan 另沿用既有 `/plan`（进）`/do`（出，固定切回 default 并触发按计划执行，不恢复进入 plan 前的模式）作为计划工作流的专用入口/出口，与 Shift+Tab 并存。当前权限模式在状态栏常驻可见（占据原 provider 名的位置；不再展示 provider 名）。切换只影响后续调用的兜底裁决，不改变已加载规则；模式跨轮保持（下一轮对话仍是上次切换的模式，不被重置）。
+- F9: 连接并发、失败隔离与启动超时
+  启动时对每个 server 起独立连接任务，`asyncio.gather` 并发；每个 server 以 `asyncio.wait_for` 施加 30s 超时。连接 / 握手 / 列工具失败只跳过该 server + 告警，其余 server 与内置工具照常注册。启动只在**全部 server 的建立结果**（成功 / 失败 / 超时）齐备后进入 TUI。
 
-- F8: 人在回路交互
-  判定落到 Ask 时暂停 Agent Loop，向用户呈现待批准的工具调用（多行确认块：工具名 + 关键参数预览 + 触发原因 + 菜单选项），用户三选一，↑↓ 移动光标 + 回车确认，数字键 1/2/3 亦可直选，默认高亮「允许本次」：
-  - **允许本次** → 判 Allow，不留记录；
-  - **永久** → 判 Allow，并把对应 allow 规则写入**本地级**配置文件（跨会话生效）；
-  - **拒绝本次** → 判 Deny（回灌让模型调整）。
+- F10: 调用超时与协议错回灌
+  远端调用以 `asyncio.wait_for` 施加 30s 超时；超时与协议异常均映射为 `Result(is_error=True, content=可读错因)` 回灌，不中断 Agent Loop、不回滚会话历史。
 
-  永久放行生成的规则采用**精确匹配**（针对该次具体调用的命令串或路径），不自动泛化。等待用户决策期间可取消（Esc / Ctrl+C）当前轮，取消后会话历史仍合法、可继续对话。
+- F11: 生命周期关闭
+  退出时统一关闭所有会话：stdio 子进程终止、HTTP 会话断开；总超时 5s 兜底，超时给 stderr 告警后不再等待，绝不阻塞退出。
 
-- F9: 拒绝回灌不中断
-  任何一层产生的 Deny（黑名单 / 沙箱 / deny 规则 / 人在回路拒绝），都包成**结构化错误结果**（含可读的被拒原因，按来源区分）回灌给模型，作为该工具调用的结果计入历史；Agent Loop 继续往下走，模型据此调整策略或换路径。同一批多个工具调用中，被拒的与放行的各自独立：结果按原调用序与各自调用 ID 正确配对回灌，互不串位、互不影响。
+- F12: 权限链路自然命中
+  不做任何权限适配。`friendly_name` 对 `mcp__<server>__<tool>` 原样返回 → 规则可写 `mcp__<server>__<tool>` / `mcp__<server>__*`；`categorize` 在 `read_only==True` 走 Read、否则归 Exec → 模式兜底矩阵自然命中；`extract_target` 对未知工具返回 `("", False, False)` → 黑名单 / 沙箱自动跳过。
 
 ## 非功能需求
 
-- N1: 黑名单不可绕过——不存在任何配置项、规则或模式（含 bypassPermissions）能放开黑名单命中的命令；黑名单是流水线最高优先级，先于其余四层。
-- N2: 沙箱防逃逸——路径判断必须「先解析符号链接、再前缀比对」，软链接指向项目外的目标判 Deny；对新建文件按最近已存在祖先目录解析，不因目标不存在而误判通过。
-- N3: 不破坏既有 Agent Loop / Plan Mode——多轮编排、流式双路收集、保序分批并发、用户取消、历史一致、缓存与 system-reminder 注入等既有能力不退化；只读工具的并发执行不因权限检查退化为串行（只读永不触发 Ask）。
-- N4: 人在回路可取消、不死锁——等待用户决策期间按 Esc / Ctrl+C 能干净地取消本轮（不泄漏挂起的 asyncio task、不死锁、不退出整个程序）；取消后对话历史角色交替合法、工具调用与结果配对不破坏。
-- N5: 配置降级——三层配置文件缺失视为空；格式非法时跳过该文件并降级为安全默认（不额外放开权限），不抛未捕获异常、不中断会话、不致引擎构造失败。
-- N6: 跨协议一致——权限判定与 provider 无关，Anthropic / OpenAI（含兼容端点）/ DeepSeek 行为完全一致；不改 provider 适配层。
-- N7: 安全默认——未知/未注册工具、参数无法解析、类别无法判定等不确定情形，一律按最严处理（按有副作用工具走 Ask、或直接 Deny），绝不静默放行。
-- N8: 代码规范——按项目语言的标准格式化 / 静态检查 / 测试命令全部通过（本项目为 Python：`ruff format` / `ruff check`，可选 `mypy`；遵循 `agents.md`）。
-- N9: 可扩展性——新增一层防御、一档模式或一类规则匹配时改动局部：不触及判定流水线主编排，不改 provider 适配层。
+- N1: 降级与失败隔离——配置缺失 / 格式非法 / server 连接失败 / 超时，一律只影响自身：不抛未捕获异常、不中断启动、不拖垮其它 server 与内置工具集。
+- N2: 校验严格但局部——非法 server 跳过并给出原因，判定只依赖 server 自身字段，不牵连合法 server。
+- N3: provider 适配层零改动——`src/endless_code/llm/anthropic_provider.py`、`openai_provider.py` 无修改；工具定义透传，协议无关。
+- N4: permission 包零改动——`src/endless_code/permission/` 无修改；MCP 工具的权限判定完全复用既有链路。
+- N5: 不中断 Agent Loop——调用超时 / 协议错 / 远端错误均以 `is_error` 结果回灌，Loop 继续、历史一致、既有能力（多轮编排、流式、保序分批并发、取消）不退化。
+- N6: 凭据不落盘——配置示例 / 文档 / 测试 fixture 全用 `${VAR}`；密钥经 env / headers 从宿主环境注入，不写入配置文件、不回显。
+- N7: 退出干净——`close()` 终止所有子进程 / 断开 HTTP，5s 兜底防卡死，无残留子进程。
+- N8: 并发安全——连接并发写共享状态经锁保护；`close` 后无悬挂 task、无死锁、无 `coroutine was never awaited` 告警。
+- N9: 代码规范——`ruff format --check .` 无 diff、`ruff check .` 无告警；`pytest` 全过；新增 `tests/test_mcp_*.py`。
 
 ## 不做的事
-
-- **网络请求限制 / 资源配额 / 速率限制**——本阶段不限制出网、不做 CPU/内存/时间配额（留待后续）。
-- **审计日志**——不落地权限决策的持久化审计流水（留待后续）。
-- **黑名单可配置 / 可扩展**——黑名单内置固定，用户不可增删、不可关闭。
-- **自动泛化规则**——人在回路「永久」只生成**精确匹配**规则；想要 `git *` 这类前缀/通配规则需用户手写进配置。
-- **非内置工具 / MCP 工具的权限**——本阶段只覆盖 6 个内置工具。
-- **命令执行（Bash）路径沙箱**——Bash 命令不做路径围栏（无法可靠静态解析任意命令的文件访问）；其危险交给黑名单 + 规则 + 模式兜底。
-- **多项目根 / 额外目录授权**——沙箱只认启动时的单一项目根，不支持运行时追加可访问目录。
-- **权限规则的图形化 / 交互式编辑器**——规则靠配置文件与人在回路写入，不做规则编辑 UI。
-- **acceptEdits 之外的细粒度自动批准档**——模式集固定为四档，不做「仅自动批准某工具」之类的自定义档位。
-- **深层符号链接遍历围栏**——按模式找文件 / 搜内容的目录遍历沿用现有不跟随目录软链接的行为，沙箱只校验其搜索根。
+- **资源 / 提示词 / 采样 / roots**——本章只覆盖工具能力，不实现 MCP 资源、提示词、采样与 roots 语义。
+- **独立 SSE 推送通道**——只消费请求-响应，不订阅 `streamable_http_client` 返回的服务端推送流。
+- **非 text 内容块回灌**——image / audio 等块静默丢弃（模型只能消费文本），仅告警一次。
+- **OAuth 完整流程**——用户预换 token 写进 `headers`；本章范围最小化。
+- **本地级（第三层）MCP 配置**——只两层；`${VAR}` 已让密钥不入配置，本地层冗余。
+- **黑名单 / 沙箱扩展**——MCP 工具的黑名单 / 沙箱行为沿用内置工具的既有判定，不新增作用域。
+- **HTTP server 的交互式建连**——无重连 / 重试 / 心跳，连接失败即跳过。
 
 ## 验收标准
-
-- AC1: 黑名单硬拦截——命令执行类工具跑 `rm -rf /`（及变体）被判 Deny、不执行，结果回灌含被拒原因；在 bypassPermissions 模式下依然被拦。（F1/N1）
-- AC2: 沙箱围栏——文件工具写/读项目根之外路径（如 `/etc/passwd`、`../outside`）被判 Deny；通过软链接指向项目外的目标也被判 Deny（先解析再比对）；项目内的新建文件（含尚未创建的多级中间目录）正常放行。（F2/N2）
-- AC3: 规则精确与 glob 匹配——`Bash(git status)` 精确放行 `git status`、不放行 `git push`；`Bash(git *)` 放行所有 git 子命令；`Write(src/**)` 放行 `src/` 下任意路径写入、不放行 `docs/x`；单独的 deny 规则（如 `Bash(git push)` deny）命中即判 Deny。（F3）
-- AC4: 友好名路由——规则中的友好名 Bash/Read/Write/Edit/Glob/Grep 正确路由到对应的 6 个内置工具（命令执行 / 读 / 写 / 改 / 按模式找文件 / 搜内容）。（F3）
-- AC5: 三级优先级——本地盖过项目、项目盖过用户；同层 deny 优先于 allow（验证：构造冲突规则断言裁决）。（F4）
-- AC6: 配置降级——三层文件缺失时引擎按空规则运行；某文件格式非法时跳过该文件、其余正常加载、不致引擎构造失败、不抛未捕获异常。（F4/N5）
-- AC7: 模式矩阵——default：只读 Allow、文件写/命令执行 Ask；acceptEdits：文件写 Allow、命令执行 Ask；bypassPermissions：全 Allow（黑名单/沙箱除外）；plan：仅只读工具可见、文件写/命令执行不被请求，且其兜底裁决仍为 Ask（验证：逐档逐类断言裁决）。（F5/F7）
-- AC8: 流水线短路与跳层放行——黑名单命中不再进沙箱/规则；deny 规则命中不再进模式；Allow 规则命中直接放行不进模式兜底；被跳过的层不误拦（非命令执行工具不被黑名单拦、命令执行工具不被沙箱拦，均继续进后续层）。（F6）
-- AC9: 运行时切换模式——按 Shift+Tab 循环 default → acceptEdits → plan → bypassPermissions → default；`/plan`/`/do` 仍可进出 plan（`/do` 固定回 default）；状态栏左侧常驻显示当前权限模式（不再显示 provider 名）；切换不改已加载规则、跨轮保持（下一轮不被重置）。（F7）
-- AC10: 人在回路三选一——Ask 时弹出多行待批准块（工具名 + 参数 + 触发原因 + 菜单）；↑↓+回车 或 数字键 1/2/3 选择，默认高亮「允许本次」；选「允许本次」→ 执行且不留规则；「永久」→ 执行且 allow 规则写入本地层配置文件、重启后仍生效；「拒绝本次」→ Deny 回灌、Loop 继续。（F8）
-- AC11: 拒绝不中断 + 保序——单批多调用中被拒的回灌错误、放行的正常执行，结果按调用序与各自调用 ID 配对回灌、互不串位；Agent Loop 继续，模型可据被拒原因改路径。（F9/N3）
-- AC12: 取消安全——人在回路等待中按 Esc/Ctrl+C 干净取消本轮（不退出整个程序）；无挂起 asyncio task 泄漏；取消后再发一条消息可继续、不报 400。（N4）
-- AC13: 只读并发不退化——一批连续只读调用仍并发执行（权限检查不把只读串行化）；只读调用永不触发 Ask（验证：批量只读不弹人在回路）。（N3）
-- AC14: 跨协议一致——anthropic 与 openai（含兼容 base_url）权限行为一致（同样的拦截/询问/放行）；provider 适配层未改动。（N6）
-- AC15: 安全默认——未知工具/参数不可解析/类别不明时按最严处理（Ask 或 Deny），不静默放行；具体：未注册工具名归命令执行类不直接 Allow、参数 JSON 无法解析时不静默放行、只读标志缺失/类别不明按有副作用处理。（N7）
-- AC16: 不破坏既有 Agent Loop / Plan Mode——多轮连环、用户取消、流出错恢复、历史一致、缓存命中、规划按轮次注入仍成立；`pytest` 通过。（N3）
-- AC17: 代码规范与不泄漏——`ruff format --check .` 通过、`ruff check .` 无告警；含密钥的本地配置层已被 gitignore，CLI 输出与配置回显不泄漏 api_key。（N8）
-- AC18: 启动默认模式——defaultMode 按 本地 > 项目 > 用户 生效，皆无则 default（验证：三层配置各设不同 defaultMode 断言生效层；defaultMode=plan 启动即应用只读工具集 + 计划提醒）。（F4/F5）
-- AC19: 可扩展性——新增一档模式只需扩模式兜底表、新增一层防御只需在流水线插一层，均不触及 provider 适配层（验证：对应改动 diff 局限在 permission 包的模式/流水线文件）。（N9）
+- AC1: 两层配置——两文件存在时按 server 名合并，同名 server 项目级完整覆盖用户级（验证：单测构造两层文件断言合并结果与字段来源）。(F1)
+- AC2: 降级与校验——任一文件缺失视为空、格式非法跳过该文件 + stderr 告警且其它层正常加载；stdio 缺 command / http 缺 url / `type` 非法或缺失的 server 被跳过 + 给出原因，其余 server 不受影响；`load_config` 永不抛出。(F2/N1/N2)
+- AC3: ${VAR} 展开——env / headers 的值被展开；未定义展开为空串 + 一次性告警；command / args 中的 `${X}` 保留字面量。(F3)
+- AC4: stdio 连接——能拉起 MCP server 子进程并由 SDK 完成 `initialize` + `list_tools`；`env` 注入到子进程环境（验证：真实 demo server 端到端，或 tmux 实跑 `@modelcontextprotocol/server-everything`）。(F4/F6)
+- AC5: HTTP 连接——能对 HTTP MCP server 完成握手 + 列工具；`headers` 真正出现在每个 HTTP 请求中（验证：`pytest-httpx` / `httpx.MockTransport` 起最小端点断言收到 `Authorization` 头）。(F5/F6/N6)
+- AC6: 工具适配与调用——description 空给兜底；schema 透传 / 空 schema 兜底；`read_only` 仅信 `read_only_hint==True`（None-safe）；多 text 块按序拼接；非 text 块丢弃 + 单工具限一次告警；远端 `isError` 映射（验证：`test_mcp_tool` 注入 stub 覆盖各分支）。(F7)
+- AC7: 命名与命名空间——工具 `name` 形如 `mcp__<server>__<tool>`；含禁用字符的工具被跳过 + 告警；registry 注册后全名集合无重复（与内置 6 工具、跨 server 均不冲突）。(F8)
+- AC8: 失败隔离与启动超时——一个失败 server + 一个正常 server 启动时：前者告警、后者工具照常注册可用；卡住的 server 在（测试缩短的）超时窗口结束后被跳过，启动不阻塞超过该窗口。(F9/N1)
+- AC9: 协议错与超时回灌——远端调用抛异常或 30s 超时 → `Result(is_error=True)` + 可读错因回灌，Agent Loop 不中断。(F10/N5)
+- AC10: 退出干净——`close()` 终止所有 stdio 子进程、断开 HTTP；某 session 关闭卡住时 5s 兜底返回不阻塞；实跑退出后无残留子进程。(F11/N7)
+- AC11: 权限链路自然命中——无规则时 `readOnlyHint=True` 工具走 Read 兜底（default 放行）、其余走 Exec 兜底（default Ask）；allow 规则 `mcp__<server>__*` 命中直接放行；bypass 放行；MCP 工具不被黑名单 / 沙箱误拦（`extract_target` 返回 `("", False, False)`）。(F12/N4)
+- AC12: provider 适配层零改动——`src/endless_code/llm/anthropic_provider.py`、`openai_provider.py` 无修改（验证：核对 diff）。(N3)
+- AC13: 既有能力不退化——`pytest` 全过，既有用例无需适配；Agent Loop / 权限 / 工具链路行为不变。(N5)
+- AC14: 凭据不落盘——配置示例 / 文档 / 测试 fixture 全用 `${VAR}`；`git grep -E '(Bearer|sk-|ghp_|github_pat_)[A-Za-z0-9_-]{16,}'` 在本次开发期间无命中。(N6)
+```

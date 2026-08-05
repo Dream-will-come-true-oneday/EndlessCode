@@ -60,12 +60,12 @@ def fixed_modules() -> list[Module]:
     ]
 
 
-def optional_modules() -> list[Module]:
-    """返回预留的空模块；本阶段不接入真实内容来源。"""
+def optional_modules(instructions: str = "", memory: str = "") -> list[Module]:
+    """返回可由启动期指令和长期记忆填充的可选模块。"""
     return [
-        Module("custom_instructions", 80, ""),
+        Module("custom_instructions", 80, instructions),
         Module("active_skills", 90, ""),
-        Module("long_term_memory", 100, ""),
+        Module("long_term_memory", 100, memory),
     ]
 
 
@@ -78,6 +78,6 @@ def assemble_system(modules: list[Module]) -> str:
     )
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(instructions: str = "", memory: str = "") -> str:
     """构造可缓存的稳定系统提示。"""
-    return assemble_system(fixed_modules() + optional_modules())
+    return assemble_system(fixed_modules() + optional_modules(instructions, memory))

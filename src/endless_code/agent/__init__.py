@@ -27,6 +27,7 @@ from endless_code.compact.const import (
 )
 from endless_code.conversation import Conversation
 from endless_code.llm import (
+    Message,
     PromptTooLongError,
     Provider,
     Request,
@@ -37,6 +38,7 @@ from endless_code.llm import (
     ToolResult,
     Usage,
 )
+from endless_code.memory import Manager, has_memory_signal
 from endless_code.permission import Decision, Mode, Outcome
 from endless_code.permission.engine import Engine, new_engine
 from endless_code.prompt import build_system_prompt, gather_environment, plan_reminder
@@ -84,6 +86,7 @@ class SessionRuntime:
     usage_anchor: int = 0
     anchor_msg_len: int = 0
     run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    turn_count: int = 0
 
 
 def new_session_runtime(
@@ -160,12 +163,18 @@ class Agent:
         version: str = "0.1.0",
         engine: Engine | None = None,
         runtime: SessionRuntime | None = None,
+        memory_manager: Manager | None = None,
+        instruction_text: str = "",
+        memory_text: str = "",
     ) -> None:
         self._provider = provider
         self._registry = registry
         self._version = version
         self._engine = engine or new_engine(str(Path.cwd().resolve()))[0]
         self._runtime = runtime or new_session_runtime(str(Path.cwd().resolve()))
+        self._memory_manager = memory_manager
+        self._instruction_text = instruction_text
+        self._memory_text = memory_text
 
     async def run(
         self,
@@ -185,7 +194,12 @@ class Agent:
     ) -> AsyncIterator[Event]:
         cancel = cancel or asyncio.Event()
         environment = await gather_environment(self._version, self._provider.model)
-        stable_system = build_system_prompt()
+        memory_text = (
+            self._memory_manager.load_index()
+            if self._memory_manager is not None
+            else self._memory_text
+        )
+        stable_system = build_system_prompt(self._instruction_text, memory_text)
 
         unknown_run = 0
         for iteration in range(1, MAX_ITERATIONS + 1):
@@ -343,6 +357,7 @@ class Agent:
                     yield Event(text=final)
                 conv.add_assistant(final)
                 self._record_usage_anchor(round_state.usage, conv)
+                self._schedule_memory_update(conv)
                 yield Event(done=True)
                 return
 
@@ -463,6 +478,22 @@ class Agent:
             return
         self._runtime.usage_anchor = usage_anchor(usage)
         self._runtime.anchor_msg_len = conv.length()
+
+    def _schedule_memory_update(self, conv: Conversation) -> None:
+        manager = self._memory_manager
+        if manager is None:
+            return
+        self._runtime.turn_count += 1
+        recent_turn = self._recent_turn(conv.messages())
+        if self._runtime.turn_count % 5 == 0 or has_memory_signal(recent_turn):
+            asyncio.create_task(manager.update_async(recent_turn))
+
+    @staticmethod
+    def _recent_turn(messages: list[Message]) -> list[Message]:
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index].role == "user":
+                return messages[index:]
+        return []
 
     def _record_read_files(
         self, calls: list[ToolCall], results: list[Result | None]

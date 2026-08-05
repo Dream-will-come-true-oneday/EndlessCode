@@ -12,6 +12,7 @@ from endless_code.config import ProviderConfig
 from endless_code.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
 from endless_code.permission import Mode, new_engine
 from endless_code.prompt import EXECUTE_DIRECTIVE, PLAN_MODE_REMINDER
+from endless_code.session import Writer
 from endless_code.tool import Registry, Result, new_default_registry
 from endless_code.tui.app import EndlessCodeApp, SessionState
 
@@ -241,6 +242,33 @@ async def test_compact_command_uses_summary_path_only() -> None:
                 message.content != "/compact" for message in app._conv.messages()
             )
             assert "已压缩，token 从" in _chat_text(app)
+
+
+@pytest.mark.asyncio
+async def test_resume_switches_to_selected_persisted_session(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    directory = tmp_path / ".endless-code" / "sessions" / "20260805-120000-abcd"
+    writer = Writer(str(directory), "fake-model")
+    writer.append(Message(role="user", content="恢复这条历史"))
+    writer.append(Message(role="assistant", content="历史回复"))
+    writer.close()
+
+    with patch("endless_code.tui.app.new_provider", return_value=FakeProvider([])):
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+        async with app.run_test() as pilot:
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            app._command_resume()
+            assert app.state is SessionState.RESUMING
+            app._render_resume_options("恢复")
+            assert app._visible_resume_sessions[0].id == directory.name
+            app._resume_selected()
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            assert [message.content for message in app._conv.messages()] == [
+                "恢复这条历史",
+                "历史回复",
+            ]
 
 
 @pytest.mark.asyncio

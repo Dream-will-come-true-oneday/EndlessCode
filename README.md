@@ -26,9 +26,8 @@ Endless Code 是一个运行在终端中的智能编程助手。它以可取消�
 | --- | --- | --- |
 | Anthropic | `protocol: anthropic` | 官方 Messages API、稳定 system 缓存断点 |
 | OpenAI | `protocol: openai` | 官方 API 或任意 OpenAI 兼容 `base_url` |
-| DeepSeek | `protocol: deepseek` | DeepSeek 默认 endpoint、thinking 和 prompt cache 字段 |
 
-DeepSeek 也可以通过 OpenAI 兼容配置使用：将 `protocol` 设置为 `openai`，再指定 `base_url`。专门的 `deepseek` 配置适合需要 `thinking` 或 DeepSeek 缓存 usage 的场景。
+DeepSeek 等 OpenAI 兼容服务可直接将 `protocol` 设置为 `openai`，再指定 `base_url` 接入。
 
 ## 快速开始
 
@@ -82,26 +81,18 @@ providers:
     protocol: anthropic
     model: claude-3-5-sonnet-latest
     api_key: $ANTHROPIC_API_KEY
-    # 可选；未配置时 Anthropic 默认 200000
-    context_window: 200000
+    # 可选；未配置时默认 1000000
+    context_window: 1000000
 
   - name: openai
     protocol: openai
     model: gpt-4o
     api_key: $OPENAI_API_KEY
-    # 可选；未配置时 OpenAI 默认 128000
-    context_window: 128000
-    # 可选：第三方 OpenAI 兼容服务
-    # base_url: https://example.com/v1
+    # 可选；未配置时默认 1000000
+    context_window: 1000000
+    # 可选：第三方 OpenAI 兼容服务（如 DeepSeek，base_url 指向其 API 地址）
+    # base_url: https://api.deepseek.com
 
-  - name: deepseek
-    protocol: deepseek
-    model: deepseek-chat
-    base_url: https://api.deepseek.com
-    api_key: $DEEPSEEK_API_KEY
-    thinking: false
-    # 可选；未配置时 DeepSeek 默认 128000
-    context_window: 128000
 ```
 
 `api_key` 支持 `$VAR_NAME` 环境变量引用，也支持明文值，但生产环境应优先使用环境变量。配置文件查找顺序为：
@@ -219,8 +210,6 @@ python examples/smoke.py --provider openai
 
 - [`spec.md`](spec.md)：需求与验收标准
 - [`plan.md`](plan.md)：架构与技术设计
-- [`task.md`](task.md)：实现顺序与验证步骤
-- [`checklist.md`](checklist.md)：功能、集成和端到端验收
 
 ## License
 

@@ -1,11 +1,13 @@
 """权限引擎、规则、沙箱、配置与本地放行测试。"""
 
 import json
+from pathlib import Path
 
 import pytest
 
 from endless_code.llm import ToolCall
 from endless_code.permission import (
+    Category,
     Decision,
     Mode,
     Rule,
@@ -17,7 +19,18 @@ from endless_code.permission import (
     sandbox_ok,
 )
 from endless_code.permission.blacklist import hits_blacklist
-from endless_code.permission.settings import extract_target, friendly_name
+from endless_code.permission.persist import _escape_glob, rule_for
+from endless_code.permission.sandbox import eval_symlinks_or_ancestor, resolve_root
+from endless_code.permission.settings import (
+    PermissionsBlock,
+    Settings,
+    SettingsError,
+    categorize,
+    extract_target,
+    friendly_name,
+    load_settings,
+    to_rule_set,
+)
 
 
 def _call(name: str, **kwargs) -> ToolCall:
@@ -210,3 +223,268 @@ def test_persist_local_allow_mcp_tool(tmp_path) -> None:
 
     engine2, _ = new_engine(str(tmp_path))
     assert engine2.check(Mode.DEFAULT, call, False)[0] is Decision.ALLOW
+
+
+def test_blacklist_covers_all_dangerous_patterns() -> None:
+    dangerous = [
+        "rm -rf /",
+        "rm -fr ~",
+        "dd if=/dev/zero of=/dev/sda bs=1M",
+        ":(){ :|:& };:",
+        "mkfs.ext4 /dev/sda1",
+        "echo x > /dev/sda",
+        "chmod -R 777 /",
+        "rm -rf /*",
+    ]
+    assert all(hits_blacklist(command) for command in dangerous)
+    assert not hits_blacklist("git status")
+    assert not hits_blacklist("rm -rf ./build")
+
+
+def test_resolve_root_raises_for_missing_dir() -> None:
+    with pytest.raises(FileNotFoundError):
+        resolve_root("/no/such/root-xyz")
+
+
+def test_eval_symlinks_or_ancestor_falls_back(tmp_path) -> None:
+    (tmp_path / "a").mkdir()
+    target = str(tmp_path / "a" / "b" / "c")
+    assert eval_symlinks_or_ancestor(target) == str(Path(target).resolve())
+
+
+def test_sandbox_ok_empty_path_and_prefix_boundary(tmp_path) -> None:
+    engine, _ = new_engine(str(tmp_path))
+    assert sandbox_ok(engine, "") is True
+    sibling = tmp_path.parent / (tmp_path.name + "x")
+    assert not sandbox_ok(engine, str(sibling))
+
+
+def test_new_engine_returns_err_for_unresolvable_root(tmp_path) -> None:
+    engine, err = new_engine(str(tmp_path / "missing"))
+    assert engine is not None
+    assert err is not None
+
+
+def test_parse_rule_invalid_inputs() -> None:
+    assert parse_rule("") == (Rule("", "", False), False)
+    assert parse_rule("Bash(git *")[1] is False
+    assert parse_rule("bad-tool(pat)")[1] is False
+    rule, ok = parse_rule("Bash")
+    assert ok
+    assert rule.tool == "Bash"
+    assert rule.pattern == ""
+
+
+def test_match_pattern_empty_question_and_escape() -> None:
+    assert match_pattern("", "anything") is True
+    assert match_pattern("a?c", "abc", path_like=False) is True
+    assert match_pattern("a?c", "ac", path_like=False) is False
+    assert match_pattern(r"a\*b", "a*b", path_like=False) is True
+    assert match_pattern("**", "anything here", path_like=False) is True
+    assert match_pattern("src/a/b.py", "src/a/b.py") is True
+
+
+def test_load_settings_invalid_structures(tmp_path) -> None:
+    missing = tmp_path / "missing.yaml"
+    assert load_settings(missing).default_mode == ""
+
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("not: [valid", encoding="utf-8")
+    with pytest.raises(SettingsError):
+        load_settings(bad)
+
+    bad.write_text(
+        "default_mode: 123\npermissions: {allow: [], deny: []}\n", encoding="utf-8"
+    )
+    with pytest.raises(SettingsError):
+        load_settings(bad)
+
+    bad.write_text("permissions: not-a-dict\n", encoding="utf-8")
+    with pytest.raises(SettingsError):
+        load_settings(bad)
+
+    bad.write_text("permissions:\n  allow: notalist\n  deny: []\n", encoding="utf-8")
+    with pytest.raises(SettingsError):
+        load_settings(bad)
+
+
+def test_load_settings_filters_non_string_entries(tmp_path) -> None:
+    target = tmp_path / "s.yaml"
+    target.write_text(
+        "default_mode: plan\n"
+        "permissions:\n"
+        "  allow: [Write(src/x.py), 123, true]\n"
+        "  deny: []\n",
+        encoding="utf-8",
+    )
+    settings = load_settings(target)
+    assert settings.default_mode == "plan"
+    assert settings.permissions.allow == ["Write(src/x.py)"]
+    assert settings.permissions.deny == []
+
+
+def test_to_rule_set_skips_invalid_entries() -> None:
+    settings = Settings(
+        default_mode="",
+        permissions=PermissionsBlock(
+            allow=["Read(src/*.py)", "bad-tool(x)"],
+            deny=["Bash(rm *)", "not valid("],
+        ),
+    )
+    rules = to_rule_set(settings)
+    assert len(rules.allow) == 1
+    assert len(rules.deny) == 1
+    assert rules.allow[0].tool == "Read"
+    assert rules.deny[0].tool == "Bash"
+
+
+def test_categorize() -> None:
+    assert categorize("read_file", True) is Category.READ
+    assert categorize("write_file", False) is Category.WRITE
+    assert categorize("edit_file", False) is Category.WRITE
+    assert categorize("bash", False) is Category.EXEC
+    assert categorize("mystery", False) is Category.EXEC
+
+
+def test_extract_target_happy_paths() -> None:
+    assert extract_target(_call("read_file", path="a.txt")) == ("a.txt", True, True)
+    assert extract_target(_call("write_file", path="b.txt", content="x")) == (
+        "b.txt",
+        True,
+        True,
+    )
+    assert extract_target(_call("glob", pattern="*.py")) == (".", True, True)
+    assert extract_target(_call("grep", pattern="x", path="src")) == ("src", True, True)
+    assert extract_target(_call("bash", command="git status")) == (
+        "git status",
+        False,
+        True,
+    )
+
+
+def test_escape_glob() -> None:
+    assert _escape_glob("a*b?c[d]\\e") == r"a\*b\?c\[d\]\\e"
+
+
+def test_rule_for_mcp_and_unknown(tmp_path) -> None:
+    engine, _ = new_engine(str(tmp_path))
+    mcp_rule, text, ok = rule_for(engine, _call("mcp__demo__echo", text="x"))
+    assert ok
+    assert text == "mcp__demo__echo"
+    assert mcp_rule.tool == "mcp__demo__echo"
+    assert mcp_rule.pattern == ""
+
+    rule, text, ok = rule_for(engine, _call("mystery"))
+    assert not ok
+    assert text == ""
+    assert rule == Rule("", "", False)
+
+
+def test_persist_local_allow_idempotent_and_preserves_existing(tmp_path) -> None:
+    settings_dir = tmp_path / ".endless-code"
+    settings_dir.mkdir()
+    (settings_dir / "settings.local.yaml").write_text(
+        "default_mode: plan\n"
+        "permissions:\n"
+        "  allow:\n"
+        "    - Read(src/readme.md)\n"
+        "  deny: []\n",
+        encoding="utf-8",
+    )
+    engine, _ = new_engine(str(tmp_path))
+    call = _call("write_file", path="src/x.py", content="x")
+    engine.persist_local_allow(call)
+    engine.persist_local_allow(call)
+
+    text = (settings_dir / "settings.local.yaml").read_text(encoding="utf-8")
+    assert "default_mode: plan" in text
+    assert "Read(src/readme.md)" in text
+    assert text.count("Write(src/x.py)") == 1
+
+
+def test_persist_local_allow_raises_for_unknown_tool(tmp_path) -> None:
+    engine, _ = new_engine(str(tmp_path))
+    with pytest.raises(ValueError):
+        engine.persist_local_allow(_call("mystery"))
+
+
+def test_parse_mode_non_string() -> None:
+    assert parse_mode(123) == (Mode.DEFAULT, False)
+
+
+def test_engine_denies_unparseable_file_path(tmp_path) -> None:
+    engine, _ = new_engine(str(tmp_path))
+    call = _call("write_file", content="x")
+    assert engine.check(Mode.DEFAULT, call, False)[0] is Decision.DENY
+
+
+def test_engine_denies_file_outside_root(tmp_path) -> None:
+    engine, _ = new_engine(str(tmp_path))
+    call = _call("write_file", path="../outside.txt", content="x")
+    assert engine.check(Mode.DEFAULT, call, False)[0] is Decision.DENY
+
+
+def test_rule_for_bash_command_escapes_glob(tmp_path) -> None:
+    engine, _ = new_engine(str(tmp_path))
+    rule, text, ok = rule_for(engine, _call("bash", command="git *status"))
+    assert ok
+    assert rule.tool == "Bash"
+    assert rule.pattern == r"git \*status"
+    assert text == r"Bash(git \*status)"
+
+
+def test_match_pattern_path_wildcards_and_boundary() -> None:
+    assert match_pattern("src/*.py", "src/a.py") is True
+    assert match_pattern("src/a?c.py", "src/abc.py") is True
+    assert match_pattern(r"src/a\*b.py", "src/a*b.py") is True
+    assert match_pattern("a/b", "a") is False
+    assert match_pattern("a/**/z", "a/b/c") is False
+
+
+def test_load_settings_empty_and_root_not_mapping(tmp_path) -> None:
+    empty = tmp_path / "empty.yaml"
+    empty.write_text("", encoding="utf-8")
+    assert load_settings(empty).default_mode == ""
+
+    null = tmp_path / "null.yaml"
+    null.write_text("null\n", encoding="utf-8")
+    assert load_settings(null).default_mode == ""
+
+    not_mapping = tmp_path / "not_mapping.yaml"
+    not_mapping.write_text("just a string\n", encoding="utf-8")
+    with pytest.raises(SettingsError):
+        load_settings(not_mapping)
+
+
+def test_load_settings_default_mode_none(tmp_path) -> None:
+    target = tmp_path / "s.yaml"
+    target.write_text(
+        "default_mode:\npermissions: {allow: [], deny: []}\n", encoding="utf-8"
+    )
+    settings = load_settings(target)
+    assert settings.default_mode == ""
+
+
+def test_parse_args_variants() -> None:
+    from endless_code.permission.settings import _parse_args
+
+    assert _parse_args({"path": "x"}) == {"path": "x"}
+    assert _parse_args(123) is None
+    assert _parse_args("not json") is None
+    assert _parse_args("123") is None
+    assert _parse_args('{"path": "x"}') == {"path": "x"}
+
+
+def test_extract_target_unparseable_input() -> None:
+    call = ToolCall(id="c", name="read_file", input="not json")
+    assert extract_target(call) == ("", False, False)
+
+
+def test_check_function_delegates(tmp_path) -> None:
+    from endless_code.permission import check
+
+    engine, _ = new_engine(str(tmp_path))
+    call = _call("read_file", path="a.txt")
+    assert check(engine, Mode.DEFAULT, call, True) == engine.check(
+        Mode.DEFAULT, call, True
+    )

@@ -38,9 +38,20 @@ async def test_amain_registers_mcp_tools_and_closes(tmp_path, monkeypatch) -> No
     captured = {}
 
     class FakeApp:
-        def __init__(self, providers, registry=None, version="", engine=None):
+        def __init__(
+            self,
+            providers,
+            registry=None,
+            version="",
+            engine=None,
+            instruction_text=None,
+            memory_manager=None,
+        ):
             captured["registry"] = registry
             captured["providers"] = providers
+            captured["engine"] = engine
+            captured["instruction_text"] = instruction_text
+            captured["memory_manager"] = memory_manager
 
         async def run_async(self):
             # 验证 registry 里已有 MCP 工具
@@ -49,6 +60,9 @@ async def test_amain_registers_mcp_tools_and_closes(tmp_path, monkeypatch) -> No
             assert "mcp__demo__echo" in names
 
     monkeypatch.setattr(cli_mod, "EndlessCodeApp", FakeApp)
+    monkeypatch.setattr(
+        cli_mod, "new_engine", lambda _root: (None, Exception("degraded"))
+    )
     # 限制连接超时，避免卡住
     monkeypatch.setattr("endless_code.mcp.manager.connect_timeout", 5.0)
     monkeypatch.setattr("endless_code.mcp.manager.close_timeout", 3.0)
@@ -58,3 +72,6 @@ async def test_amain_registers_mcp_tools_and_closes(tmp_path, monkeypatch) -> No
     assert code == 0
     # _amain 内部 new_manager 已被 close（finally），tools 已清理
     assert captured["registry"] is not None
+    assert captured["engine"] is None
+    assert captured["instruction_text"] is not None
+    assert captured["memory_manager"] is not None

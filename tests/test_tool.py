@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from endless_code.tool import Registry, new_default_registry
+from endless_code.tool.bash import BashTool
 
 
 def _python_command(code: str) -> str:
@@ -225,3 +226,32 @@ def test_tool_descriptions_reinforce_conventions() -> None:
 
     assert "read_file" in EditFileTool().description()
     assert "专用工具" in BashTool().description()
+
+
+class TestBashInputValidation:
+    @pytest.mark.asyncio
+    async def test_invalid_json(self) -> None:
+        result = await BashTool().execute("not json")
+        assert result.is_error
+        assert "参数 JSON 解析失败" in result.content
+
+    @pytest.mark.asyncio
+    async def test_missing_command(self) -> None:
+        for raw in ("{}", "", json.dumps({"command": ""})):
+            result = await BashTool().execute(raw)
+            assert result.is_error
+            assert "缺少必填参数" in result.content
+
+    @pytest.mark.asyncio
+    async def test_non_string_command_returns_error(self) -> None:
+        for raw in (json.dumps({"command": 123}), json.dumps({"command": True})):
+            result = await BashTool().execute(raw)
+            assert result.is_error
+            assert "缺少必填参数" in result.content
+
+    @pytest.mark.asyncio
+    async def test_non_object_json_returns_error(self) -> None:
+        for raw in ("123", "[1, 2]", '"str"', "null"):
+            result = await BashTool().execute(raw)
+            assert result.is_error
+            assert "JSON 对象" in result.content

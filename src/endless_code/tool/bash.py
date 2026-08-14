@@ -102,8 +102,11 @@ class BashTool:
         except json.JSONDecodeError as e:
             return Result(content=f"参数 JSON 解析失败: {e}", is_error=True)
 
+        if not isinstance(data, dict):
+            return Result(content="参数必须是 JSON 对象", is_error=True)
+
         cmd = data.get("command")
-        if not cmd:
+        if not isinstance(cmd, str) or not cmd:
             return Result(content="缺少必填参数: command", is_error=True)
 
         process_kwargs: dict[str, Any] = {}

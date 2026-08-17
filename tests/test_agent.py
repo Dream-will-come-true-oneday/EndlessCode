@@ -20,6 +20,7 @@ from endless_code.agent import (
     ToolEvent,
     new_session_runtime,
 )
+from endless_code.compact import ManageOutput
 from endless_code.conversation import Conversation
 from endless_code.llm import (
     Message,
@@ -214,6 +215,36 @@ async def test_natural_completion() -> None:
         ("user", "hi"),
         ("assistant", "hello"),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("context_window", "estimated"),
+    [(200_000, 167_000), (1_000_000, 835_000)],
+)
+async def test_auto_compact_event_uses_window_threshold(
+    context_window, estimated, tmp_path, monkeypatch
+) -> None:
+    provider = FakeProvider([[StreamEvent(text="done"), StreamEvent(done=True)]])
+    conv = Conversation()
+    conv.add_user("work")
+    managed_inputs = []
+
+    async def _fake_manage(input_):
+        managed_inputs.append(input_)
+        return ManageOutput(input_.estimated_token, input_.estimated_token)
+
+    monkeypatch.setattr("endless_code.agent.estimate_tokens", lambda *_: estimated)
+    monkeypatch.setattr("endless_code.agent.manage_context", _fake_manage)
+    runtime = new_session_runtime(str(tmp_path), context_window)
+
+    events = await _run(Agent(provider, _registry(), runtime=runtime), conv)
+
+    assert any(
+        event.compact is not None and event.compact.phase is CompactPhase.BEFORE_AUTO
+        for event in events
+    )
+    assert managed_inputs[0].context_window == context_window
 
 
 @pytest.mark.asyncio

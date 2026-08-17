@@ -81,14 +81,14 @@ providers:
     protocol: anthropic
     model: claude-3-5-sonnet-latest
     api_key: $ANTHROPIC_API_KEY
-    # 可选；未配置时默认 1000000
-    context_window: 1000000
+    # 可选；未配置时默认 200000
+    context_window: 200000
 
   - name: openai
     protocol: openai
     model: gpt-4o
     api_key: $OPENAI_API_KEY
-    # 可选；未配置时默认 1000000
+    # 可选；显式 1M；未配置时默认 200000
     context_window: 1000000
     # 可选：第三方 OpenAI 兼容服务（如 DeepSeek，base_url 指向其 API 地址）
     # base_url: https://api.deepseek.com
@@ -157,9 +157,9 @@ mcp_servers:
 
 ## 长会话上下文管理
 
-Endless Code 会在每次请求前检查工具结果和会话长度：单条超过 50KB 的工具结果会保存到 `.endless-code/sessions/<会话 ID>/tool-results/`，会话中仅保留头部预览与 `read_file` 重读路径；同一轮工具结果合计过大时也会按大小继续落盘。
+Endless Code 会在每次请求前检查工具结果和会话长度。默认上下文窗口为 200K，Provider 可通过 `context_window` 选择任意正整数窗口（例如显式 1M）。在 200K 窗口下，单条超过 50KB 的工具结果会保存到 `.endless-code/sessions/<会话 ID>/tool-results/`，同消息聚合线为 200KB；窗口增大时两条工具保护线按比例放大，但最多为 100KB/400KB。会话中仅保留头部预览与 `read_file` 重读路径。
 
-当估算用量接近当前 Provider 的 `context_window` 时，Agent 会自动生成结构化摘要，并补回最近读取的文件、当前可用工具和边界提示。界面会显示压缩开始与完成状态。遇到 Provider 报告上下文超限时，程序会先紧急压缩，再仅重试原请求一次。
+自动压缩阈值按当前窗口动态计算：200K 窗口在约 167K token 触发，1M 窗口在约 835K token 触发；紧急压缩后的重试安全线分别约为 177K 和 885K。摘要会按窗口保留近期原文和恢复附件，并补回当前可用工具和边界提示。界面会显示压缩开始与完成状态。遇到 Provider 报告上下文超限时，程序会先紧急压缩，再仅重试原请求一次。
 
 `/compact` 可在空闲时手动触发摘要。工具原文、会话存档和记忆文件均位于 `.endless-code/`，该目录中的本地配置和 session 数据已被 Git 忽略。
 

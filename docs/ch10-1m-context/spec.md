@@ -1,5 +1,7 @@
 # 1M 上下文窗口适配 Spec
 
+> 历史方案：本文档已被 `docs/ch11-context-window-config` 取代。当前默认窗口为 200K，1M 需要显式配置。
+
 ## 背景
 
 endless_code 的上下文管理阈值按 128k 窗口设计：provider 未显式配置时，openai/deepseek 默认 128k、anthropic 默认 200k；层 1 工具结果落盘线为单条 50KB、同消息聚合 200KB；层 2 自动压缩触发点为 `context_window - 33k`；摘要后只保留最近 10k token。

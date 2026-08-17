@@ -64,15 +64,11 @@ def build_context_limits(context_window: int) -> ContextLimits:
     tool_scale_window = min(context_window, MAX_TOOL_LIMIT_CONTEXT)
     return ContextLimits(
         context_window=context_window,
-        single_result_bytes=_scale_up(
-            BASE_SINGLE_RESULT_BYTES, tool_scale_window
-        ),
+        single_result_bytes=_scale_up(BASE_SINGLE_RESULT_BYTES, tool_scale_window),
         message_aggregate_bytes=_scale_up(
             BASE_MESSAGE_AGGREGATE_BYTES, tool_scale_window
         ),
-        summary_reserve_tokens=_scale_up(
-            BASE_SUMMARY_RESERVE_TOKENS, context_window
-        ),
+        summary_reserve_tokens=_scale_up(BASE_SUMMARY_RESERVE_TOKENS, context_window),
         auto_safety_margin_tokens=_scale_up(
             BASE_AUTO_SAFETY_MARGIN_TOKENS, context_window
         ),

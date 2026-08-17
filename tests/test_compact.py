@@ -26,7 +26,6 @@ from endless_code.compact.const import (
     RECOVERY_FILE_LIMIT,
 )
 from endless_code.compact.layer1 import _replacement_for, _truncate_utf8, preview_head
-from endless_code.compact.limits import build_context_limits
 from endless_code.compact.layer2 import (
     _join_after_summary,
     _provider_stream,
@@ -34,6 +33,7 @@ from endless_code.compact.layer2 import (
     pick_recent_tail,
     ptl_retry,
 )
+from endless_code.compact.limits import build_context_limits
 from endless_code.compact.recovery import build_recovery_attachment, render_file_block
 from endless_code.compact.state import FileReadRecord
 from endless_code.compact.summary_prompt import (
@@ -183,7 +183,10 @@ def test_layer1_1m_aggregate_limit_is_400k(tmp_path) -> None:
     )
 
     assert remaining <= 400_000
-    assert sum("[tool result offloaded" in item.content for item in result.tool_results) == 1
+    assert (
+        sum("[tool result offloaded" in item.content for item in result.tool_results)
+        == 1
+    )
 
 
 def test_token_and_recent_tail_keep_tool_pair() -> None:
@@ -383,7 +386,10 @@ def test_join_after_summary_branches() -> None:
     assert joined[2:] == user_recent
 
     assistant_recent = [Message(role="assistant", content="a")]
-    assert _join_after_summary(summary, assistant_recent) == [summary, *assistant_recent]
+    assert _join_after_summary(summary, assistant_recent) == [
+        summary,
+        *assistant_recent,
+    ]
 
 
 @pytest.mark.asyncio
@@ -537,7 +543,9 @@ async def test_auto_manage_context_tripped_breaker_does_not_compact(
 
 
 @pytest.mark.asyncio
-async def test_auto_manage_context_swallows_compact_error(tmp_path, monkeypatch) -> None:
+async def test_auto_manage_context_swallows_compact_error(
+    tmp_path, monkeypatch
+) -> None:
     conv = Conversation()
     conv.add_user("x")
     provider = SummaryProvider("<summary>x</summary>")

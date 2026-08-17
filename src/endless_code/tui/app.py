@@ -27,8 +27,11 @@ from endless_code.agent import (
     SessionRuntime,
     new_session_runtime,
 )
-from endless_code.compact import estimate_tokens, open_session_context
-from endless_code.compact.const import AUTO_SAFETY_MARGIN, SUMMARY_RESERVE
+from endless_code.compact import (
+    build_context_limits,
+    estimate_tokens,
+    open_session_context,
+)
 from endless_code.config import ConfigError, ProviderConfig, effective_context_window
 from endless_code.conversation import Conversation
 from endless_code.llm import Provider, new_provider
@@ -423,9 +426,9 @@ class EndlessCodeApp(App):
                 self._runtime.session = open_session_context(
                     str(Path.cwd().resolve()), info.id
                 )
-                threshold = (
-                    self._runtime.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
-                )
+                threshold = build_context_limits(
+                    self._runtime.context_window
+                ).auto_compact_threshold
                 if (
                     self._agent is not None
                     and estimate_tokens(0, loaded.messages, 0) >= threshold

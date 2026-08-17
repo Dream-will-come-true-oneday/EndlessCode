@@ -15,15 +15,11 @@ from endless_code.compact import (
     ManageInput,
     RecoveryState,
     TriggerKind,
+    build_context_limits,
     estimate_tokens,
     manage_context,
     new_session_context,
     usage_anchor,
-)
-from endless_code.compact.const import (
-    AUTO_SAFETY_MARGIN,
-    MANUAL_SAFETY_MARGIN,
-    SUMMARY_RESERVE,
 )
 from endless_code.conversation import Conversation
 from endless_code.llm import (
@@ -225,11 +221,9 @@ class Agent:
                 conv.messages(),
                 self._runtime.anchor_msg_len,
             )
-            auto_threshold = (
-                self._runtime.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
-            )
+            limits = build_context_limits(self._runtime.context_window)
             likely_auto = (
-                estimated >= auto_threshold
+                estimated >= limits.auto_compact_threshold
                 and not self._runtime.auto_tracking.tripped()
             )
             if likely_auto:
@@ -328,11 +322,7 @@ class Agent:
                 self._runtime.usage_anchor = 0
                 self._runtime.anchor_msg_len = 0
                 retry_estimate = estimate_tokens(0, conv.messages(), 0)
-                if retry_estimate >= (
-                    self._runtime.context_window
-                    - SUMMARY_RESERVE
-                    - MANUAL_SAFETY_MARGIN
-                ):
+                if retry_estimate >= limits.emergency_retry_threshold:
                     round_state.error = PromptTooLongError("压缩后上下文仍超过安全阈值")
                     break
 

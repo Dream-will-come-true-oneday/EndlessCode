@@ -5,9 +5,9 @@ import json
 from endless_code.compact.const import (
     ESTIMATE_CHARS_PER_TOKEN,
     RECOVERY_FILE_LIMIT,
-    RECOVERY_TOKENS_PER_FILE,
 )
 from endless_code.compact.layer1 import _truncate_utf8
+from endless_code.compact.limits import BASE_CONTEXT_WINDOW, build_context_limits
 from endless_code.compact.state import FileReadRecord
 from endless_code.llm import ToolDefinition
 
@@ -17,8 +17,14 @@ BOUNDARY_NOTICE = (
 )
 
 
-def render_file_block(record: FileReadRecord) -> str:
-    max_bytes = int(RECOVERY_TOKENS_PER_FILE * ESTIMATE_CHARS_PER_TOKEN)
+def render_file_block(
+    record: FileReadRecord, recovery_tokens_per_file: int | None = None
+) -> str:
+    if recovery_tokens_per_file is None:
+        recovery_tokens_per_file = build_context_limits(
+            BASE_CONTEXT_WINDOW
+        ).recovery_tokens_per_file
+    max_bytes = int(recovery_tokens_per_file * ESTIMATE_CHARS_PER_TOKEN)
     content = record.content
     if len(content.encode("utf-8")) > max_bytes:
         content = f"{_truncate_utf8(content, max_bytes)}\n(content truncated)"
@@ -32,10 +38,13 @@ def render_file_block(record: FileReadRecord) -> str:
 
 
 def build_recovery_attachment(
-    snapshot: list[FileReadRecord], tool_defs: list[ToolDefinition]
+    snapshot: list[FileReadRecord],
+    tool_defs: list[ToolDefinition],
+    recovery_tokens_per_file: int | None = None,
 ) -> str:
     files = "\n\n".join(
-        render_file_block(record) for record in snapshot[:RECOVERY_FILE_LIMIT]
+        render_file_block(record, recovery_tokens_per_file)
+        for record in snapshot[:RECOVERY_FILE_LIMIT]
     )
     if not files:
         files = "（本会话尚未成功读取文件。）"

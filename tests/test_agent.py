@@ -68,6 +68,11 @@ class FakeProvider:
             yield event
 
 
+def test_new_session_runtime_defaults_to_200k(tmp_path) -> None:
+    runtime = new_session_runtime(str(tmp_path))
+    assert runtime.context_window == 200_000
+
+
 class MemoryRecorder:
     def __init__(self) -> None:
         self.done = asyncio.Event()

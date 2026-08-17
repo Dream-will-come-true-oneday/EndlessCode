@@ -7,6 +7,7 @@ from endless_code.compact.compact import (
     manage_context,
 )
 from endless_code.compact.layer1 import build_preview, offload_and_snip, spill_single
+from endless_code.compact.limits import ContextLimits, build_context_limits
 from endless_code.compact.state import (
     CompactCircuitBreaker,
     ContentReplacementState,
@@ -22,6 +23,7 @@ from endless_code.compact.token import estimate_tokens, usage_anchor
 __all__ = [
     "CompactCircuitBreaker",
     "ContentReplacementState",
+    "ContextLimits",
     "FileReadRecord",
     "ManageInput",
     "ManageOutput",
@@ -29,6 +31,7 @@ __all__ = [
     "SessionContext",
     "TriggerKind",
     "build_preview",
+    "build_context_limits",
     "estimate_tokens",
     "manage_context",
     "new_session_context",

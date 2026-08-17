@@ -8,7 +8,10 @@ from endless_code.compact.const import (
     PTL_DROP_PERCENTAGE,
     PTL_RETRY_LIMIT,
     RECENT_KEEP_MESSAGES,
-    RECENT_KEEP_TOKENS,
+)
+from endless_code.compact.limits import (
+    BASE_CONTEXT_WINDOW,
+    build_context_limits,
 )
 from endless_code.compact.recovery import build_recovery_attachment
 from endless_code.compact.summary_prompt import build_summary_prompt, extract_summary
@@ -27,16 +30,22 @@ def _provider_stream(provider, request: Request) -> AsyncIterator[StreamEvent]:
     return stream_fn(request)
 
 
-def pick_recent_tail(messages: list[Message]) -> list[Message]:
+def pick_recent_tail(
+    messages: list[Message], recent_keep_tokens: int | None = None
+) -> list[Message]:
     """从尾部保留足够的新近原文，且不拆开工具调用配对。"""
     if not messages:
         return []
+    if recent_keep_tokens is None:
+        recent_keep_tokens = build_context_limits(
+            BASE_CONTEXT_WINDOW
+        ).recent_keep_tokens
     total = 0
     start = len(messages)
     for count, index in enumerate(range(len(messages) - 1, -1, -1), start=1):
         total += estimate_tokens(0, [messages[index]], 0)
         start = index
-        if total >= RECENT_KEEP_TOKENS and count >= RECENT_KEEP_MESSAGES:
+        if total >= recent_keep_tokens and count >= RECENT_KEEP_MESSAGES:
             break
     while start > 0 and messages[start].role == "tool":
         start -= 1
@@ -113,12 +122,23 @@ async def run_summary(input_) -> list[Message]:
         summary_text = await summarize_once(input_, old_messages)
     except PromptTooLongError as exc:
         summary_text = await ptl_retry(input_, old_messages, exc)
-    recovery = build_recovery_attachment(snapshot, input_.tool_defs)
+    limits = getattr(input_, "limits", None)
+    if limits is None:
+        limits = build_context_limits(
+            getattr(input_, "context_window", BASE_CONTEXT_WINDOW)
+        )
+    recovery = build_recovery_attachment(
+        snapshot,
+        input_.tool_defs,
+        recovery_tokens_per_file=limits.recovery_tokens_per_file,
+    )
     summary = Message(
         role="user",
         content=f"## 历史会话摘要\n{summary_text}\n\n{recovery}",
     )
-    return _join_after_summary(summary, pick_recent_tail(old_messages))
+    return _join_after_summary(
+        summary, pick_recent_tail(old_messages, limits.recent_keep_tokens)
+    )
 
 
 async def auto_compact(input_) -> tuple[list[Message], int, int]:

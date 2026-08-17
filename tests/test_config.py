@@ -92,17 +92,18 @@ def test_provider_factory_constructs_all_protocols() -> None:
 def test_context_window_defaults_and_explicit_value() -> None:
     assert (
         effective_context_window(ProviderConfig("a", "anthropic", "k", "m"))
-        == 1_000_000
+        == 200_000
     )
     assert (
-        effective_context_window(ProviderConfig("o", "openai", "k", "m")) == 1_000_000
+        effective_context_window(ProviderConfig("o", "openai", "k", "m")) == 200_000
     )
     assert (
-        effective_context_window(ProviderConfig("d", "deepseek", "k", "m")) == 1_000_000
+        effective_context_window(ProviderConfig("d", "deepseek", "k", "m")) == 200_000
     )
-    assert (
-        effective_context_window(
-            ProviderConfig("a", "anthropic", "k", "m", context_window=80_000)
+    for explicit in (80_000, 512_000, 1_000_000):
+        assert (
+            effective_context_window(
+                ProviderConfig("a", "anthropic", "k", "m", context_window=explicit)
+            )
+            == explicit
         )
-        == 80_000
-    )

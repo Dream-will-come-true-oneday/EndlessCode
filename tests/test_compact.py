@@ -26,6 +26,7 @@ from endless_code.compact.const import (
     RECOVERY_FILE_LIMIT,
 )
 from endless_code.compact.layer1 import _replacement_for, _truncate_utf8, preview_head
+from endless_code.compact.limits import build_context_limits
 from endless_code.compact.layer2 import (
     _join_after_summary,
     _provider_stream,
@@ -142,6 +143,47 @@ def test_layer1_limits_aggregate_results(tmp_path) -> None:
         sum("[tool result offloaded" in item.content for item in result.tool_results)
         >= 2
     )
+
+
+def test_layer1_1m_limits_and_tool_cap(tmp_path) -> None:
+    state = ContentReplacementState()
+    context = new_session_context(str(tmp_path))
+    limits = build_context_limits(1_000_000)
+    message = Message(
+        role="tool",
+        tool_results=[
+            ToolResult(tool_call_id="kept", content="x" * 100_000),
+            ToolResult(tool_call_id="spilled", content="y" * 100_001),
+        ],
+    )
+
+    result = offload_and_snip([message], state, context, limits)[0]
+
+    assert "[tool result offloaded" not in result.tool_results[0].content
+    assert "[tool result offloaded" in result.tool_results[1].content
+
+
+def test_layer1_1m_aggregate_limit_is_400k(tmp_path) -> None:
+    state = ContentReplacementState()
+    context = new_session_context(str(tmp_path))
+    limits = build_context_limits(1_000_000)
+    message = Message(
+        role="tool",
+        tool_results=[
+            ToolResult(tool_call_id=f"id-{index}", content="x" * 100_000)
+            for index in range(5)
+        ],
+    )
+
+    result = offload_and_snip([message], state, context, limits)[0]
+    remaining = sum(
+        len(item.content.encode("utf-8"))
+        for item in result.tool_results
+        if "[tool result offloaded" not in item.content
+    )
+
+    assert remaining <= 400_000
+    assert sum("[tool result offloaded" in item.content for item in result.tool_results) == 1
 
 
 def test_token_and_recent_tail_keep_tool_pair() -> None:
@@ -404,6 +446,17 @@ def test_build_recovery_attachment_limits_files(tmp_path) -> None:
     assert rendered.count("读取时间:") == RECOVERY_FILE_LIMIT
 
 
+def test_recovery_attachment_limit_scales_with_window(tmp_path) -> None:
+    record = FileReadRecord(
+        path="/p", content="x" * 100_000, timestamp=datetime.now(UTC)
+    )
+    small = render_file_block(record, recovery_tokens_per_file=5_000)
+    large = render_file_block(record, recovery_tokens_per_file=25_000)
+    assert "(content truncated)" in small
+    assert "(content truncated)" in large
+    assert len(large) > len(small)
+
+
 def test_serialize_conversation_is_deterministic_and_complete() -> None:
     message = Message(
         role="assistant",
@@ -474,7 +527,7 @@ async def test_auto_manage_context_tripped_breaker_does_not_compact(
     input_ = _input(tmp_path, conv, provider)
     input_.trigger = TriggerKind.AUTO
     monkeypatch.setattr(
-        "endless_code.compact.compact.estimate_tokens", lambda *_args: 100_000
+        "endless_code.compact.compact.estimate_tokens", lambda *_args: 200_000
     )
     for _ in range(3):
         input_.auto_tracking.record_failure()
@@ -491,7 +544,7 @@ async def test_auto_manage_context_swallows_compact_error(tmp_path, monkeypatch)
     input_ = _input(tmp_path, conv, provider)
     input_.trigger = TriggerKind.AUTO
     monkeypatch.setattr(
-        "endless_code.compact.compact.estimate_tokens", lambda *_args: 100_000
+        "endless_code.compact.compact.estimate_tokens", lambda *_args: 200_000
     )
 
     async def _boom(_input):
@@ -511,7 +564,7 @@ async def test_auto_manage_context_compacts_on_success(tmp_path, monkeypatch) ->
     input_ = _input(tmp_path, conv, provider)
     input_.trigger = TriggerKind.AUTO
     monkeypatch.setattr(
-        "endless_code.compact.compact.estimate_tokens", lambda *_args: 100_000
+        "endless_code.compact.compact.estimate_tokens", lambda *_args: 200_000
     )
 
     result = await manage_context(input_)

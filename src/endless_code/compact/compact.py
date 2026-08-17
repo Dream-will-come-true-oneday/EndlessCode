@@ -4,9 +4,9 @@ import logging
 from dataclasses import dataclass
 from enum import Enum
 
-from endless_code.compact.const import AUTO_SAFETY_MARGIN, SUMMARY_RESERVE
 from endless_code.compact.layer1 import offload_and_snip
 from endless_code.compact.layer2 import auto_compact, force_compact
+from endless_code.compact.limits import ContextLimits, build_context_limits
 from endless_code.compact.token import estimate_tokens
 from endless_code.llm import ToolDefinition
 
@@ -35,6 +35,10 @@ class ManageInput:
     estimated_token: int
     trigger: TriggerKind
 
+    @property
+    def limits(self) -> ContextLimits:
+        return build_context_limits(self.context_window)
+
 
 @dataclass
 class ManageOutput:
@@ -47,13 +51,14 @@ class ManageOutput:
 async def manage_context(input_: ManageInput) -> ManageOutput:
     """按触发类型执行第一层和/或第二层上下文管理。"""
     before = input_.estimated_token
+    limits = input_.limits
     if input_.trigger is TriggerKind.MANUAL:
         messages, _, after = await force_compact(input_)
         input_.conv.replace_history(messages)
         return ManageOutput(before, after, compacted=True)
 
     layer1 = offload_and_snip(
-        input_.conv.messages(), input_.replacement, input_.session
+        input_.conv.messages(), input_.replacement, input_.session, limits
     )
     input_.conv.replace_history(layer1)
     after_layer1 = estimate_tokens(input_.usage_anchor, layer1, input_.anchor_msg_len)
@@ -64,15 +69,14 @@ async def manage_context(input_: ManageInput) -> ManageOutput:
         input_.conv.replace_history(messages)
         return ManageOutput(before, after, compacted=True)
 
-    if input_.context_window <= SUMMARY_RESERVE + AUTO_SAFETY_MARGIN:
+    if not limits.supports_auto_compaction:
         logger.warning(
             "context_window too small for automatic compaction: %s",
             input_.context_window,
         )
         return ManageOutput(before, after_layer1)
 
-    threshold = input_.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
-    if after_layer1 < threshold or input_.auto_tracking.tripped():
+    if after_layer1 < limits.auto_compact_threshold or input_.auto_tracking.tripped():
         return ManageOutput(before, after_layer1)
 
     input_.estimated_token = before

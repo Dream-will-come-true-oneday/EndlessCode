@@ -4,10 +4,13 @@ import copy
 from pathlib import Path
 
 from endless_code.compact.const import (
-    MESSAGE_AGGREGATE_LIMIT,
     PREVIEW_HEAD_BYTES,
     PREVIEW_HEAD_LINES,
-    SINGLE_RESULT_LIMIT,
+)
+from endless_code.compact.limits import (
+    BASE_CONTEXT_WINDOW,
+    ContextLimits,
+    build_context_limits,
 )
 from endless_code.compact.state import ContentReplacementState, SessionContext
 from endless_code.llm import Message, ToolResult
@@ -69,8 +72,10 @@ def offload_and_snip(
     messages: list[Message],
     state: ContentReplacementState,
     session: SessionContext,
+    limits: ContextLimits | None = None,
 ) -> list[Message]:
     """返回处理后的历史副本，不修改传入的消息或工具结果。"""
+    limits = limits or build_context_limits(BASE_CONTEXT_WINDOW)
     output = copy.deepcopy(messages)
     for message in output:
         if message.role != "tool" or not message.tool_results:
@@ -92,7 +97,8 @@ def offload_and_snip(
             unknown, key=lambda item: item[0], reverse=True
         ):
             should_replace = (
-                size > SINGLE_RESULT_LIMIT or remaining > MESSAGE_AGGREGATE_LIMIT
+                size > limits.single_result_bytes
+                or remaining > limits.message_aggregate_bytes
             )
             if should_replace:
                 replacement = _replacement_for(result, state, session)

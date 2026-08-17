@@ -37,8 +37,8 @@ class ConfigError(Exception):
     """配置相关错误。"""
 
 
-DEFAULT_ANTHROPIC_CONTEXT_WINDOW = 1_000_000
-DEFAULT_OPENAI_CONTEXT_WINDOW = 1_000_000
+DEFAULT_ANTHROPIC_CONTEXT_WINDOW = 200_000
+DEFAULT_OPENAI_CONTEXT_WINDOW = 200_000
 
 
 def effective_context_window(provider: ProviderConfig) -> int:

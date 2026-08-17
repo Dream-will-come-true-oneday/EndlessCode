@@ -82,7 +82,7 @@ class SessionRuntime:
     recovery: RecoveryState
     auto_tracking: CompactCircuitBreaker
     session: object
-    context_window: int = 1_000_000
+    context_window: int = 200_000
     usage_anchor: int = 0
     anchor_msg_len: int = 0
     run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -90,7 +90,7 @@ class SessionRuntime:
 
 
 def new_session_runtime(
-    workspace: str, context_window: int = 1_000_000
+    workspace: str, context_window: int = 200_000
 ) -> SessionRuntime:
     return SessionRuntime(
         replacement=ContentReplacementState(),

@@ -12,6 +12,8 @@ from endless_code.prompt.reminder import (
     EXECUTE_DIRECTIVE,
     PLAN_REMINDER_BRIEF,
     PLAN_REMINDER_FULL,
+    combine_reminders,
+    deferred_tools_reminder,
     plan_reminder,
     system_reminder,
 )
@@ -55,6 +57,8 @@ __all__ = [
     "Module",
     "assemble_system",
     "build_system_prompt",
+    "combine_reminders",
+    "deferred_tools_reminder",
     "fixed_modules",
     "gather_environment",
     "optional_modules",

@@ -3,7 +3,7 @@
 import asyncio
 import json
 import os
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from textual.widgets import Footer, Header, Input, RichLog
@@ -246,7 +246,7 @@ async def test_compact_command_uses_summary_path_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resume_switches_to_selected_persisted_session(
+async def test_deferred_resume_reset_switches_to_selected_persisted_session(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -260,6 +260,8 @@ async def test_resume_switches_to_selected_persisted_session(
         app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
         async with app.run_test() as pilot:
             await _wait_for_state(app, pilot, SessionState.IDLE)
+            reset_deferred = Mock()
+            app._agent.reset_deferred_tools = reset_deferred
             app._command_resume()
             assert app.state is SessionState.RESUMING
             app._render_resume_options("恢复")
@@ -270,6 +272,7 @@ async def test_resume_switches_to_selected_persisted_session(
                 "恢复这条历史",
                 "历史回复",
             ]
+            reset_deferred.assert_called_once_with()
 
 
 @pytest.mark.asyncio

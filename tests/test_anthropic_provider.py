@@ -87,6 +87,8 @@ async def test_cache_control_reminder_usage_and_tool_stream() -> None:
         {"type": "text", "text": "environment"},
     ]
     assert messages.kwargs["messages"][-1]["content"][-1]["text"] == request.reminder
+    assert [tool["name"] for tool in messages.kwargs["tools"]] == ["read_file"]
+    assert request.messages == [Message(role="user", content="hello")]
     usage = next(event.usage for event in result if event.usage)
     assert (
         usage.input_tokens,

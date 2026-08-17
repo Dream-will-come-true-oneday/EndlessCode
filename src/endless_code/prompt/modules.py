@@ -60,12 +60,27 @@ def fixed_modules() -> list[Module]:
     ]
 
 
-def optional_modules(instructions: str = "", memory: str = "") -> list[Module]:
+def optional_modules(
+    instructions: str = "", memory: str = "", deferred_tools: bool = False
+) -> list[Module]:
     """返回可由启动期指令和长期记忆填充的可选模块。"""
     return [
         Module("custom_instructions", 80, instructions),
         Module("active_skills", 90, ""),
         Module("long_term_memory", 100, memory),
+        Module(
+            "deferred_tools",
+            110,
+            (
+                "Some MCP tools are deferred. Their names are listed in a temporary "
+                "user message. Before calling a deferred MCP tool, call ToolSearch "
+                "with its exact name, then wait for the next model turn where its "
+                "full schema will be available. Never call an unloaded MCP tool "
+                "directly."
+                if deferred_tools
+                else ""
+            ),
+        ),
     ]
 
 
@@ -78,6 +93,10 @@ def assemble_system(modules: list[Module]) -> str:
     )
 
 
-def build_system_prompt(instructions: str = "", memory: str = "") -> str:
+def build_system_prompt(
+    instructions: str = "", memory: str = "", deferred_tools: bool = False
+) -> str:
     """构造可缓存的稳定系统提示。"""
-    return assemble_system(fixed_modules() + optional_modules(instructions, memory))
+    return assemble_system(
+        fixed_modules() + optional_modules(instructions, memory, deferred_tools)
+    )

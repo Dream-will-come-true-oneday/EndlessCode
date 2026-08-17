@@ -104,6 +104,10 @@ providers:
 
 Endless Code 内置 MCP（Model Context Protocol）客户端，通过 **stdio** 或 **Streamable HTTP** 连接 MCP server，把远端工具接入本地工具链路。工具命名为 `mcp__<server>__<tool>`（如 `mcp__github__search_repo`），与内置 6 个工具天然不冲突；权限规则可直接写 `mcp__<server>__<tool>` 或 `mcp__<server>__*`。
 
+MCP 工具默认延迟加载。每轮请求只向模型列出未加载工具的名称，不携带完整描述和参数 schema。模型需要某个工具时会先调用 `ToolSearch`，被选中工具的完整 schema 从下一轮请求开始可用。已加载集合只属于当前运行会话，新会话、恢复会话或重启进程后会重置。
+
+固定模拟基准中，58 个 MCP 工具经过 10 次请求并加载其中 3 个工具时，工具元数据估算从 968,935 Token 降至 35,294 Token，减少 96.36%，高于 80% 验收线。该数据用于可重复回归验证，实际收益取决于工具 schema 大小、请求轮数和加载工具数量。
+
 MCP 配置同样分两层 YAML，同名 server 项目级完整覆盖用户级：
 
 | 位置 | 路径 |
@@ -130,6 +134,7 @@ mcp_servers:
 - `env` / `headers` 的值支持 `${VAR}` 展开；未定义变量展开为空串并在启动时告警，不阻断启动。
 - 每个 server 启动连接超时 30s、调用超时 30s；连接失败 / 配置非法 / 超时的 server 只跳过自身，其余 server 与内置工具照常可用。
 - 远端声明只读（`readOnlyHint`）的工具走只读兜底，其余工具在 default 模式需人在回路确认，行为与内置工具一致。
+- Plan Mode 的延迟目录和 `ToolSearch` 只暴露远端声明为只读的 MCP 工具。加载只改变模型可见性，不代表用户授权；真实调用仍完整经过五层权限链。
 - 退出时自动终止所有 stdio 子进程并断开 HTTP 会话。
 - 完整示例见 [`docs/mcp/mcp-servers.example.yaml`](docs/mcp/mcp-servers.example.yaml)。
 

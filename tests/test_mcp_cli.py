@@ -58,6 +58,10 @@ async def test_amain_registers_mcp_tools_and_closes(tmp_path, monkeypatch) -> No
             names = [d.name for d in captured["registry"].definitions()]
             assert "mcp__demo__add" in names
             assert "mcp__demo__echo" in names
+            assert captured["registry"].deferred_names() == [
+                "mcp__demo__add",
+                "mcp__demo__echo",
+            ]
 
     monkeypatch.setattr(cli_mod, "EndlessCodeApp", FakeApp)
     monkeypatch.setattr(

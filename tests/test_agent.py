@@ -32,7 +32,9 @@ from endless_code.llm import (
 )
 from endless_code.permission import Decision, Mode, Outcome, new_engine
 from endless_code.prompt import PLAN_MODE_REMINDER
+from endless_code.session import Writer
 from endless_code.tool import Registry, Result
+from endless_code.tool.deferred import TOOL_SEARCH_NAME
 
 
 class FakeProvider:
@@ -119,6 +121,30 @@ class EchoTool:
         return Result(content=data.get("value", "ok"))
 
 
+class DeferredEchoTool(EchoTool):
+    def __init__(self, name: str, *, read_only: bool = True) -> None:
+        self._name = name
+        self.read_only = read_only
+        self.calls: list[str] = []
+
+    def name(self) -> str:
+        return self._name
+
+    def description(self) -> str:
+        return f"deferred description for {self._name}"
+
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+        }
+
+    async def execute(self, args: str) -> Result:
+        self.calls.append(args)
+        return await super().execute(args)
+
+
 class BlockingTool(EchoTool):
     read_only = False
 
@@ -176,6 +202,32 @@ def _registry(*tools) -> Registry:
     for tool in tools:
         registry.register(tool)
     return registry
+
+
+def _deferred_registry(*tools) -> Registry:
+    registry = Registry()
+    registry.register(EchoTool())
+    for tool in tools:
+        registry.register(tool, deferred=True)
+    return registry
+
+
+def _search_event(call_id: str, *names: str) -> StreamEvent:
+    return StreamEvent(
+        tool_calls=[
+            ToolCall(
+                id=call_id,
+                name=TOOL_SEARCH_NAME,
+                input=json.dumps({"names": list(names)}),
+            )
+        ]
+    )
+
+
+def _named_tool_event(call_id: str, name: str, value: str = "ok") -> StreamEvent:
+    return StreamEvent(
+        tool_calls=[ToolCall(id=call_id, name=name, input=json.dumps({"value": value}))]
+    )
 
 
 def _tool_event(
@@ -539,6 +591,240 @@ async def test_stable_prefix_plan_reminder_and_history_are_isolated() -> None:
         for request in provider.requests
     )
     assert all("system-reminder" not in message.content for message in conv.messages())
+
+
+@pytest.mark.asyncio
+async def test_deferred_first_request_tool_search_next_round_and_not_persisted(
+    tmp_path,
+) -> None:
+    remote = DeferredEchoTool("mcp__demo__read")
+    provider = RequestProvider(
+        [
+            [_search_event("search", remote.name()), StreamEvent(done=True)],
+            [
+                _named_tool_event("remote", remote.name(), "loaded"),
+                StreamEvent(done=True),
+            ],
+            [StreamEvent(text="done"), StreamEvent(done=True)],
+        ]
+    )
+    writer = Writer(str(tmp_path / "session"), "fake-model")
+    conv = Conversation(writer.append, writer.replace)
+    try:
+        conv.add_user("use the remote tool")
+        await _run(Agent(provider, _deferred_registry(remote)), conv)
+    finally:
+        writer.close()
+
+    first_names = [tool.name for tool in provider.requests[0].tools]
+    second_names = [tool.name for tool in provider.requests[1].tools]
+    assert first_names == ["echo_tool", TOOL_SEARCH_NAME]
+    assert remote.name() not in first_names
+    assert remote.name() in provider.requests[0].reminder
+    assert remote.name() in second_names
+    assert remote.name() not in provider.requests[1].reminder
+    remote_definition = next(
+        tool for tool in provider.requests[1].tools if tool.name == remote.name()
+    )
+    assert remote_definition.description == remote.description()
+    assert remote_definition.input_schema == remote.parameters()
+    assert "ToolSearch" in provider.requests[0].system.stable
+    assert all(
+        "Deferred MCP tools available" not in message.content
+        for message in conv.messages()
+    )
+    archive = writer.path.read_text(encoding="utf-8")
+    assert "Deferred MCP tools available" not in archive
+    assert remote.description() not in archive
+    assert remote.calls == [json.dumps({"value": "loaded"})]
+
+
+@pytest.mark.asyncio
+async def test_unactivated_deferred_tool_is_blocked_before_permission() -> None:
+    remote = DeferredEchoTool("mcp__demo__write", read_only=False)
+    provider = RequestProvider(
+        [
+            [_named_tool_event("remote", remote.name()), StreamEvent(done=True)],
+            [StreamEvent(text="done"), StreamEvent(done=True)],
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("call it directly")
+    events = await _run(
+        Agent(provider, _deferred_registry(remote)), conv, mode=Mode.DEFAULT
+    )
+
+    assert not any(event.approval is not None for event in events)
+    assert remote.calls == []
+    result = next(
+        event.tool
+        for event in events
+        if event.tool is not None and event.tool.phase is Phase.END
+    )
+    assert result.is_error
+    assert TOOL_SEARCH_NAME in result.result
+
+
+@pytest.mark.asyncio
+async def test_e2e_same_response_tool_search_activation_boundary() -> None:
+    remote = DeferredEchoTool("mcp__demo__read")
+    provider = RequestProvider(
+        [
+            [
+                StreamEvent(
+                    tool_calls=[
+                        ToolCall(
+                            id="search",
+                            name=TOOL_SEARCH_NAME,
+                            input=json.dumps({"names": [remote.name()]}),
+                        ),
+                        ToolCall(
+                            id="early",
+                            name=remote.name(),
+                            input=json.dumps({"value": "early"}),
+                        ),
+                    ]
+                ),
+                StreamEvent(done=True),
+            ],
+            [
+                _named_tool_event("later", remote.name(), "later"),
+                StreamEvent(done=True),
+            ],
+            [StreamEvent(text="done"), StreamEvent(done=True)],
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("search and call")
+    events = await _run(Agent(provider, _deferred_registry(remote)), conv)
+
+    early = next(
+        event.tool
+        for event in events
+        if event.tool is not None
+        and event.tool.call_id == "early"
+        and event.tool.phase is Phase.END
+    )
+    assert early.is_error
+    assert TOOL_SEARCH_NAME in early.result
+    assert remote.name() not in [tool.name for tool in provider.requests[0].tools]
+    assert remote.name() in [tool.name for tool in provider.requests[1].tools]
+    assert remote.calls == [json.dumps({"value": "later"})]
+
+
+@pytest.mark.asyncio
+async def test_deferred_activation_does_not_bypass_permission() -> None:
+    remote = DeferredEchoTool("mcp__demo__write", read_only=False)
+    provider = RequestProvider(
+        [
+            [_search_event("search", remote.name()), StreamEvent(done=True)],
+            [_named_tool_event("write", remote.name()), StreamEvent(done=True)],
+            [StreamEvent(text="done"), StreamEvent(done=True)],
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("load then write")
+    approvals = 0
+    async for event in Agent(provider, _deferred_registry(remote)).run(
+        conv, mode=Mode.DEFAULT
+    ):
+        if event.approval is not None:
+            approvals += 1
+            event.approval.respond.set_result(Outcome.DENY_ONCE)
+
+    assert approvals == 1
+    assert remote.calls == []
+
+
+@pytest.mark.asyncio
+async def test_e2e_deferred_plan_mode_catalog_and_tools_are_read_only() -> None:
+    read = DeferredEchoTool("mcp__demo__read")
+    write = DeferredEchoTool("mcp__demo__write", read_only=False)
+    provider = RequestProvider(
+        [
+            [_search_event("search", read.name()), StreamEvent(done=True)],
+            [StreamEvent(text="done"), StreamEvent(done=True)],
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("plan with remote data")
+    await _run(Agent(provider, _deferred_registry(read, write)), conv, mode=Mode.PLAN)
+
+    assert read.name() in provider.requests[0].reminder
+    assert write.name() not in provider.requests[0].reminder
+    assert read.name() in [tool.name for tool in provider.requests[1].tools]
+    assert write.name() not in [tool.name for tool in provider.requests[1].tools]
+
+
+@pytest.mark.asyncio
+async def test_e2e_deferred_discover_activate_authorize_execute() -> None:
+    remote = DeferredEchoTool("mcp__demo__write", read_only=False)
+    provider = RequestProvider(
+        [
+            [_search_event("search", remote.name()), StreamEvent(done=True)],
+            [
+                _named_tool_event("write", remote.name(), "authorized"),
+                StreamEvent(done=True),
+            ],
+            [StreamEvent(text="done"), StreamEvent(done=True)],
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("discover, authorize, and execute")
+    approvals = 0
+    async for event in Agent(provider, _deferred_registry(remote)).run(
+        conv, mode=Mode.DEFAULT
+    ):
+        if event.approval is not None:
+            approvals += 1
+            event.approval.respond.set_result(Outcome.ALLOW_ONCE)
+
+    assert approvals == 1
+    assert remote.calls == [json.dumps({"value": "authorized"})]
+    assert remote.name() not in [tool.name for tool in provider.requests[0].tools]
+    assert remote.name() in [tool.name for tool in provider.requests[1].tools]
+
+
+@pytest.mark.asyncio
+async def test_deferred_activation_survives_compact_and_reset_clears_it() -> None:
+    remote = DeferredEchoTool("mcp__demo__read")
+    provider = RequestProvider(
+        [
+            [_search_event("search", remote.name()), StreamEvent(done=True)],
+            [StreamEvent(text="loaded"), StreamEvent(done=True)],
+            [StreamEvent(text="<summary>brief</summary>"), StreamEvent(done=True)],
+            [StreamEvent(text="after compact"), StreamEvent(done=True)],
+            [StreamEvent(text="after reset"), StreamEvent(done=True)],
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("load")
+    agent = Agent(provider, _deferred_registry(remote))
+    await _run(agent, conv)
+
+    await agent.run_force_compact(conv)
+    conv.add_user("continue after compact")
+    await _run(agent, conv)
+    assert remote.name() in [tool.name for tool in provider.requests[3].tools]
+
+    agent.reset_deferred_tools()
+    conv.add_user("continue after reset")
+    await _run(agent, conv)
+    assert remote.name() not in [tool.name for tool in provider.requests[4].tools]
+    assert remote.name() in provider.requests[4].reminder
+
+
+@pytest.mark.asyncio
+async def test_e2e_without_mcp_preserves_request_shape() -> None:
+    provider = RequestProvider([[StreamEvent(text="done"), StreamEvent(done=True)]])
+    conv = Conversation()
+    conv.add_user("local only")
+    await _run(Agent(provider, _registry(EchoTool())), conv)
+
+    request = provider.requests[0]
+    assert [tool.name for tool in request.tools] == ["echo_tool"]
+    assert request.reminder == ""
+    assert TOOL_SEARCH_NAME not in request.system.stable
 
 
 @pytest.mark.asyncio

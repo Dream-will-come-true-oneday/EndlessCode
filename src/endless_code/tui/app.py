@@ -422,6 +422,8 @@ class EndlessCodeApp(App):
             self._conv = Conversation.from_messages(
                 loaded.messages, self._writer.append, self._writer.replace
             )
+            if self._agent is not None:
+                self._agent.reset_deferred_tools()
             if self._runtime is not None:
                 self._runtime.session = open_session_context(
                     str(Path.cwd().resolve()), info.id

@@ -114,11 +114,17 @@ async def test_deepseek_stream_preserves_thinking_and_suffix() -> None:
     client = FakeClient(response)
     provider._client = client
 
-    events = [event async for event in provider.stream([], [], "read only plan")]
+    visible_tools = [
+        ToolDefinition("ToolSearch", "load deferred tools", {"type": "object"})
+    ]
+    events = [
+        event async for event in provider.stream([], visible_tools, "read only plan")
+    ]
     kwargs = client.chat.completions.kwargs
     assert kwargs["stream_options"] == {"include_usage": True}
     assert kwargs["extra_body"] == {"thinking": {"type": "enabled"}}
     assert "read only plan" in kwargs["messages"][0]["content"]
+    assert [tool["function"]["name"] for tool in kwargs["tools"]] == ["ToolSearch"]
     assert events[0].text == "ok"
     assert events[1].usage.input_tokens == 3
     assert events[-1].done
@@ -141,6 +147,7 @@ async def test_openai_request_injects_reminder_and_cache_usage() -> None:
 
     request = Request(
         messages=[Message(role="user", content="hello")],
+        tools=[ToolDefinition("ToolSearch", "load deferred tools", {"type": "object"})],
         system=System(stable="stable", environment="environment"),
         reminder="<system-reminder>notice</system-reminder>",
     )
@@ -153,6 +160,10 @@ async def test_openai_request_injects_reminder_and_cache_usage() -> None:
         "role": "user",
         "content": request.reminder,
     }
+    assert [
+        tool["function"]["name"] for tool in client.chat.completions.kwargs["tools"]
+    ] == ["ToolSearch"]
+    assert request.messages == [Message(role="user", content="hello")]
     event_usage = next(event.usage for event in events if event.usage)
     assert event_usage.cache_read == 6
 

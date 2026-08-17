@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from endless_code.tool import Registry, new_default_registry
+from endless_code.tool import Registry, Result, new_default_registry
 from endless_code.tool.bash import BashTool
 
 
@@ -53,6 +53,48 @@ class TestRegistry:
         r = await registry.execute("no_such", "{}")
         assert r.is_error
         assert "未知工具" in r.content
+
+    def test_deferred_metadata_preserves_registration_order(self) -> None:
+        class MetadataTool:
+            def __init__(self, name: str, read_only: bool) -> None:
+                self._name = name
+                self.read_only = read_only
+
+            def name(self) -> str:
+                return self._name
+
+            def description(self) -> str:
+                return f"description:{self._name}"
+
+            def parameters(self) -> dict:
+                return {"type": "object"}
+
+            async def execute(self, args: str) -> Result:
+                return Result(args)
+
+        registry = Registry()
+        registry.register(MetadataTool("local", True))
+        registry.register(MetadataTool("mcp__demo__write", False), deferred=True)
+        registry.register(MetadataTool("mcp__demo__read", True), deferred=True)
+
+        assert registry.names() == [
+            "local",
+            "mcp__demo__write",
+            "mcp__demo__read",
+        ]
+        assert registry.deferred_names() == [
+            "mcp__demo__write",
+            "mcp__demo__read",
+        ]
+        assert registry.deferred_names(read_only_only=True) == ["mcp__demo__read"]
+        assert registry.is_deferred("mcp__demo__write")
+        assert not registry.is_deferred("local")
+        assert not registry.is_deferred("missing")
+        assert registry.definition("mcp__demo__read").description == (
+            "description:mcp__demo__read"
+        )
+        assert registry.definition("missing") is None
+        assert [item.name for item in registry.definitions()] == registry.names()
 
 
 class TestReadFile:

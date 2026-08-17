@@ -50,7 +50,7 @@ async def _amain() -> int:
     mgr = await new_manager(mcp_cfg, version=__version__)
     try:
         for t in mgr.tools():
-            registry.register(t)
+            registry.register(t, deferred=True)
         app_kwargs = {
             "registry": registry,
             "version": __version__,

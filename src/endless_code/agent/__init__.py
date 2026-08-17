@@ -37,8 +37,15 @@ from endless_code.llm import (
 from endless_code.memory import Manager, has_memory_signal
 from endless_code.permission import Decision, Mode, Outcome
 from endless_code.permission.engine import Engine, new_engine
-from endless_code.prompt import build_system_prompt, gather_environment, plan_reminder
+from endless_code.prompt import (
+    build_system_prompt,
+    combine_reminders,
+    deferred_tools_reminder,
+    gather_environment,
+    plan_reminder,
+)
 from endless_code.tool import Registry, Result
+from endless_code.tool.deferred import SessionToolSet
 
 MAX_ITERATIONS = 25
 MAX_UNKNOWN_RUN = 3
@@ -165,6 +172,7 @@ class Agent:
     ) -> None:
         self._provider = provider
         self._registry = registry
+        self._tools = SessionToolSet(registry)
         self._version = version
         self._engine = engine or new_engine(str(Path.cwd().resolve()))[0]
         self._runtime = runtime or new_session_runtime(str(Path.cwd().resolve()))
@@ -195,7 +203,11 @@ class Agent:
             if self._memory_manager is not None
             else self._memory_text
         )
-        stable_system = build_system_prompt(self._instruction_text, memory_text)
+        stable_system = build_system_prompt(
+            self._instruction_text,
+            memory_text,
+            deferred_tools=self._tools.has_deferred(),
+        )
 
         unknown_run = 0
         for iteration in range(1, MAX_ITERATIONS + 1):
@@ -206,14 +218,17 @@ class Agent:
                 return
 
             yield Event(iteration=iteration)
-            if mode is Mode.PLAN:
-                definitions = self._registry.read_only_definitions()
-            else:
-                definitions = self._registry.definitions()
-            reminder = (
-                plan_reminder((iteration - 1) % PLAN_REMINDER_INTERVAL == 0)
-                if mode is Mode.PLAN
-                else ""
+            definitions = self._tools.definitions(mode)
+            reminder = combine_reminders(
+                (
+                    plan_reminder(
+                        (iteration - 1) % PLAN_REMINDER_INTERVAL == 0,
+                        deferred_tools=self._tools.has_deferred(),
+                    )
+                    if mode is Mode.PLAN
+                    else ""
+                ),
+                deferred_tools_reminder(self._tools.inactive_names(mode)),
             )
 
             estimated = estimate_tokens(
@@ -353,14 +368,19 @@ class Agent:
 
             conv.add_assistant_with_tool_calls(round_state.text, round_state.calls)
             self._record_usage_anchor(round_state.usage, conv)
-            if all(self._registry.get(call.name) is None for call in round_state.calls):
+            if all(not self._tools.known(call.name) for call in round_state.calls):
                 unknown_run += 1
             else:
                 unknown_run = 0
 
             execution = _ExecutionState(results=[None] * len(round_state.calls))
+            active_at_round_start = self._tools.active_snapshot(mode)
             async for event in self._execute_events(
-                round_state.calls, cancel, execution, mode
+                round_state.calls,
+                cancel,
+                execution,
+                mode,
+                active_at_round_start,
             ):
                 yield event
 
@@ -506,11 +526,7 @@ class Agent:
     ) -> tuple[int, int]:
         """供 TUI `/compact` 调用的无条件摘要入口。"""
         async with self._runtime.run_lock:
-            definitions = (
-                self._registry.read_only_definitions()
-                if mode is Mode.PLAN
-                else self._registry.definitions()
-            )
+            definitions = self._tools.definitions(mode)
             estimated = estimate_tokens(
                 self._runtime.usage_anchor,
                 conv.messages(),
@@ -537,12 +553,17 @@ class Agent:
             self._runtime.anchor_msg_len = 0
             return result.before_tokens, result.after_tokens
 
+    def reset_deferred_tools(self) -> None:
+        """在切换会话时清空未持久化的 MCP 激活状态。"""
+        self._tools.reset()
+
     async def _execute_events(
         self,
         calls: list[ToolCall],
         cancel: asyncio.Event,
         state: _ExecutionState,
         mode: Mode,
+        active_at_round_start: frozenset[str],
     ) -> AsyncIterator[Event]:
         cancel_task = asyncio.create_task(cancel.wait())
         active_tasks: set[asyncio.Task[Result]] = set()
@@ -556,8 +577,8 @@ class Agent:
                     return
 
                 end = index + 1
-                if self._registry.is_read_only(calls[index].name):
-                    while end < len(calls) and self._registry.is_read_only(
+                if self._tools.is_read_only(calls[index].name):
+                    while end < len(calls) and self._tools.is_read_only(
                         calls[end].name
                     ):
                         end += 1
@@ -574,14 +595,20 @@ class Agent:
                         )
                     )
 
-                if self._registry.is_read_only(calls[index].name):
+                if self._tools.is_read_only(calls[index].name):
                     task_indices: dict[asyncio.Task[Result], int] = {}
                     for current in batch_indices:
                         call = calls[current]
-                        if self._registry.get(call.name) is None:
+                        if not self._tools.known(call.name):
                             state.results[current] = Result(
                                 content=f"未知工具: {call.name}", is_error=True
                             )
+                            continue
+                        blocked = self._tools.blocked_result(
+                            call.name, mode, active_at_round_start
+                        )
+                        if blocked is not None:
+                            state.results[current] = blocked
                             continue
                         decision, reason = self._engine.check(mode, call, True)
                         if decision is Decision.DENY:
@@ -590,7 +617,12 @@ class Agent:
                             )
                             continue
                         task = asyncio.create_task(
-                            self._registry.execute(call.name, call.input)
+                            self._tools.execute(
+                                call.name,
+                                call.input,
+                                mode,
+                                active_at_round_start,
+                            )
                         )
                         active_tasks.add(task)
                         task_indices[task] = current
@@ -630,10 +662,16 @@ class Agent:
                 else:
                     for current in batch_indices:
                         call = calls[current]
-                        if self._registry.get(call.name) is None:
+                        if not self._tools.known(call.name):
                             state.results[current] = Result(
                                 content=f"未知工具: {call.name}", is_error=True
                             )
+                            continue
+                        blocked = self._tools.blocked_result(
+                            call.name, mode, active_at_round_start
+                        )
+                        if blocked is not None:
+                            state.results[current] = blocked
                             continue
                         decision, reason = self._engine.check(mode, call, False)
                         if decision is Decision.DENY:
@@ -643,7 +681,11 @@ class Agent:
                             continue
                         if decision is Decision.ALLOW:
                             result = await self._await_serial_call(
-                                call, cancel, cancel_task
+                                call,
+                                cancel,
+                                cancel_task,
+                                mode,
+                                active_at_round_start,
                             )
                             if result is None:
                                 state.completed = False
@@ -669,7 +711,11 @@ class Agent:
 
                         if outcome is Outcome.ALLOW_ONCE:
                             result = await self._await_serial_call(
-                                call, cancel, cancel_task
+                                call,
+                                cancel,
+                                cancel_task,
+                                mode,
+                                active_at_round_start,
                             )
                             if result is None:
                                 state.completed = False
@@ -686,7 +732,11 @@ class Agent:
                                     "持久化放行规则失败: %s", call.name, exc_info=True
                                 )
                             result = await self._await_serial_call(
-                                call, cancel, cancel_task
+                                call,
+                                cancel,
+                                cancel_task,
+                                mode,
+                                active_at_round_start,
                             )
                             if result is None:
                                 state.completed = False
@@ -735,9 +785,18 @@ class Agent:
         call: ToolCall,
         cancel: asyncio.Event,
         cancel_task: asyncio.Task,
+        mode: Mode,
+        active_at_round_start: frozenset[str],
     ) -> Result | None:
         """执行单个有副作用工具，支持外部取消；取消返回 None。"""
-        tool_task = asyncio.create_task(self._registry.execute(call.name, call.input))
+        tool_task = asyncio.create_task(
+            self._tools.execute(
+                call.name,
+                call.input,
+                mode,
+                active_at_round_start,
+            )
+        )
         try:
             done, _ = await asyncio.wait(
                 {tool_task, cancel_task},

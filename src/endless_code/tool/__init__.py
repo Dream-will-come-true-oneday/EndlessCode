@@ -51,37 +51,57 @@ class Registry:
     def __init__(self) -> None:
         self._order: list[str] = []
         self._tools: dict[str, Tool] = {}
+        self._deferred: set[str] = set()
 
-    def register(self, t: Tool) -> None:
+    def register(self, t: Tool, *, deferred: bool = False) -> None:
         n = t.name()
         if n in self._tools:
             raise ValueError(f"工具名重复: {n}")
         self._order.append(n)
         self._tools[n] = t
+        if deferred:
+            self._deferred.add(n)
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
-    def definitions(self) -> list[ToolDefinition]:
+    def names(self) -> list[str]:
+        """按注册顺序返回工具名称副本。"""
+        return list(self._order)
+
+    def definition(self, name: str) -> ToolDefinition | None:
+        """返回单个工具完整定义；未知名称返回 None。"""
+        tool = self.get(name)
+        if tool is None:
+            return None
+        return ToolDefinition(
+            name=tool.name(),
+            description=tool.description(),
+            input_schema=tool.parameters(),
+        )
+
+    def is_deferred(self, name: str) -> bool:
+        """已注册且标记为延迟工具时返回 True。"""
+        return name in self._deferred
+
+    def deferred_names(self, *, read_only_only: bool = False) -> list[str]:
+        """按注册顺序返回延迟工具名称。"""
         return [
-            ToolDefinition(
-                name=self._tools[n].name(),
-                description=self._tools[n].description(),
-                input_schema=self._tools[n].parameters(),
-            )
-            for n in self._order
+            name
+            for name in self._order
+            if name in self._deferred
+            and (not read_only_only or self._tools[name].read_only)
         ]
+
+    def definitions(self) -> list[ToolDefinition]:
+        return [definition for n in self._order if (definition := self.definition(n))]
 
     def read_only_definitions(self) -> list[ToolDefinition]:
         """按注册顺序导出只读工具定义。"""
         return [
-            ToolDefinition(
-                name=self._tools[n].name(),
-                description=self._tools[n].description(),
-                input_schema=self._tools[n].parameters(),
-            )
+            definition
             for n in self._order
-            if self._tools[n].read_only
+            if self._tools[n].read_only and (definition := self.definition(n))
         ]
 
     def is_read_only(self, name: str) -> bool:

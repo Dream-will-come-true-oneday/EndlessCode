@@ -3,7 +3,7 @@
 import asyncio
 import json
 import os
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from textual.widgets import Footer, Header, Input, RichLog
@@ -97,12 +97,13 @@ class BlockingTool(SecretTool):
         return Result(content="unreachable")
 
 
-def _config(*, api_key: str = TEST_SECRET) -> ProviderConfig:
+def _config(*, api_key: str = TEST_SECRET, context_window: int = 0) -> ProviderConfig:
     return ProviderConfig(
         name="fake",
         protocol="openai",
         api_key=api_key,
         model="fake-model",
+        context_window=context_window,
     )
 
 
@@ -269,6 +270,43 @@ async def test_resume_switches_to_selected_persisted_session(
                 "恢复这条历史",
                 "历史回复",
             ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("context_window", "estimated", "should_compact"),
+    [
+        (200_000, 166_999, False),
+        (200_000, 167_000, True),
+        (1_000_000, 834_999, False),
+        (1_000_000, 835_000, True),
+    ],
+)
+async def test_resume_uses_dynamic_context_threshold(
+    tmp_path, monkeypatch, context_window, estimated, should_compact
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    directory = tmp_path / ".endless-code" / "sessions" / "20260805-120000-abcd"
+    writer = Writer(str(directory), "fake-model")
+    writer.append(Message(role="user", content="恢复动态阈值会话"))
+    writer.close()
+
+    with patch("endless_code.tui.app.new_provider", return_value=FakeProvider([])):
+        app = EndlessCodeApp(
+            [_config(context_window=context_window)],
+            new_default_registry(),
+            engine=_engine(),
+        )
+        async with app.run_test() as pilot:
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            compact = AsyncMock(return_value=(estimated, 100))
+            app._agent.run_force_compact = compact
+            with patch("endless_code.tui.app.estimate_tokens", return_value=estimated):
+                app._command_resume()
+                app._resume_selected()
+                await _wait_for_state(app, pilot, SessionState.IDLE)
+
+            assert compact.await_count == int(should_compact)
 
 
 @pytest.mark.asyncio

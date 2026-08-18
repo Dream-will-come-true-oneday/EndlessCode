@@ -34,10 +34,11 @@ from endless_code.llm import (
     ToolResult,
     Usage,
 )
-from endless_code.memory import Manager, has_memory_signal
+from endless_code.memory import Manager
 from endless_code.permission import Decision, Mode, Outcome
 from endless_code.permission.engine import Engine, new_engine
 from endless_code.prompt import (
+    build_context_prefix,
     build_system_prompt,
     combine_reminders,
     deferred_tools_reminder,
@@ -89,7 +90,8 @@ class SessionRuntime:
     usage_anchor: int = 0
     anchor_msg_len: int = 0
     run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    turn_count: int = 0
+    context_prefix: list[Message] = field(default_factory=list)
+    context_prefix_valid: bool = False
 
 
 def new_session_runtime(
@@ -197,16 +199,13 @@ class Agent:
         cancel: asyncio.Event | None = None,
     ) -> AsyncIterator[Event]:
         cancel = cancel or asyncio.Event()
-        environment = await gather_environment(self._version, self._provider.model)
-        memory_text = (
-            self._memory_manager.load_index()
-            if self._memory_manager is not None
-            else self._memory_text
-        )
-        stable_system = build_system_prompt(
-            self._instruction_text,
-            memory_text,
-            deferred_tools=self._tools.has_deferred(),
+        await self._ensure_context_prefix()
+        stable_system = build_system_prompt(deferred_tools=self._tools.has_deferred())
+        recent_turn = self._recent_turn(conv.messages())
+        memory_reminder = (
+            self._memory_manager.recall(recent_turn[0].content)
+            if self._memory_manager is not None and recent_turn
+            else ""
         )
 
         unknown_run = 0
@@ -229,12 +228,15 @@ class Agent:
                     else ""
                 ),
                 deferred_tools_reminder(self._tools.inactive_names(mode)),
+                memory_reminder,
             )
 
             estimated = estimate_tokens(
                 self._runtime.usage_anchor,
                 conv.messages(),
                 self._runtime.anchor_msg_len,
+                fixed_messages=self._runtime.context_prefix,
+                reminder=reminder,
             )
             limits = build_context_limits(self._runtime.context_window)
             likely_auto = (
@@ -260,6 +262,9 @@ class Agent:
                     trigger=TriggerKind.AUTO,
                 )
             )
+            if managed.compacted:
+                self._invalidate_context_prefix()
+                await self._ensure_context_prefix()
             if likely_auto:
                 yield Event(
                     compact=CompactEvent(
@@ -274,12 +279,9 @@ class Agent:
             while True:
                 round_state = _RoundState()
                 request = Request(
-                    messages=conv.messages(),
+                    messages=self._request_messages(conv),
                     tools=definitions,
-                    system=System(
-                        stable=stable_system,
-                        environment=environment.render(),
-                    ),
+                    system=System(stable=stable_system),
                     reminder=reminder,
                 )
                 async for event in self._stream_events(
@@ -314,6 +316,8 @@ class Agent:
                                 self._runtime.usage_anchor,
                                 conv.messages(),
                                 self._runtime.anchor_msg_len,
+                                fixed_messages=self._runtime.context_prefix,
+                                reminder=reminder,
                             ),
                             trigger=TriggerKind.EMERGENCY,
                         )
@@ -334,9 +338,18 @@ class Agent:
                         emergency.after_tokens,
                     )
                 )
+                if emergency.compacted:
+                    self._invalidate_context_prefix()
+                    await self._ensure_context_prefix()
                 self._runtime.usage_anchor = 0
                 self._runtime.anchor_msg_len = 0
-                retry_estimate = estimate_tokens(0, conv.messages(), 0)
+                retry_estimate = estimate_tokens(
+                    0,
+                    conv.messages(),
+                    0,
+                    fixed_messages=self._runtime.context_prefix,
+                    reminder=reminder,
+                )
                 if retry_estimate >= limits.emergency_retry_threshold:
                     round_state.error = PromptTooLongError("压缩后上下文仍超过安全阈值")
                     break
@@ -422,7 +435,7 @@ class Agent:
         cancel: asyncio.Event,
         state: _RoundState,
     ) -> AsyncIterator[Event]:
-        request.messages = conv.messages()
+        request.messages = self._request_messages(conv)
         request.tools = definitions
         stream = self._call_provider(request).__aiter__()
         cancel_task = asyncio.create_task(cancel.wait())
@@ -493,10 +506,29 @@ class Agent:
         manager = self._memory_manager
         if manager is None:
             return
-        self._runtime.turn_count += 1
         recent_turn = self._recent_turn(conv.messages())
-        if self._runtime.turn_count % 5 == 0 or has_memory_signal(recent_turn):
-            asyncio.create_task(manager.update_async(recent_turn))
+        manager.schedule_update(recent_turn)
+
+    async def _ensure_context_prefix(self) -> None:
+        if self._runtime.context_prefix_valid:
+            return
+        environment = await gather_environment(self._version, self._provider.model)
+        memory_text = (
+            self._memory_manager.load_index()
+            if self._memory_manager is not None
+            else self._memory_text
+        )
+        self._runtime.context_prefix = build_context_prefix(
+            environment.render(), self._instruction_text, memory_text
+        )
+        self._runtime.context_prefix_valid = True
+
+    def _invalidate_context_prefix(self) -> None:
+        self._runtime.context_prefix = []
+        self._runtime.context_prefix_valid = False
+
+    def _request_messages(self, conv: Conversation) -> list[Message]:
+        return [*self._runtime.context_prefix, *conv.messages()]
 
     @staticmethod
     def _recent_turn(messages: list[Message]) -> list[Message]:
@@ -531,6 +563,7 @@ class Agent:
                 self._runtime.usage_anchor,
                 conv.messages(),
                 self._runtime.anchor_msg_len,
+                fixed_messages=self._runtime.context_prefix,
             )
             result = await manage_context(
                 ManageInput(
@@ -551,11 +584,17 @@ class Agent:
             )
             self._runtime.usage_anchor = 0
             self._runtime.anchor_msg_len = 0
+            self._invalidate_context_prefix()
             return result.before_tokens, result.after_tokens
 
     def reset_deferred_tools(self) -> None:
         """在切换会话时清空未持久化的 MCP 激活状态。"""
+        self.reset_session_context()
+
+    def reset_session_context(self) -> None:
+        """恢复或切换会话时清空请求期会话状态。"""
         self._tools.reset()
+        self._invalidate_context_prefix()
 
     async def _execute_events(
         self,

@@ -63,14 +63,13 @@ def fixed_modules() -> list[Module]:
 def optional_modules(
     instructions: str = "", memory: str = "", deferred_tools: bool = False
 ) -> list[Module]:
-    """返回可由启动期指令和长期记忆填充的可选模块。"""
+    """返回按运行能力启用的可选稳定模块。"""
+    _ = instructions, memory
     return [
-        Module("custom_instructions", 80, instructions),
-        Module("active_skills", 90, ""),
-        Module("long_term_memory", 100, memory),
+        Module("active_skills", 80, ""),
         Module(
             "deferred_tools",
-            110,
+            90,
             (
                 "Some MCP tools are deferred. Their names are listed in a temporary "
                 "user message. Before calling a deferred MCP tool, call ToolSearch "

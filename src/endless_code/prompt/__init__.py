@@ -1,5 +1,6 @@
 """模块化 System Prompt、环境信息与运行时提醒。"""
 
+from endless_code.prompt.context import CONTEXT_ACK, build_context_prefix
 from endless_code.prompt.environment import Environment, gather_environment
 from endless_code.prompt.modules import (
     Module,
@@ -48,6 +49,7 @@ def render_banner(version: str, cwd: str) -> str:
 
 __all__ = [
     "CAT_BANNER",
+    "CONTEXT_ACK",
     "EXECUTE_DIRECTIVE",
     "PLAN_MODE_REMINDER",
     "PLAN_REMINDER_BRIEF",
@@ -56,6 +58,7 @@ __all__ = [
     "Environment",
     "Module",
     "assemble_system",
+    "build_context_prefix",
     "build_system_prompt",
     "combine_reminders",
     "deferred_tools_reminder",

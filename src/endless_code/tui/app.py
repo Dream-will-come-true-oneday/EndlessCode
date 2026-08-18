@@ -35,7 +35,7 @@ from endless_code.compact import (
 from endless_code.config import ConfigError, ProviderConfig, effective_context_window
 from endless_code.conversation import Conversation
 from endless_code.llm import Provider, new_provider
-from endless_code.memory import Manager
+from endless_code.memory import Manager, MemoryOverview, ScopeOverview
 from endless_code.permission import Mode, Outcome
 from endless_code.permission.engine import Engine, new_engine
 from endless_code.prompt import EXECUTE_DIRECTIVE
@@ -160,6 +160,7 @@ class EndlessCodeApp(App):
         self._sessions_dir = Path.cwd().resolve() / ".endless-code" / "sessions"
         self._resume_sessions = []
         self._visible_resume_sessions = []
+        self._memory_clear_pending: tuple[str, float] | None = None
         for provider in providers:
             try:
                 secret = provider.resolve_api_key()
@@ -359,6 +360,41 @@ class EndlessCodeApp(App):
         self._streaming.update("正在压缩上下文...")
         self._stream_task = asyncio.create_task(self._consume_force_compact())
 
+    def _command_memory(self, args: list[str]) -> None:
+        if self._state not in (SessionState.IDLE, SessionState.SELECTING):
+            self._write_notice("请等待当前任务完成后再管理记忆。")
+            return
+        manager = self._memory_manager
+        if manager is None:
+            self._write_notice("当前未启用长期记忆。")
+            return
+        if not args:
+            self._memory_clear_pending = None
+            self._write_notice(format_memory_overview(manager.overview()))
+            return
+        if (
+            len(args) != 2
+            or args[0] != "clear"
+            or args[1]
+            not in {
+                "user",
+                "project",
+                "all",
+            }
+        ):
+            self._write_notice("用法：/memory 或 /memory clear user|project|all")
+            return
+        scope = args[1]
+        now = time.monotonic()
+        pending = self._memory_clear_pending
+        if pending is not None and pending[0] == scope and pending[1] >= now:
+            removed = manager.clear(scope)
+            self._memory_clear_pending = None
+            self._write_notice(f"已清空 {scope} 记忆，共删除 {removed} 条。")
+            return
+        self._memory_clear_pending = (scope, now + 30.0)
+        self._write_notice(f"即将清空 {scope} 记忆；请在 30 秒内再次输入同一命令确认。")
+
     def _command_resume(self) -> None:
         if self._state is not SessionState.IDLE:
             self._write_notice("请等待当前任务完成后再恢复会话。")
@@ -423,7 +459,7 @@ class EndlessCodeApp(App):
                 loaded.messages, self._writer.append, self._writer.replace
             )
             if self._agent is not None:
-                self._agent.reset_deferred_tools()
+                self._agent.reset_session_context()
             if self._runtime is not None:
                 self._runtime.session = open_session_context(
                     str(Path.cwd().resolve()), info.id
@@ -790,6 +826,32 @@ def format_compact_notice(event: CompactEvent) -> str:
     if event.err is not None:
         return f"压缩失败: {type(event.err).__name__}: {event.err}"
     return f"已压缩，token 从 {event.before_tokens} 降至 {event.after_tokens}"
+
+
+def format_memory_overview(overview: MemoryOverview) -> str:
+    """渲染两级记忆路径、大小、分类计数与笔记摘要。"""
+    return "\n\n".join(
+        _format_memory_scope(scope) for scope in (overview.user, overview.project)
+    )
+
+
+def _format_memory_scope(scope: ScopeOverview) -> str:
+    counts = (
+        ", ".join(f"{note_type}={count}" for note_type, count in scope.counts.items())
+        or "无"
+    )
+    lines = [
+        f"[{scope.scope}] {scope.directory}",
+        f"大小: {scope.total_bytes} bytes | 分类: {counts}",
+    ]
+    for note in scope.notes:
+        summary = " ".join(note.content.split())[:120]
+        lines.append(
+            f"- [{note.type.value}] {note.title} ({note.filename}) — {summary}"
+        )
+    if not scope.notes:
+        lines.append("- （无记忆）")
+    return "\n".join(lines)
 
 
 def _relative_time(value: datetime) -> str:

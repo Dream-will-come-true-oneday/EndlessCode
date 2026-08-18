@@ -1,9 +1,10 @@
-"""加载 MEWCODE.md，并安全展开其局部 include。"""
+"""加载 ENDLESSCODE.md，并安全展开其局部 include。"""
 
 from dataclasses import dataclass
 from pathlib import Path
 
 _INCLUDE_PREFIX = "@include "
+_INSTRUCTIONS_FILENAME = "ENDLESSCODE.md"
 
 
 @dataclass(frozen=True)
@@ -22,9 +23,9 @@ class Loader:
             else Path.home() / ".config" / "endless-code"
         )
         candidates = [
-            (project_root / "MEWCODE.md", project_root),
-            (project_root / ".endless-code" / "MEWCODE.md", project_root),
-            (user_root / "MEWCODE.md", user_root),
+            (project_root / _INSTRUCTIONS_FILENAME, project_root),
+            (project_root / ".endless-code" / _INSTRUCTIONS_FILENAME, project_root),
+            (user_root / _INSTRUCTIONS_FILENAME, user_root),
         ]
         contents = [
             self._load_file(path, boundary, 1, set())

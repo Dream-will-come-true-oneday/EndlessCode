@@ -10,6 +10,7 @@ from textual.widgets import Footer, Header, Input, RichLog
 
 from endless_code.config import ProviderConfig
 from endless_code.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
+from endless_code.memory import Manager, NoteType, Store, UpdateAction
 from endless_code.permission import Mode, new_engine
 from endless_code.prompt import EXECUTE_DIRECTIVE, PLAN_MODE_REMINDER
 from endless_code.session import Writer
@@ -158,6 +159,56 @@ async def test_input_backspace_deletes_single_char() -> None:
 
 
 @pytest.mark.asyncio
+async def test_memory_command_shows_notes_and_requires_repeat_to_clear(
+    tmp_path,
+) -> None:
+    project_dir = tmp_path / "project-memory"
+    user_dir = tmp_path / "user-memory"
+    Store(str(project_dir)).apply(
+        [
+            UpdateAction(
+                action="create",
+                type=NoteType.PROJECT_KNOWLEDGE.value,
+                title="技术栈",
+                slug="stack",
+                content="Python 3.12",
+            )
+        ]
+    )
+    Store(str(user_dir)).apply(
+        [
+            UpdateAction(
+                action="create",
+                type=NoteType.USER_PREFERENCE.value,
+                title="语言偏好",
+                slug="language",
+                content="使用中文",
+            )
+        ]
+    )
+    manager = Manager(str(project_dir), str(user_dir))
+    provider = FakeProvider([])
+    with patch("endless_code.tui.app.new_provider", return_value=provider):
+        app = EndlessCodeApp(
+            [_config()],
+            new_default_registry(),
+            engine=_engine(),
+            memory_manager=manager,
+        )
+        async with app.run_test() as pilot:
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            app._handle_idle_input("/memory")
+            assert "语言偏好" in _chat_text(app)
+            assert "技术栈" in _chat_text(app)
+
+            app._handle_idle_input("/memory clear user")
+            assert (user_dir / "user_preference_language.md").exists()
+            app._handle_idle_input("/memory clear user")
+            assert not (user_dir / "user_preference_language.md").exists()
+            assert (project_dir / "project_knowledge_stack.md").exists()
+
+
+@pytest.mark.asyncio
 async def test_history_usage_and_iteration_are_updated_once() -> None:
     provider = FakeProvider(
         [
@@ -260,8 +311,8 @@ async def test_deferred_resume_reset_switches_to_selected_persisted_session(
         app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
         async with app.run_test() as pilot:
             await _wait_for_state(app, pilot, SessionState.IDLE)
-            reset_deferred = Mock()
-            app._agent.reset_deferred_tools = reset_deferred
+            reset_context = Mock()
+            app._agent.reset_session_context = reset_context
             app._command_resume()
             assert app.state is SessionState.RESUMING
             app._render_resume_options("恢复")
@@ -272,7 +323,7 @@ async def test_deferred_resume_reset_switches_to_selected_persisted_session(
                 "恢复这条历史",
                 "历史回复",
             ]
-            reset_deferred.assert_called_once_with()
+            reset_context.assert_called_once_with()
 
 
 @pytest.mark.asyncio

@@ -26,8 +26,14 @@ def estimate_tokens(
     anchor: int,
     messages: list[Message],
     anchor_msg_len: int,
+    *,
+    fixed_messages: list[Message] | None = None,
+    reminder: str = "",
 ) -> int:
     """估算锚点之后新增消息的 token 数。"""
     start = min(max(anchor_msg_len, 0), len(messages))
     added_bytes = sum(message_bytes(message) for message in messages[start:])
+    if anchor <= 0:
+        added_bytes += sum(message_bytes(message) for message in fixed_messages or [])
+        added_bytes += len(reminder.encode("utf-8"))
     return max(0, int(anchor)) + math.ceil(added_bytes / ESTIMATE_CHARS_PER_TOKEN)

@@ -155,6 +155,8 @@ mcp_servers:
 | `/do` | 退出计划模式并执行当前计划 |
 | `/compact` | 立即压缩当前会话历史，不等待自动阈值 |
 | `/resume` | 搜索、选择并恢复一个历史会话 |
+| `/memory` | 查看用户级与项目级记忆路径、大小、分类和摘要 |
+| `/memory clear user\|project\|all` | 30 秒内重复输入后清空对应范围的记忆 |
 | `Esc` | 取消当前回合 |
 | `Ctrl+C` | 运行时取消回合，空闲时退出 |
 | `Ctrl+D` | 退出程序 |
@@ -166,30 +168,32 @@ Endless Code 会在每次请求前检查工具结果和会话长度。默认上�
 
 自动压缩阈值按当前窗口动态计算：200K 窗口在约 167K token 触发，1M 窗口在约 835K token 触发；紧急压缩后的重试安全线分别约为 177K 和 885K。摘要会按窗口保留近期原文和恢复附件，并补回当前可用工具和边界提示。界面会显示压缩开始与完成状态。遇到 Provider 报告上下文超限时，程序会先紧急压缩，再仅重试原请求一次。
 
-`/compact` 可在空闲时手动触发摘要。工具原文、会话存档和记忆文件均位于 `.endless-code/`，该目录中的本地配置和 session 数据已被 Git 忽略。
+`/compact` 可在空闲时手动触发摘要。工具原文和会话存档位于 `.endless-code/` 的 Git 忽略目录；项目记忆位于 `.endless-code/memory/`，可按团队需要提交，用户级记忆位于 `~/.config/endless-code/memory/`。
 
 ## 项目指令、会话与长期记忆
 
-Endless Code 会在启动时按优先级读取下列 `MEWCODE.md` 文件，并将内容作为项目指令注入系统提示：
+Endless Code 会在启动时按优先级读取下列 `ENDLESSCODE.md` 文件，并将内容作为项目指令注入请求期历史前缀：
 
-1. `<项目根目录>/MEWCODE.md`
-2. `<项目根目录>/.endless-code/MEWCODE.md`
-3. `~/.config/endless-code/MEWCODE.md`
+1. `<项目根目录>/ENDLESSCODE.md`
+2. `<项目根目录>/.endless-code/ENDLESSCODE.md`
+3. `~/.config/endless-code/ENDLESSCODE.md`
 
 指令文件支持独占一行的 `@include 相对路径`，可拆分代码规范；展开限制为 5 层，并会阻止路径逃逸和循环引用。
 
 每个新会话会写入 `.endless-code/sessions/YYYYMMDD-HHMMSS-xxxx/conversation.jsonl`。消息、工具调用和工具结果会在每次变更后追加并执行 `fsync`，异常中断最多影响最后一行。输入 `/resume` 后可用上下键选择、输入关键词过滤、按 Enter 恢复；恢复后后续消息继续追加到原会话。
 
-新格式会话在启动时异步清理 30 天前的数据，旧格式目录不会被自动删除。Agent 每 5 轮完成后，或用户明确说“记住”“记忆”“remember”“memo”时，会异步提取长期记忆：项目知识存入 `.endless-code/memory/`，跨项目偏好存入 `~/.config/endless-code/memory/`。系统提示仅注入两级 `MEMORY.md` 索引，完整笔记仍可按需用 `read_file` 读取。
+新格式会话在启动时异步清理 30 天前的数据，旧格式目录不会被自动删除。Agent 每次正常完成用户回合后都会异步提取长期记忆，不阻塞下一次输入。用户偏好和纠正反馈写入用户级目录，项目知识和参考资料写入项目级目录；分类到作用域的映射由程序强制执行，模型不能把项目知识写进用户级记忆。
+
+每个会话首次请求时会在真实对话前附加两条不持久化的合成消息，依次提供环境、项目指令、用户级索引和项目级索引；压缩后根据最新文件重建。每个用户请求还会用本地中英文词元检索最多 6 条、合计不超过 8KB 的相关笔记全文，通过临时 reminder 提供给 Agent。合成前缀和召回内容都不会写入 `conversation.jsonl`。用户可直接编辑独立 Markdown 笔记；下一次请求或 `/memory` 会自动重建索引。
 
 ## 系统提示与缓存
 
 稳定系统提示由身份、约束、任务模式、动作执行、工具约定、表达风格和输出格式等模块按优先级组装。工具定义与稳定提示保持固定顺序，便于使用 Provider 的前缀缓存。
 
-每轮请求另外注入：
+请求期上下文另外包含：
 
-- 当前工作目录、平台、日期、版本、模型和可用 Git 状态。
-- 不写入持久化对话历史的 `<system-reminder>`。
+- 会话首次请求和压缩后重建的环境、项目指令与两级记忆索引历史前缀。
+- 不写入持久化对话历史的相关记忆与 MCP 工具目录 `<system-reminder>`。
 - Plan Mode 的完整或精简轮次提醒。
 
 Anthropic 使用 `cache_control.type: ephemeral` 标记稳定 system 块；OpenAI 和 DeepSeek 使用各自返回的缓存 usage 字段。端点不提供缓存字段时，usage 会以 `0` 展示，不影响对话继续。

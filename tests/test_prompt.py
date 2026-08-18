@@ -1,9 +1,11 @@
 import pytest
 
 from endless_code.prompt import (
+    CONTEXT_ACK,
     Environment,
     Module,
     assemble_system,
+    build_context_prefix,
     build_system_prompt,
     combine_reminders,
     deferred_tools_reminder,
@@ -68,11 +70,19 @@ def test_tool_conventions_are_in_stable_prompt() -> None:
     assert "always read the target content" in prompt
 
 
-def test_prompt_includes_non_empty_instructions_and_memory() -> None:
+def test_user_context_is_excluded_from_stable_system_prompt() -> None:
     prompt = build_system_prompt("project rule", "remember this")
-    assert "project rule" in prompt
-    assert "remember this" in prompt
-    assert prompt.index("project rule") < prompt.index("remember this")
+    assert "project rule" not in prompt
+    assert "remember this" not in prompt
+
+
+def test_context_prefix_orders_environment_instructions_and_memory() -> None:
+    prefix = build_context_prefix("cwd=/repo", "project rule", "user then project")
+    assert [message.role for message in prefix] == ["user", "assistant"]
+    content = prefix[0].content
+    assert content.index("cwd=/repo") < content.index("project rule")
+    assert content.index("project rule") < content.index("user then project")
+    assert prefix[1].content == CONTEXT_ACK
 
 
 def test_deferred_system_instruction_is_optional_and_stable() -> None:

@@ -265,6 +265,24 @@ def test_estimate_tokens_clamps_and_rounds() -> None:
     assert estimate_tokens(100, messages, 99) == 100
     assert estimate_tokens(-5, messages, 0) == 2
     assert estimate_tokens(0, messages, -1) == 2
+    with_context = estimate_tokens(
+        0,
+        messages,
+        0,
+        fixed_messages=[Message(role="assistant", content="durable memory")],
+        reminder="recalled note",
+    )
+    assert with_context > estimate_tokens(0, messages, 0)
+    assert (
+        estimate_tokens(
+            100,
+            messages,
+            99,
+            fixed_messages=[Message(role="assistant", content="durable memory")],
+            reminder="recalled note",
+        )
+        == 100
+    )
 
 
 def test_parse_session_time_new_old_and_invalid() -> None:

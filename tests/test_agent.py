@@ -80,11 +80,17 @@ class MemoryRecorder:
     def __init__(self) -> None:
         self.done = asyncio.Event()
         self.messages: list[Message] = []
+        self.index = "remembered context"
+        self.load_count = 0
 
     def load_index(self) -> str:
-        return ""
+        self.load_count += 1
+        return self.index
 
-    async def update_async(self, messages: list[Message]) -> None:
+    def recall(self, query: str) -> str:
+        return f"<system-reminder>recalled: {query}</system-reminder>"
+
+    def schedule_update(self, messages: list[Message]) -> None:
         self.messages = messages
         self.done.set()
 
@@ -286,7 +292,9 @@ async def test_auto_compact_event_uses_window_threshold(
         managed_inputs.append(input_)
         return ManageOutput(input_.estimated_token, input_.estimated_token)
 
-    monkeypatch.setattr("endless_code.agent.estimate_tokens", lambda *_: estimated)
+    monkeypatch.setattr(
+        "endless_code.agent.estimate_tokens", lambda *_, **__: estimated
+    )
     monkeypatch.setattr("endless_code.agent.manage_context", _fake_manage)
     runtime = new_session_runtime(str(tmp_path), context_window)
 
@@ -336,6 +344,8 @@ async def test_multi_round_event_sequence_and_history() -> None:
     assert messages[2].tool_results[0].tool_call_id == "c1"
     assert messages[-1].content == "finished"
     assert [message.role for message in provider.requests[1][0]] == [
+        "user",
+        "assistant",
         "user",
         "assistant",
         "tool",
@@ -984,11 +994,11 @@ async def test_ask_approval_allow_forever_persists(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_explicit_memory_signal_schedules_background_update(tmp_path) -> None:
+async def test_every_normal_turn_schedules_background_memory_update(tmp_path) -> None:
     provider = FakeProvider([[StreamEvent(text="done"), StreamEvent(done=True)]])
     manager = MemoryRecorder()
     conv = Conversation()
-    conv.add_user("请记住我偏好中文回复")
+    conv.add_user("普通请求也应在正常结束后提取")
     agent = Agent(
         provider,
         _registry(),
@@ -999,6 +1009,107 @@ async def test_explicit_memory_signal_schedules_background_update(tmp_path) -> N
     await _run(agent, conv)
     await asyncio.wait_for(manager.done.wait(), timeout=1)
     assert [message.content for message in manager.messages] == [
-        "请记住我偏好中文回复",
+        "普通请求也应在正常结束后提取",
         "done",
     ]
+    assert "recalled:" in provider.requests[0][2]
+
+
+@pytest.mark.asyncio
+async def test_memory_update_receives_complete_tool_turn(tmp_path) -> None:
+    provider = FakeProvider(
+        [
+            [_tool_event("read"), StreamEvent(done=True)],
+            [StreamEvent(text="finished"), StreamEvent(done=True)],
+        ]
+    )
+    manager = MemoryRecorder()
+    conv = Conversation()
+    conv.add_user("inspect with a tool")
+    await _run(
+        Agent(
+            provider,
+            _registry(EchoTool()),
+            runtime=new_session_runtime(str(tmp_path)),
+            memory_manager=manager,  # type: ignore[arg-type]
+        ),
+        conv,
+    )
+
+    assert [message.role for message in manager.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert manager.messages[1].tool_calls[0].id == "read"
+    assert manager.messages[2].tool_results[0].tool_call_id == "read"
+
+
+@pytest.mark.asyncio
+async def test_context_prefix_is_request_only_and_rebuilt_after_compact(
+    tmp_path,
+) -> None:
+    provider = RequestProvider(
+        [
+            [StreamEvent(text="first"), StreamEvent(done=True)],
+            [StreamEvent(text="<summary>brief</summary>"), StreamEvent(done=True)],
+            [StreamEvent(text="second"), StreamEvent(done=True)],
+        ]
+    )
+    manager = MemoryRecorder()
+    writer = Writer(str(tmp_path / "session"), "fake-model")
+    conv = Conversation(writer.append, writer.replace)
+    conv.add_user("initial request")
+    agent = Agent(
+        provider,
+        _registry(),
+        runtime=new_session_runtime(str(tmp_path)),
+        memory_manager=manager,  # type: ignore[arg-type]
+        instruction_text="project instruction",
+    )
+    try:
+        await _run(agent, conv)
+        first_prefix = provider.requests[0].messages[:2]
+        assert [message.role for message in first_prefix] == ["user", "assistant"]
+        assert "project instruction" in first_prefix[0].content
+        assert "remembered context" in first_prefix[0].content
+        assert "project instruction" not in provider.requests[0].system.stable
+
+        manager.index = "updated after compact"
+        await agent.run_force_compact(conv)
+        conv.add_user("continue")
+        await _run(agent, conv)
+    finally:
+        writer.close()
+
+    assert "updated after compact" in provider.requests[2].messages[0].content
+    assert manager.load_count == 2
+    assert all(
+        "project instruction" not in message.content for message in conv.messages()
+    )
+    archive = writer.path.read_text(encoding="utf-8")
+    assert "project instruction" not in archive
+    assert "remembered context" not in archive
+    assert "updated after compact" not in archive
+
+
+@pytest.mark.asyncio
+async def test_error_terminal_does_not_schedule_memory_update(tmp_path) -> None:
+    provider = FakeProvider(
+        [[StreamEvent(err=RuntimeError("failed")), StreamEvent(done=True)]]
+    )
+    manager = MemoryRecorder()
+    conv = Conversation()
+    conv.add_user("do not persist a failed turn")
+
+    await _run(
+        Agent(
+            provider,
+            _registry(),
+            runtime=new_session_runtime(str(tmp_path)),
+            memory_manager=manager,  # type: ignore[arg-type]
+        ),
+        conv,
+    )
+    assert not manager.done.is_set()

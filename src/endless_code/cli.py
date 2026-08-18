@@ -64,6 +64,7 @@ async def _amain() -> int:
         app = EndlessCodeApp(cfg.providers, **app_kwargs)
         await app.run_async()
     finally:
+        await memory_manager.drain(timeout=2.0)
         await asyncio.gather(cleanup_task, return_exceptions=True)
         await mgr.close()
     return 0

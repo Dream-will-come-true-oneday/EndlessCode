@@ -19,8 +19,9 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
+from endless_code.mcp.catalog import McpCatalog
 from endless_code.mcp.config import Config, ServerConfig
-from endless_code.mcp.tool import McpTool, adapt_tool
+from endless_code.mcp.tool import McpSearchTool, McpTool, adapt_tool
 
 # 模块级变量（非常量，便于单测改小）。
 connect_timeout: float = 30.0
@@ -42,10 +43,21 @@ class Manager:
         self._lock = asyncio.Lock()
         self._tools: list[McpTool] = []
         self._connections: list[_Connection] = []
+        self.catalog = McpCatalog()
+        self.search_tool = McpSearchTool(self.catalog, self.activate)
 
     def tools(self) -> list[McpTool]:
         """返回工具列表副本，防外部修改。"""
         return list(self._tools)
+
+    def meta_tools(self) -> list[McpSearchTool]:
+        """Return local read-only MCP discovery tools."""
+        return [self.search_tool]
+
+    def activate(self, names: list[str]) -> list[str]:
+        """Activate catalog entries and return their canonical names."""
+        activated = self.catalog.activate(names)
+        return [entry.name for entry in activated]
 
     async def close(self) -> None:
         """唤醒所有连接退栈；总超时兜底，绝不阻塞退出。"""
@@ -182,14 +194,16 @@ async def _serve_session(
         client_info=mtypes.Implementation(name="endless-code", version=version),
     ) as session:
         await session.initialize()
-        listed = await session.list_tools()
-        adapted = [
-            tool
-            for t in listed.tools
-            if (tool := adapt_tool(name, t, session)) is not None
-        ]
+        adapted: list[McpTool] = []
+        async for listed in _list_tool_pages(session):
+            adapted.extend(
+                tool
+                for t in listed.tools
+                if (tool := adapt_tool(name, t, session)) is not None
+            )
         async with mgr._lock:
             mgr._tools.extend(adapted)
+            mgr.catalog.add_all(adapted)
 
         conn.established.set()
 
@@ -202,3 +216,29 @@ def _httpx_client_with_headers(headers: dict[str, str]) -> Any:
     import httpx
 
     return httpx.AsyncClient(headers=headers)
+
+
+async def _list_tool_pages(session):
+    """Yield every tools/list page across MCP SDK versions."""
+    cursor: str | None = None
+    seen: set[str] = set()
+    while True:
+        if cursor is None:
+            page = await session.list_tools()
+        else:
+            try:
+                from mcp.types import PaginatedRequestParams
+
+                page = await session.list_tools(
+                    params=PaginatedRequestParams(cursor=cursor)
+                )
+            except (TypeError, AttributeError):
+                page = await session.list_tools(cursor=cursor)
+        yield page
+        next_cursor = getattr(page, "next_cursor", None)
+        if next_cursor is None:
+            next_cursor = getattr(page, "nextCursor", None)
+        if not next_cursor or next_cursor in seen:
+            return
+        seen.add(next_cursor)
+        cursor = next_cursor

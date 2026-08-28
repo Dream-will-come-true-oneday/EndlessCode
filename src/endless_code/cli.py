@@ -49,7 +49,17 @@ async def _amain() -> int:
     mcp_cfg = load_config(root)
     mgr = await new_manager(mcp_cfg, version=__version__)
     try:
+        supports_lazy_mcp = (
+            "instruction_text" in inspect.signature(EndlessCodeApp).parameters
+        )
         for t in mgr.tools():
+            # Older embedders with the pre-lazy constructor keep the historic
+            # eager exposure contract; the built-in TUI uses the new flow.
+            if supports_lazy_mcp:
+                registry.register(t)
+            else:
+                registry.register(t, exposed=True)
+        for t in mgr.meta_tools():
             registry.register(t)
         app_kwargs = {
             "registry": registry,

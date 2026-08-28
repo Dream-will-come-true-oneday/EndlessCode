@@ -33,7 +33,7 @@ from endless_code.config import ConfigError, ProviderConfig, effective_context_w
 from endless_code.conversation import Conversation
 from endless_code.llm import Provider, new_provider
 from endless_code.memory import Manager
-from endless_code.permission import Mode, Outcome
+from endless_code.permission import AuditWriter, Mode, Outcome
 from endless_code.permission.engine import Engine, new_engine
 from endless_code.prompt import EXECUTE_DIRECTIVE
 from endless_code.security import redact_sensitive, summarize_tool_args
@@ -154,6 +154,7 @@ class EndlessCodeApp(App):
         self._instruction_text = instruction_text
         self._memory_manager = memory_manager
         self._writer: Writer | None = None
+        self._audit_writer: AuditWriter | None = None
         self._sessions_dir = Path.cwd().resolve() / ".endless-code" / "sessions"
         self._resume_sessions = []
         self._visible_resume_sessions = []
@@ -215,12 +216,24 @@ class EndlessCodeApp(App):
 
     def _activate_provider(self, cfg: ProviderConfig) -> bool:
         try:
+            secret = cfg.resolve_api_key()
+            if self._writer is not None:
+                self._writer.close()
+            if self._audit_writer is not None:
+                self._audit_writer.close()
             self._provider = new_provider(cfg)
             self._runtime = new_session_runtime(
                 str(Path.cwd().resolve()), effective_context_window(cfg)
             )
             self._writer = Writer(
                 self._runtime.session.session_dir, self._provider.model
+            )
+            if secret:
+                self._secrets.add(secret)
+            self._audit_writer = AuditWriter(
+                self._runtime.session.session_dir,
+                self._runtime.session.session_id,
+                secrets=self._secrets,
             )
             self._conv = Conversation(self._writer.append, self._writer.replace)
             if self._memory_manager is not None:
@@ -233,10 +246,8 @@ class EndlessCodeApp(App):
                 self._runtime,
                 memory_manager=self._memory_manager,
                 instruction_text=self._instruction_text,
+                audit_writer=self._audit_writer,
             )
-            secret = cfg.resolve_api_key()
-            if secret:
-                self._secrets.add(secret)
             return True
         except Exception as exc:  # noqa: BLE001
             self._provider = None
@@ -372,6 +383,37 @@ class EndlessCodeApp(App):
         self._render_resume_options("")
         self._input.focus()
 
+    def _command_audit(self) -> None:
+        """显示当前会话最近的脱敏权限审计事件。"""
+        if self._state is not SessionState.IDLE:
+            self._write_notice("请等待当前任务完成后再查看权限审计。")
+            return
+        writer = self._audit_writer
+        if writer is None:
+            self._write_notice("当前会话尚未建立权限审计记录。")
+            return
+        events = writer.recent(50)
+        if not events:
+            self._write_notice("当前会话暂无权限审计记录。")
+            return
+        lines: list[str] = []
+        for item in events:
+            event = self._safe(item.get("event", "unknown"))
+            tool = self._safe(item.get("tool", ""))
+            target = self._safe(item.get("target", ""))
+            risk = self._safe(item.get("risk_level") or item.get("risk", ""))
+            decision = self._safe(item.get("decision", ""))
+            source = self._safe(item.get("rule_source", ""))
+            approval = self._safe(item.get("approval_result", ""))
+            duration = self._safe(item.get("duration_ms", ""))
+            error = self._safe(item.get("is_error", False))
+            lines.append(
+                f"{event} | {tool} | target={target} | risk={risk} "
+                f"| source={source} | decision={decision} | approval={approval} "
+                f"| duration_ms={duration} | error={error}"
+            )
+        self._chat.write(Panel("\n".join(lines), title="权限审计"))
+
     def on_input_changed(self, event: Input.Changed) -> None:
         if self._state is SessionState.RESUMING:
             self._render_resume_options(event.value.strip())
@@ -413,6 +455,8 @@ class EndlessCodeApp(App):
             old_writer = self._writer
             if old_writer is not None:
                 old_writer.close()
+            if self._audit_writer is not None:
+                self._audit_writer.close()
             self._writer = Writer.open_existing(
                 info.dir, self._provider.model if self._provider else ""
             )
@@ -423,6 +467,13 @@ class EndlessCodeApp(App):
                 self._runtime.session = open_session_context(
                     str(Path.cwd().resolve()), info.id
                 )
+                self._audit_writer = AuditWriter(
+                    self._runtime.session.session_dir,
+                    self._runtime.session.session_id,
+                    secrets=self._secrets,
+                )
+                if self._agent is not None:
+                    self._agent._audit_writer = self._audit_writer
                 threshold = (
                     self._runtime.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
                 )
@@ -513,8 +564,18 @@ class EndlessCodeApp(App):
         lines = [
             f"● {req.name}({args})",
             f"  原因：{req.reason}",
-            "  是否继续？",
         ]
+        explanation = req.explanation
+        if explanation is not None:
+            lines.extend(
+                [
+                    f"  风险：{explanation.risk_level.value}",
+                    f"  目标：{self._safe(explanation.target)}",
+                    f"  规则来源：{self._safe(explanation.rule_source)}",
+                    f"  影响：{self._safe(explanation.impact)}",
+                ]
+            )
+        lines.append("  是否继续？")
         for idx, label in enumerate(
             ["允许本次", "永久允许（写入本地配置）", "拒绝本次"]
         ):
@@ -769,11 +830,15 @@ class EndlessCodeApp(App):
                 await asyncio.gather(task, return_exceptions=True)
         if self._writer is not None:
             self._writer.close()
+        if self._audit_writer is not None:
+            self._audit_writer.close()
         self.exit()
 
     def on_unmount(self) -> None:
         if self._writer is not None:
             self._writer.close()
+        if self._audit_writer is not None:
+            self._audit_writer.close()
 
 
 def format_compact_notice(event: CompactEvent) -> str:

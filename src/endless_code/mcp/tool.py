@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import sys
+from collections.abc import Callable
 from typing import Any, Protocol
 
 import mcp.types as mtypes
@@ -36,10 +37,12 @@ class McpTool:
         schema: dict[str, Any],
         read_only: bool,
         caller: CallerSession,
+        exposed: bool = False,
     ) -> None:
         self.full_name = full_name  # "mcp__<server>__<tool>"
         self.remote_name = remote_name  # server 上的原始工具名
         self.read_only = read_only  # 仅来自远端 annotations.read_only_hint==True
+        self.exposed = exposed
         self._description = description
         self._schema = schema
         self.caller = caller  # 协议形式持有，便于单测注入 stub
@@ -92,6 +95,78 @@ class McpTool:
         return Result(content="\n".join(texts), is_error=bool(result.is_error))
 
 
+class McpSearchTool:
+    """Read-only meta-tool for discovering and activating MCP tools."""
+
+    read_only = True
+
+    def __init__(self, catalog, activator: Callable[[list[str]], object] | None = None):
+        self.catalog = catalog
+        self._activator = activator
+
+    def name(self) -> str:
+        return "mcp_search_tools"
+
+    def description(self) -> str:
+        return (
+            "Search the local MCP tool directory by server, name, or description; "
+            "matching tools are activated for the next request."
+        )
+
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Keywords to search"},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "default": 5,
+                },
+            },
+            "required": ["query"],
+        }
+
+    async def execute(self, args: str) -> Result:
+        data = _parse_args(args)
+        if data is None:
+            return Result(content="mcp_search_tools 参数 JSON 解析失败", is_error=True)
+        if "query" not in data:
+            return Result(content="mcp_search_tools 缺少 query 参数", is_error=True)
+        query = data.get("query", "")
+        if not isinstance(query, str):
+            return Result(
+                content="mcp_search_tools 的 query 必须是字符串", is_error=True
+            )
+        limit = data.get("limit", 5)
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 10
+        ):
+            return Result(
+                content="mcp_search_tools 的 limit 必须是 1 到 10 的整数", is_error=True
+            )
+        matches = self.catalog.search(query, limit)
+        names = [entry.name for entry in matches]
+        if self._activator is not None:
+            self._activator(names)
+        else:
+            self.catalog.activate(names)
+        payload = [
+            {"name": entry.name, "description": _short_description(entry.description)}
+            for entry in matches
+        ]
+        if not payload:
+            return Result(content="没有找到匹配的 MCP 工具，请换一个关键词。")
+        return Result(
+            content=json.dumps(
+                {"tools": payload}, ensure_ascii=False, separators=(",", ":")
+            )
+        )
+
+
 def _parse_args(raw: str) -> dict[str, Any] | None:
     """把 agent 传来的 JSON 字符串解析为 dict；空/非法返回 None。"""
     s = raw.strip() or "{}"
@@ -134,3 +209,10 @@ def adapt_tool(
         read_only=read_only,
         caller=session,
     )
+
+
+def _short_description(description: str, limit: int = 240) -> str:
+    text = " ".join(description.split())
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text

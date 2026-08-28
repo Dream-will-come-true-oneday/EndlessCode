@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
@@ -39,7 +40,14 @@ from endless_code.llm import (
     Usage,
 )
 from endless_code.memory import Manager, has_memory_signal
-from endless_code.permission import Decision, Mode, Outcome
+from endless_code.permission import (
+    AuditWriter,
+    Decision,
+    Mode,
+    Outcome,
+    PermissionExplanation,
+)
+from endless_code.permission.audit import audit_args_summary
 from endless_code.permission.engine import Engine, new_engine
 from endless_code.prompt import build_system_prompt, gather_environment, plan_reminder
 from endless_code.tool import Registry, Result
@@ -136,6 +144,7 @@ class ApprovalRequest:
     args: str
     reason: str
     respond: asyncio.Future[Outcome]
+    explanation: PermissionExplanation | None = None
 
 
 @dataclass
@@ -166,6 +175,7 @@ class Agent:
         memory_manager: Manager | None = None,
         instruction_text: str = "",
         memory_text: str = "",
+        audit_writer: AuditWriter | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -175,6 +185,7 @@ class Agent:
         self._memory_manager = memory_manager
         self._instruction_text = instruction_text
         self._memory_text = memory_text
+        self._audit_writer = audit_writer
 
     async def run(
         self,
@@ -588,19 +599,25 @@ class Agent:
                     task_indices: dict[asyncio.Task[Result], int] = {}
                     for current in batch_indices:
                         call = calls[current]
+                        explanation = self._engine.explain(mode, call, True)
+                        self._audit_permission(call, explanation)
                         if self._registry.get(call.name) is None:
                             state.results[current] = Result(
                                 content=f"未知工具: {call.name}", is_error=True
                             )
+                            self._audit_approval(call, explanation, "not_required")
                             continue
-                        decision, reason = self._engine.check(mode, call, True)
+                        decision = explanation.decision
+                        reason = explanation.reason
                         if decision is Decision.DENY:
                             state.results[current] = Result(
                                 content=reason, is_error=True
                             )
+                            self._audit_approval(call, explanation, "not_required")
                             continue
+                        self._audit_approval(call, explanation, "not_required")
                         task = asyncio.create_task(
-                            self._registry.execute(call.name, call.input)
+                            self._execute_call(call, explanation)
                         )
                         active_tasks.add(task)
                         task_indices[task] = current
@@ -640,20 +657,26 @@ class Agent:
                 else:
                     for current in batch_indices:
                         call = calls[current]
+                        explanation = self._engine.explain(mode, call, False)
+                        self._audit_permission(call, explanation)
                         if self._registry.get(call.name) is None:
                             state.results[current] = Result(
                                 content=f"未知工具: {call.name}", is_error=True
                             )
+                            self._audit_approval(call, explanation, "not_required")
                             continue
-                        decision, reason = self._engine.check(mode, call, False)
+                        decision = explanation.decision
+                        reason = explanation.reason
                         if decision is Decision.DENY:
                             state.results[current] = Result(
                                 content=reason, is_error=True
                             )
+                            self._audit_approval(call, explanation, "not_required")
                             continue
                         if decision is Decision.ALLOW:
+                            self._audit_approval(call, explanation, "not_required")
                             result = await self._await_serial_call(
-                                call, cancel, cancel_task
+                                call, cancel, cancel_task, explanation
                             )
                             if result is None:
                                 state.completed = False
@@ -673,13 +696,15 @@ class Agent:
                                 args=call.input,
                                 reason=reason,
                                 respond=respond,
+                                explanation=explanation,
                             )
                         )
                         outcome = await respond
+                        self._audit_approval(call, explanation, outcome)
 
                         if outcome is Outcome.ALLOW_ONCE:
                             result = await self._await_serial_call(
-                                call, cancel, cancel_task
+                                call, cancel, cancel_task, explanation
                             )
                             if result is None:
                                 state.completed = False
@@ -696,7 +721,7 @@ class Agent:
                                     "持久化放行规则失败: %s", call.name, exc_info=True
                                 )
                             result = await self._await_serial_call(
-                                call, cancel, cancel_task
+                                call, cancel, cancel_task, explanation
                             )
                             if result is None:
                                 state.completed = False
@@ -745,9 +770,18 @@ class Agent:
         call: ToolCall,
         cancel: asyncio.Event,
         cancel_task: asyncio.Task,
+        explanation: PermissionExplanation | None = None,
     ) -> Result | None:
         """执行单个有副作用工具，支持外部取消；取消返回 None。"""
-        tool_task = asyncio.create_task(self._registry.execute(call.name, call.input))
+        tool_task = asyncio.create_task(
+            self._execute_call(
+                call,
+                explanation
+                or self._engine.explain(
+                    Mode.DEFAULT, call, self._registry.is_read_only(call.name)
+                ),
+            )
+        )
         try:
             done, _ = await asyncio.wait(
                 {tool_task, cancel_task},
@@ -765,6 +799,92 @@ class Agent:
             tool_task.cancel()
             await asyncio.gather(tool_task, return_exceptions=True)
             raise
+
+    async def _execute_call(
+        self, call: ToolCall, explanation: PermissionExplanation
+    ) -> Result:
+        """Execute a permitted call and emit start/finish audit records."""
+        started = time.monotonic()
+        self._audit_event("execution_started", call, explanation)
+        try:
+            result = await self._registry.execute(call.name, call.input)
+        except asyncio.CancelledError:
+            self._audit_event(
+                "execution_finished",
+                call,
+                explanation,
+                result=NOTICE_CANCELLED,
+                duration_ms=(time.monotonic() - started) * 1000,
+                is_error=True,
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001
+            result = Result(content=f"工具 {call.name} 异常: {exc}", is_error=True)
+        self._audit_event(
+            "execution_finished",
+            call,
+            explanation,
+            result=result.content,
+            duration_ms=(time.monotonic() - started) * 1000,
+            is_error=result.is_error,
+        )
+        return result
+
+    def _audit_permission(
+        self, call: ToolCall, explanation: PermissionExplanation
+    ) -> None:
+        self._audit_event("permission_checked", call, explanation)
+
+    def _audit_approval(
+        self,
+        call: ToolCall,
+        explanation: PermissionExplanation,
+        approval_result: object,
+    ) -> None:
+        self._audit_event(
+            "approval_responded",
+            call,
+            explanation,
+            approval_result=approval_result,
+        )
+
+    def _audit_event(
+        self,
+        event: str,
+        call: ToolCall,
+        explanation: PermissionExplanation,
+        *,
+        approval_result: object = "",
+        result: object = None,
+        duration_ms: float | None = None,
+        is_error: bool = False,
+    ) -> None:
+        writer = self._audit_writer
+        if writer is None:
+            return
+        try:
+            writer.record(
+                event,
+                call_id=call.id,
+                tool=call.name,
+                target=explanation.target,
+                mode=explanation.mode,
+                category=explanation.category,
+                read_only=explanation.read_only,
+                decision=explanation.decision,
+                approval_result=approval_result,
+                risk_level=explanation.risk_level,
+                rule_source=explanation.rule_source,
+                reason=explanation.reason,
+                args_summary=audit_args_summary(call.name, call.input),
+                result_summary=result,
+                duration_ms=duration_ms,
+                is_error=is_error,
+            )
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "记录权限审计失败: %s/%s", event, call.name, exc_info=True
+            )
 
     async def _cancel_remaining(
         self,

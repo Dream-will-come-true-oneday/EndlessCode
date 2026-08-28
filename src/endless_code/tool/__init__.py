@@ -51,13 +51,36 @@ class Registry:
     def __init__(self) -> None:
         self._order: list[str] = []
         self._tools: dict[str, Tool] = {}
+        self._exposure_overrides: dict[str, bool] = {}
 
-    def register(self, t: Tool) -> None:
+    def register(self, t: Tool, *, exposed: bool | None = None) -> None:
         n = t.name()
         if n in self._tools:
             raise ValueError(f"工具名重复: {n}")
         self._order.append(n)
         self._tools[n] = t
+        if exposed is not None:
+            self._exposure_overrides[n] = exposed
+
+    def is_exposed(self, name: str) -> bool:
+        """Return whether a registered tool may be sent to the model."""
+        tool = self.get(name)
+        if tool is None:
+            return False
+        if name in self._exposure_overrides:
+            return self._exposure_overrides[name]
+        return bool(getattr(tool, "exposed", True))
+
+    def activate(self, names: str | list[str]) -> list[str]:
+        """Expose one or more registered tools; repeated activation is harmless."""
+        values = [names] if isinstance(names, str) else names
+        activated: list[str] = []
+        for name in values:
+            if self.get(name) is None:
+                continue
+            self._exposure_overrides[name] = True
+            activated.append(name)
+        return activated
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
@@ -70,6 +93,7 @@ class Registry:
                 input_schema=self._tools[n].parameters(),
             )
             for n in self._order
+            if self.is_exposed(n)
         ]
 
     def read_only_definitions(self) -> list[ToolDefinition]:
@@ -81,7 +105,7 @@ class Registry:
                 input_schema=self._tools[n].parameters(),
             )
             for n in self._order
-            if self._tools[n].read_only
+            if self._tools[n].read_only and self.is_exposed(n)
         ]
 
     def is_read_only(self, name: str) -> bool:
@@ -95,6 +119,14 @@ class Registry:
         tool = self.get(name)
         if tool is None:
             return Result(content=f"未知工具: {name}", is_error=True)
+        if not self.is_exposed(name):
+            return Result(
+                content=(
+                    f"MCP 工具 {name} 尚未加载，请先使用 mcp_search_tools "
+                    "搜索并激活它。"
+                ),
+                is_error=True,
+            )
         try:
             return await asyncio.wait_for(tool.execute(args), timeout)
         except TimeoutError:

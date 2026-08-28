@@ -1,6 +1,6 @@
 """权限系统：四档模式、三级规则与五层防御。"""
 
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 
 
 class Mode(IntEnum):
@@ -56,6 +56,15 @@ class Category(IntEnum):
     EXEC = 2
 
 
+class RiskLevel(StrEnum):
+    """确定性权限风险等级。"""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
 class Outcome(IntEnum):
     """人在回路三选一结果。"""
 
@@ -68,8 +77,9 @@ class ApprovalError(Exception):
     """人在回路或规则写入异常。"""
 
 
+from .audit import AuditWriter, audit_args_summary
 from .blacklist import hits_blacklist
-from .engine import Engine, check, mode_fallback, new_engine
+from .engine import Engine, PermissionExplanation, check, mode_fallback, new_engine
 from .persist import persist_local_allow, rule_for
 from .rule import Rule, RuleSet, match_pattern, parse_rule
 from .sandbox import eval_symlinks_or_ancestor, resolve_root, sandbox_ok
@@ -86,16 +96,20 @@ from .settings import (
 
 __all__ = [
     "ApprovalError",
+    "AuditWriter",
     "Category",
     "Decision",
     "Engine",
     "Mode",
     "Outcome",
+    "PermissionExplanation",
     "PermissionsBlock",
+    "RiskLevel",
     "Rule",
     "RuleSet",
     "Settings",
     "SettingsError",
+    "audit_args_summary",
     "categorize",
     "check",
     "eval_symlinks_or_ancestor",

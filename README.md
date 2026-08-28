@@ -32,6 +32,18 @@ Endless Code 是一个运行在终端中的智能编程助手。它以可取消�
 
 实现采用“本地目录搜索 + 下一轮激活”的边界：MCP 客户端仍需完整发现远端元数据，延迟发生在 Registry 向模型导出 schema 的阶段。每轮请求的延迟工具目录消息只存在于 API 请求，不进入会话历史、压缩、恢复或 JSONL；默认每次搜索最多激活 5 个工具，可通过 `limit` 控制在 1 到 10 个之间。
 
+### MCP 延迟加载请求流程
+
+1. MCP 客户端启动时通过 `tools/list` 分页发现工具，将名称、服务、描述、只读标记和完整 schema 缓存在进程内目录。
+2. Agent 构建 API 请求时，`tools` 数组只包含内置工具、`mcp_search_tools` 和已激活工具的完整 schema，不包含其他延迟工具的 schema。
+3. 系统提示明确告诉模型：未加载的 MCP 工具必须先通过 ToolSearch 查询；同一轮请求额外携带一条临时 user message，列出所有未加载工具名称。
+4. 模型调用 `mcp_search_tools` 后，客户端将命中工具加入 `activated_tools` 集合；下一轮请求重新生成 `tools` 数组，自动带入这些工具的完整 schema。
+5. `activated_tools` 只在当前进程内生效；临时 user message 不进入 `Conversation`，也不会写入会话日志或参与上下文压缩。
+
+### 五层权限拦截流程
+
+工具调用按顺序经过危险命令黑名单、项目路径沙箱、三级权限规则、权限模式和 HITL 审批。权限引擎在同一次裁决中生成风险等级、操作目标、规则来源和影响说明，审批界面与审计日志复用同一份解释结果。每次调用按 `permission_checked`、`approval_responded`、`execution_started`、`execution_finished` 记录生命周期事件，参数和结果只保留脱敏摘要。
+
 ## 支持的 Provider
 
 | Provider | 配置方式 | 特性 |

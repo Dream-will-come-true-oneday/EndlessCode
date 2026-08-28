@@ -61,6 +61,8 @@ def test_tool_conventions_are_in_stable_prompt() -> None:
     prompt = build_system_prompt()
     assert "Prefer dedicated read_file" in prompt
     assert "always read the target content" in prompt
+    assert "Some MCP tools are not loaded" in prompt
+    assert "ToolSearch" in prompt
 
 
 def test_prompt_includes_non_empty_instructions_and_memory() -> None:

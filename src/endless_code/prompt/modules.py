@@ -46,6 +46,13 @@ def fixed_modules() -> list[Module]:
             "always read the target content with read_file.",
         ),
         Module(
+            "mcp_tool_discovery",
+            55,
+            "Some MCP tools are not loaded in the current request. When a deferred "
+            "MCP capability is needed, first use ToolSearch (mcp_search_tools) to "
+            "query and activate it; do not call a deferred tool directly.",
+        ),
+        Module(
             "tone_style",
             60,
             "Give concise, accurate answers. Use markdown only when it improves "

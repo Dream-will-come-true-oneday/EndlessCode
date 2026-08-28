@@ -52,6 +52,8 @@ class Registry:
         self._order: list[str] = []
         self._tools: dict[str, Tool] = {}
         self._exposure_overrides: dict[str, bool] = {}
+        self._deferred_tools: set[str] = set()
+        self._activated_tools: set[str] = set()
 
     def register(self, t: Tool, *, exposed: bool | None = None) -> None:
         n = t.name()
@@ -61,12 +63,44 @@ class Registry:
         self._tools[n] = t
         if exposed is not None:
             self._exposure_overrides[n] = exposed
+        if exposed is False or (
+            exposed is None and getattr(t, "exposed", True) is False
+        ):
+            self._deferred_tools.add(n)
+        if n == "mcp_search_tools" and hasattr(t, "set_activator"):
+            t.set_activator(self._activate_from_search)
+
+    def _activate_from_search(self, names: list[str]) -> list[str]:
+        """Activate names in both Registry state and the search catalog."""
+        activated = self.activate(names)
+        search_tool = self.get("mcp_search_tools")
+        catalog = getattr(search_tool, "catalog", None)
+        if catalog is not None:
+            catalog.activate(activated)
+        return activated
+
+    @property
+    def activated_tools(self) -> set[str]:
+        """Return a copy of the process-local deferred-tool activation set."""
+        return set(self._activated_tools)
+
+    def deferred_mcp_names(self) -> list[str]:
+        """Return deferred MCP names that are not active yet, in stable order."""
+        return sorted(
+            name
+            for name in self._deferred_tools
+            if name.startswith("mcp__") and name not in self._activated_tools
+        )
 
     def is_exposed(self, name: str) -> bool:
         """Return whether a registered tool may be sent to the model."""
         tool = self.get(name)
         if tool is None:
             return False
+        if name in self._deferred_tools:
+            return name in self._activated_tools and bool(
+                getattr(tool, "exposed", True)
+            )
         if name in self._exposure_overrides:
             return self._exposure_overrides[name]
         return bool(getattr(tool, "exposed", True))
@@ -78,7 +112,11 @@ class Registry:
         for name in values:
             if self.get(name) is None:
                 continue
+            self._activated_tools.add(name)
             self._exposure_overrides[name] = True
+            tool = self._tools[name]
+            if hasattr(tool, "exposed"):
+                tool.exposed = True
             activated.append(name)
         return activated
 

@@ -104,6 +104,10 @@ class McpSearchTool:
         self.catalog = catalog
         self._activator = activator
 
+    def set_activator(self, activator: Callable[[list[str]], object]) -> None:
+        """Bind the client registry activation callback after registration."""
+        self._activator = activator
+
     def name(self) -> str:
         return "mcp_search_tools"
 

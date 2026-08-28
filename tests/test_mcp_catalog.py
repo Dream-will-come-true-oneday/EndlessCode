@@ -95,9 +95,11 @@ class _AgentProvider:
 
     def __init__(self):
         self.requests = []
+        self.messages = []
 
     async def stream(self, messages, tools, system_suffix=""):
         self.requests.append(list(tools))
+        self.messages.append(list(messages))
         if len(self.requests) == 1:
             yield StreamEvent(
                 tool_calls=[
@@ -152,3 +154,14 @@ async def test_agent_search_then_call_exposes_schema_next_iteration(tmp_path) ->
         "mcp__demo__search",
         "mcp_search_tools",
     ]
+    assert "mcp__demo__search" in provider.messages[0][-1].content
+    assert provider.messages[0][-1].role == "user"
+    assert not any(
+        message.content.startswith("以下 MCP 工具尚未加载")
+        for message in conv.messages()
+    )
+    assert not any(
+        message.content.startswith("以下 MCP 工具尚未加载")
+        for message in provider.messages[1]
+    )
+    assert registry.activated_tools == {"mcp__demo__search"}

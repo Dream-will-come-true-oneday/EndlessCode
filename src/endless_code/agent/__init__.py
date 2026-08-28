@@ -1,6 +1,7 @@
 """Agent 层：可取消的 ReAct 循环、保序工具调度与权限人在回路。"""
 
 import asyncio
+import copy
 import inspect
 import json
 import logging
@@ -60,6 +61,10 @@ NOTICE_UNKNOWN_TOOLS = "（连续多轮只请求到未注册的工具，自动�
 NOTICE_STREAM_ERROR = "（请求出错，本轮已中断。）"
 NOTICE_CANCELLED = "（已取消。）"
 NOTICE_EMPTY_FINAL = "（任务已结束，模型未返回文本。）"
+DEFERRED_TOOLS_MESSAGE = (
+    "以下 MCP 工具尚未加载；如果任务需要其中某个工具，请先使用 "
+    "ToolSearch（mcp_search_tools）查询并激活：\n"
+)
 
 
 class Phase(Enum):
@@ -276,7 +281,7 @@ class Agent:
             while True:
                 round_state = _RoundState()
                 request = Request(
-                    messages=conv.messages(),
+                    messages=self._request_messages(conv),
                     tools=definitions,
                     system=System(
                         stable=stable_system,
@@ -423,7 +428,7 @@ class Agent:
         cancel: asyncio.Event,
         state: _RoundState,
     ) -> AsyncIterator[Event]:
-        request.messages = conv.messages()
+        request.messages = self._request_messages(conv)
         request.tools = definitions
         stream = self._call_provider(request).__aiter__()
         cancel_task = asyncio.create_task(cancel.wait())
@@ -829,6 +834,20 @@ class Agent:
             is_error=result.is_error,
         )
         return result
+
+    def _request_messages(self, conv: Conversation) -> list[Message]:
+        """Build provider-only messages without mutating persisted conversation."""
+        messages = copy.deepcopy(conv.messages())
+        deferred_names = self._registry.deferred_mcp_names()
+        if deferred_names:
+            names = "\n".join(f"- {name}" for name in deferred_names)
+            messages.append(
+                Message(
+                    role="user",
+                    content=f"{DEFERRED_TOOLS_MESSAGE}{names}",
+                )
+            )
+        return messages
 
     def _audit_permission(
         self, call: ToolCall, explanation: PermissionExplanation

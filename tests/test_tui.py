@@ -449,3 +449,80 @@ async def test_approval_state_and_forever_response(tmp_path) -> None:
             await _wait_for_state(app, pilot, SessionState.IDLE)
             local = tmp_path / ".endless-code" / "settings.local.yaml"
             assert "Write(src/x.py)" in local.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_status_command_shows_info_without_ai_request() -> None:
+    """命令输入被本地分流消费：不产生 AI 请求，状态栏含命令提示。"""
+    provider = FakeProvider([])
+    with patch("endless_code.tui.app.new_provider", return_value=provider):
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+        async with app.run_test() as pilot:
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            app._handle_idle_input("/status")
+            await pilot.pause()
+            assert app.state is SessionState.IDLE
+            assert provider.requests == []
+            assert "/help" in app.sub_title
+            assert "fake-model" in _chat_text(app)
+
+
+@pytest.mark.asyncio
+async def test_unknown_command_guides_to_help_without_ai() -> None:
+    provider = FakeProvider([])
+    with patch("endless_code.tui.app.new_provider", return_value=provider):
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+        async with app.run_test() as pilot:
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            app._handle_idle_input("/nomatch")
+            await pilot.pause()
+            assert provider.requests == []
+            assert "未知命令" in _chat_text(app)
+            assert "/help" in _chat_text(app)
+
+
+@pytest.mark.asyncio
+async def test_clear_command_resets_conversation_and_file(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    provider = FakeProvider([])
+    with patch("endless_code.tui.app.new_provider", return_value=provider):
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+        async with app.run_test() as pilot:
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            app._conv.add_user("旧对话")
+            app._conv.add_assistant("旧回复")
+            assert app._conv.length() == 2
+
+            app._handle_idle_input("/clear")
+            await pilot.pause()
+            assert app._conv.length() == 2
+            assert "/clear yes" in _chat_text(app)
+
+            app._handle_idle_input("/clear yes")
+            await pilot.pause()
+            assert app._conv.length() == 0
+            assert app._writer is not None
+            assert app._writer.path.stat().st_size == 0
+            assert "已清空当前会话" in _chat_text(app)
+
+
+@pytest.mark.asyncio
+async def test_tab_completion_single_and_multi_match() -> None:
+    app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+    async with app.run_test() as pilot:
+        await _wait_for_state(app, pilot, SessionState.IDLE)
+        inp = app.query_one("#user-input", Input)
+
+        inp.value = "/pe"
+        app.action_complete_command()
+        await pilot.pause()
+        assert inp.value == "/pe"
+        assert "/perm" in _chat_text(app) and "/permissions" in _chat_text(app)
+
+        inp.value = "/st"
+        app.action_complete_command()
+        await pilot.pause()
+        assert inp.value == "/status "
+        assert inp.cursor_position == len("/status ")

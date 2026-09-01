@@ -27,6 +27,12 @@ from endless_code.agent import (
     SessionRuntime,
     new_session_runtime,
 )
+from endless_code.command import (
+    Dispatcher,
+    Registry,
+    SessionInfo,
+    register_builtin_commands,
+)
 from endless_code.compact import estimate_tokens, open_session_context
 from endless_code.compact.const import AUTO_SAFETY_MARGIN, SUMMARY_RESERVE
 from endless_code.config import ConfigError, ProviderConfig, effective_context_window
@@ -38,8 +44,8 @@ from endless_code.permission.engine import Engine, new_engine
 from endless_code.prompt import EXECUTE_DIRECTIVE
 from endless_code.security import redact_sensitive, summarize_tool_args
 from endless_code.session import Writer, list_sessions, load_session
-from endless_code.tool import Registry, new_default_registry
-from endless_code.tui.commands import dispatch_command
+from endless_code.tool import Registry as ToolRegistry
+from endless_code.tool import new_default_registry
 
 MODE_LABELS = {
     Mode.DEFAULT: "DEFAULT",
@@ -117,12 +123,13 @@ class EndlessCodeApp(App):
         ("ctrl+c", "cancel_or_quit", "取消/退出"),
         ("escape", "cancel_turn", "取消本轮"),
         ("shift+tab", "cycle_mode", "切换权限模式"),
+        ("tab", "complete_command", "补全命令"),
     ]
 
     def __init__(
         self,
         providers: list[ProviderConfig],
-        registry: Registry | None = None,
+        registry: ToolRegistry | None = None,
         version: str = __version__,
         engine: Engine | None = None,
         instruction_text: str = "",
@@ -158,6 +165,11 @@ class EndlessCodeApp(App):
         self._sessions_dir = Path.cwd().resolve() / ".endless-code" / "sessions"
         self._resume_sessions = []
         self._visible_resume_sessions = []
+        self._last_error = ""
+        self._last_reply = ""
+        self._command_registry = Registry()
+        register_builtin_commands(self._command_registry)
+        self._dispatcher = Dispatcher(self._command_registry, self)
         for provider in providers:
             try:
                 secret = provider.resolve_api_key()
@@ -260,7 +272,7 @@ class EndlessCodeApp(App):
         mode_label = MODE_LABELS.get(self._mode, str(self._mode))
         self.sub_title = (
             f"{mode_label} | {provider_name} | {model} | "
-            f"↑{self._usage_in} ↓{self._usage_out} tok"
+            f"↑{self._usage_in} ↓{self._usage_out} tok | /help 查看命令"
         )
 
     def _write_welcome(self) -> None:
@@ -283,6 +295,7 @@ class EndlessCodeApp(App):
         )
 
     def _write_error(self, err_msg: str) -> None:
+        self._last_error = err_msg
         self._chat.write(Panel(self._safe(err_msg), title="错误", border_style="red"))
 
     def _write_notice(self, text: str) -> None:
@@ -322,7 +335,7 @@ class EndlessCodeApp(App):
             return
         if not text:
             return
-        if dispatch_command(self, text):
+        if self._dispatcher.try_dispatch(text):
             return
         if self._state is SessionState.SELECTING:
             self._handle_select_input(text)
@@ -332,12 +345,9 @@ class EndlessCodeApp(App):
         self._handle_idle_input(text)
 
     def _handle_idle_input(self, text: str) -> None:
-        if dispatch_command(self, text):
+        if self._dispatcher.try_dispatch(text):
             return
         self._start_turn(text)
-
-    def _command_exit(self) -> None:
-        self.exit()
 
     def _command_plan(self) -> None:
         if self._state is not SessionState.IDLE:
@@ -413,6 +423,101 @@ class EndlessCodeApp(App):
                 f"| duration_ms={duration} | error={error}"
             )
         self._chat.write(Panel("\n".join(lines), title="权限审计"))
+
+    # ---- CommandHost 实现：命令系统与渲染层解耦的唯一通道 ----
+
+    def show_notice(self, text: str) -> None:
+        self._write_notice(text)
+
+    def show_error(self, text: str) -> None:
+        self._write_error(text)
+
+    def send_user_message(self, text: str) -> None:
+        self._start_turn(text)
+
+    def get_last_error(self) -> str:
+        return self._last_error
+
+    def get_last_reply(self) -> str:
+        return self._last_reply
+
+    def get_mode(self) -> Mode:
+        return self._mode
+
+    def set_mode(self, mode: Mode) -> None:
+        """切换权限模式并刷新状态栏（仅空闲状态生效）。"""
+        if self._state is not SessionState.IDLE:
+            self._write_notice("当前任务尚未结束，暂不能切换权限模式。")
+            return
+        self._mode = mode
+        self._write_notice(f"已切换到 {MODE_LABELS.get(mode, str(mode))} 模式")
+        self._update_status()
+
+    def get_session_info(self) -> SessionInfo:
+        return SessionInfo(
+            version=self._version,
+            provider=self._provider.name if self._provider else "--",
+            model=self._provider.model if self._provider else "--",
+            mode=MODE_LABELS.get(self._mode, str(self._mode)),
+            tokens_in=self._usage_in,
+            tokens_out=self._usage_out,
+            session_id=(self._runtime.session.session_id if self._runtime else "--"),
+            message_count=self._conv.length(),
+        )
+
+    def get_memory_index(self) -> str:
+        if self._memory_manager is None:
+            return ""
+        return self._memory_manager.load_index()
+
+    def show_audit(self) -> None:
+        self._command_audit()
+
+    def start_compact(self) -> None:
+        self._command_compact()
+
+    def start_resume(self) -> None:
+        self._command_resume()
+
+    def enter_plan(self) -> None:
+        self._command_plan()
+
+    def start_execute(self) -> None:
+        self._command_do()
+
+    def clear_session(self) -> None:
+        """清空当前会话：重置内存对话并截断会话持久化文件。"""
+        if self._state is not SessionState.IDLE:
+            self._write_notice("当前任务尚未结束，暂不能清空会话。")
+            return
+        if self._writer is None:
+            self._conv = Conversation()
+            self._write_notice("已清空当前会话。")
+            return
+        self._writer.close()
+        with self._writer.path.open("w", encoding="utf-8"):
+            pass
+        model = self._provider.model if self._provider else ""
+        self._writer = Writer(str(self._writer.session_dir), model)
+        self._conv = Conversation(self._writer.append, self._writer.replace)
+        self._write_notice("已清空当前会话。")
+
+    def quit_app(self) -> None:
+        self.exit()
+
+    def action_complete_command(self) -> None:
+        """Tab 补全：唯一匹配写回输入框，多匹配展示候选。"""
+        value = self._input.value
+        if self._state in (SessionState.SELECTING, SessionState.RESUMING):
+            return
+        if not value.startswith("/"):
+            return
+        text, candidates = self._dispatcher.complete(value)
+        if candidates:
+            self._write_notice("候选命令：" + " ".join(candidates))
+        if text != value:
+            self._input.value = text
+            self._input.cursor_position = len(text)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if self._state is SessionState.RESUMING:
@@ -552,6 +657,7 @@ class EndlessCodeApp(App):
         text = self._cur_reply
         self._cur_reply = ""
         if final:
+            self._last_reply = text
             self._write_assistant_message(text)
         else:
             self._chat.write(Markdown(self._safe(text)))

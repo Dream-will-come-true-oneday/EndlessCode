@@ -19,8 +19,8 @@ def spill_single(session: SessionContext, tool_use_id: str, content: str) -> str
     if path.exists():
         return str(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("xb") as output:
-        output.write(content.encode("utf-8"))
+    with path.open("x", encoding="utf-8") as output:
+        output.write(content)
     return str(path)
 
 

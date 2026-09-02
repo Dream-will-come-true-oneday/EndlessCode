@@ -22,12 +22,33 @@ packages = ["src/endless_code"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "pytest-rerunfailures>=14.0",
     "ruff>=0.4",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+addopts = "--strict-markers"
+markers = [
+    "unit: 纯函数/状态机单元测试",
+    "integration: 模块组合集成测试",
+    "e2e: 端到端场景测试（FakeLLM 驱动）",
+    "stability: 失败注入稳定性测试",
+    "perf: 性能/成本基线测试",
+    "eval: 真实模型评测（需要 API key，默认跳过）",
+]
+
+[tool.coverage.run]
+source = ["endless_code"]
+
+[tool.coverage.report]
+fail_under = 85
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+]
 
 [build-system]
 requires = ["hatchling"]

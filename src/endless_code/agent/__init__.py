@@ -453,6 +453,11 @@ class Agent:
                     stream_event = next_task.result()
                 except StopAsyncIteration:
                     return
+                except Exception as exc:  # noqa: BLE001
+                    # Provider 直接抛异常（网络重置等）也走错误恢复路径，
+                    # 不得把异常透传给调用方导致回合任务崩溃。
+                    state.error = exc
+                    return
                 finally:
                     next_task = None
 

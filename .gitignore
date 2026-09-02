@@ -24,6 +24,10 @@ env/
 # uv
 uv.lock
 
+# 评测产物（pytest --cov / evals/runner.py 生成）
+evals/reports/
+.coverage
+
 # OS
 .DS_Store
 Thumbs.db

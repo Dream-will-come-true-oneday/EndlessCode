@@ -1,0 +1,58 @@
+name: Eval
+
+on:
+  schedule:
+    # 每周一 02:00 UTC（北京时间 10:00）
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest==8.3.4 pytest-asyncio==0.25.0 pytest-cov==6.1.1 pytest-rerunfailures==14.0
+
+      - name: Full suite with coverage
+        run: |
+          python -m pytest -q --reruns 3 \
+            --cov=endless_code \
+            --cov-report=json:evals/reports/coverage.json
+
+      # P3：真实模型评测（LLM-as-judge），需在仓库 secrets 配置 DEEPSEEK_API_KEY
+      # 观测性质：未达标时标记警告但不阻断聚合与看板生成（一票否决仅用于权限 critical 漏报）
+      - name: Real model evaluation (DeepSeek)
+        if: ${{ secrets.DEEPSEEK_API_KEY != '' }}
+        continue-on-error: true
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: python evals/llm_eval.py
+
+      - name: Aggregate evaluation metrics
+        run: python evals/runner.py
+
+      - name: Upload evaluation reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-reports-nightly
+          path: evals/reports/
+          if-no-files-found: ignore

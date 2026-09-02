@@ -1,0 +1,9 @@
+You are in PLAN MODE. Use only read_file, glob, and grep to investigate. Do not write or edit files and do not run shell commands. Produce a clear step-by-step plan, then stop and wait for /do.
+
+<<<SEP>>>
+
+PLAN MODE remains active: use only read_file, glob, and grep. Continue investigation and update the execution plan.
+
+<<<SEP>>>
+
+请按上面的计划开始执行。

@@ -92,3 +92,28 @@ def test_completions_exclude_hidden() -> None:
     registry = Registry()
     registry.register(make_spec("/secret", hidden=True))
     assert registry.completions("/sec") == []
+
+
+def test_suggest_matches_name_and_alias_without_duplicates() -> None:
+    registry = Registry()
+    spec = make_spec("/permissions", aliases=("/perm",))
+    registry.register(spec)
+    assert registry.suggest("/per") == [spec]
+
+
+def test_suggest_is_case_insensitive_and_sorted() -> None:
+    registry = Registry()
+    registry.register(make_spec("/memory", aliases=("/mem",)))
+    registry.register(make_spec("/mode"))
+    registry.register(make_spec("/mid"))
+    specs = registry.suggest("/M")
+    assert [spec.name for spec in specs] == ["/memory", "/mid", "/mode"]
+    assert registry.suggest("/mem") == [specs[0]]
+
+
+def test_suggest_excludes_hidden_and_empty_result() -> None:
+    registry = Registry()
+    registry.register(make_spec("/secret", hidden=True))
+    registry.register(make_spec("/open"))
+    assert registry.suggest("/sec") == []
+    assert registry.suggest("/zzz") == []

@@ -6,7 +6,7 @@ import os
 from unittest.mock import patch
 
 import pytest
-from textual.widgets import Footer, Header, Input, RichLog
+from textual.widgets import Footer, Header, Input, OptionList, RichLog
 
 from endless_code.config import ProviderConfig
 from endless_code.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
@@ -526,3 +526,102 @@ async def test_tab_completion_single_and_multi_match() -> None:
         await pilot.pause()
         assert inp.value == "/status "
         assert inp.cursor_position == len("/status ")
+
+
+@pytest.mark.asyncio
+async def test_suggestion_panel_appears_and_filters() -> None:
+    """输入命令前缀实时弹出建议面板，继续输入实时过滤（AC1、AC3）。"""
+    app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+    async with app.run_test() as pilot:
+        await _wait_for_state(app, pilot, SessionState.IDLE)
+        inp = app.query_one("#user-input", Input)
+        panel = app.query_one("#suggest-list", OptionList)
+
+        await pilot.press("/", "m", "e")
+        await pilot.pause()
+        assert not panel.has_class("hidden")
+        # 别名 /mem 与规范名 /memory 指向同一命令，去重后仅剩一个候选
+        assert [spec.name for spec in app._suggest_specs] == ["/memory"]
+
+        await pilot.press("x")
+        await pilot.pause()
+        assert panel.has_class("hidden")
+
+        await pilot.press("backspace", "m")
+        await pilot.pause()
+        assert not panel.has_class("hidden")
+
+        await pilot.press("backspace", "backspace", "backspace", "backspace", "h")
+        await pilot.pause()
+        assert panel.has_class("hidden")
+        assert inp.value == "h"
+
+
+@pytest.mark.asyncio
+async def test_suggestion_enter_executes_command() -> None:
+    """Enter 直接执行高亮命令：无 AI 请求、输入清空、面板关闭（AC2）。"""
+    provider = FakeProvider([])
+    with patch("endless_code.tui.app.new_provider", return_value=provider):
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+        async with app.run_test() as pilot:
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            inp = app.query_one("#user-input", Input)
+            panel = app.query_one("#suggest-list", OptionList)
+
+            await pilot.press("/", "s", "t")
+            await pilot.pause()
+            assert not panel.has_class("hidden")
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert panel.has_class("hidden")
+            assert inp.value == ""
+            assert provider.requests == []
+            assert "fake-model" in _chat_text(app)
+
+
+@pytest.mark.asyncio
+async def test_suggestion_escape_keeps_input() -> None:
+    """Esc 关闭面板且输入保留，重新输入面板复现（AC3）。"""
+    app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+    async with app.run_test() as pilot:
+        await _wait_for_state(app, pilot, SessionState.IDLE)
+        inp = app.query_one("#user-input", Input)
+        panel = app.query_one("#suggest-list", OptionList)
+
+        await pilot.press("/", "s", "t")
+        await pilot.pause()
+        assert not panel.has_class("hidden")
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert panel.has_class("hidden")
+        assert inp.value == "/st"
+
+        await pilot.press("a")
+        await pilot.pause()
+        assert not panel.has_class("hidden")
+
+
+@pytest.mark.asyncio
+async def test_suggestion_down_then_enter_executes_second() -> None:
+    """↓ 移动高亮后 Enter 执行第二个候选（AC2、AC5 别名命中去重）。"""
+    app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+    async with app.run_test() as pilot:
+        await _wait_for_state(app, pilot, SessionState.IDLE)
+        panel = app.query_one("#suggest-list", OptionList)
+
+        await pilot.press("/", "c")
+        await pilot.pause()
+        assert [spec.name for spec in app._suggest_specs] == ["/clear", "/compact"]
+
+        await pilot.press("down")
+        await pilot.pause()
+        assert panel.highlighted == 1
+
+        await pilot.press("enter")
+        await pilot.pause()
+        assert panel.has_class("hidden")
+        assert app._suggest_specs == []
+        # 第二个候选 /compact 已执行并输出压缩提示
+        assert "已压缩" in _chat_text(app)

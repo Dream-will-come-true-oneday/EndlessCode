@@ -41,3 +41,16 @@ class Registry:
             for key, spec in self._specs.items()
             if not spec.hidden and key.startswith(needle)
         )
+
+    def suggest(self, prefix: str) -> list[CommandSpec]:
+        """前缀匹配名称或别名的可见命令，按名称排序去重。
+
+        返回 CommandSpec 列表（非字符串），便于调用方直接渲染描述与别名。
+        """
+        needle = prefix.strip().lower()
+        matched = {
+            spec.name: spec
+            for key, spec in self._specs.items()
+            if not spec.hidden and key.startswith(needle)
+        }
+        return [matched[key] for key in sorted(matched)]

@@ -28,9 +28,11 @@ from endless_code.agent import (
     new_session_runtime,
 )
 from endless_code.command import (
+    CommandSpec,
     Dispatcher,
     Registry,
     SessionInfo,
+    parse_command,
     register_builtin_commands,
 )
 from endless_code.compact import estimate_tokens, open_session_context
@@ -116,6 +118,16 @@ class EndlessCodeApp(App):
     #resume-list.hidden, #chat-area.hidden {
         display: none;
     }
+
+#suggest-list {
+        height: auto;
+        max-height: 12;
+        margin: 0 1;
+    }
+
+#suggest-list.hidden {
+        display: none;
+    }
     """
 
     BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
@@ -170,6 +182,7 @@ class EndlessCodeApp(App):
         self._command_registry = Registry()
         register_builtin_commands(self._command_registry)
         self._dispatcher = Dispatcher(self._command_registry, self)
+        self._suggest_specs: list[CommandSpec] = []
         for provider in providers:
             try:
                 secret = provider.resolve_api_key()
@@ -191,6 +204,7 @@ class EndlessCodeApp(App):
         yield VerticalScroll(RichLog(id="chat-area", highlight=True, markup=True))
         yield OptionList(id="resume-list", classes="hidden")
         yield Static("", id="streaming-box", classes="hidden")
+        yield OptionList(id="suggest-list", classes="hidden")
         yield Container(
             Input(placeholder="输入消息…", id="user-input"), id="input-area"
         )
@@ -222,6 +236,10 @@ class EndlessCodeApp(App):
     @property
     def _resume_list(self) -> OptionList:
         return self.query_one("#resume-list", OptionList)
+
+    @property
+    def _suggest_list(self) -> OptionList:
+        return self.query_one("#suggest-list", OptionList)
 
     def _safe(self, text: object) -> str:
         return redact_sensitive(text, self._secrets)
@@ -328,6 +346,9 @@ class EndlessCodeApp(App):
         self._chat.write("[bold red]请输入有效的编号[/]")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        if self._suggest_specs and self._state is SessionState.IDLE:
+            self._accept_suggestion()
+            return
         text = event.value.strip()
         self._input.clear()
         if self._state is SessionState.RESUMING:
@@ -519,9 +540,56 @@ class EndlessCodeApp(App):
             self._input.value = text
             self._input.cursor_position = len(text)
 
+    def _update_suggestions(self, value: str) -> None:
+        """根据输入实时刷新命令建议面板。"""
+        if self._state is not SessionState.IDLE or not value.startswith("/"):
+            self._hide_suggestions()
+            return
+        parsed = parse_command(value)
+        if parsed is None or parsed.args:
+            self._hide_suggestions()
+            return
+        specs = self._command_registry.suggest(parsed.name)
+        if not specs:
+            self._hide_suggestions()
+            return
+        self._suggest_specs = specs
+        options = [
+            Option(
+                f"{spec.name}  {' '.join(spec.aliases)}  — {spec.description}"
+                if spec.aliases
+                else f"{spec.name}  — {spec.description}"
+            )
+            for spec in specs
+        ]
+        self._suggest_list.clear_options()
+        self._suggest_list.add_options(options)
+        self._suggest_list.highlighted = 0
+        self._suggest_list.remove_class("hidden")
+
+    def _hide_suggestions(self) -> None:
+        self._suggest_specs = []
+        self._suggest_list.add_class("hidden")
+        self._suggest_list.clear_options()
+
+    def _accept_suggestion(self) -> None:
+        """执行高亮候选命令并收起建议面板。"""
+        if not self._suggest_specs:
+            return
+        index = self._suggest_list.highlighted
+        if index is None or index < 0 or index >= len(self._suggest_specs):
+            self._hide_suggestions()
+            return
+        spec = self._suggest_specs[index]
+        self._hide_suggestions()
+        self._input.value = ""
+        self._dispatcher.try_dispatch(spec.name)
+
     def on_input_changed(self, event: Input.Changed) -> None:
         if self._state is SessionState.RESUMING:
             self._render_resume_options(event.value.strip())
+        else:
+            self._update_suggestions(event.value)
 
     def _render_resume_options(self, query: str) -> None:
         needle = query.lower()
@@ -619,6 +687,7 @@ class EndlessCodeApp(App):
             self._close_resume()
 
     def _start_turn(self, text: str, *, display_user: bool = True) -> None:
+        self._hide_suggestions()
         if self._provider is None:
             self._write_error("尚未选择可用的 Provider。")
             return
@@ -917,6 +986,18 @@ class EndlessCodeApp(App):
                         self._turn_cancel.set()
                 else:
                     self._update_approving(key)
+                event.stop()
+                return
+        if self._suggest_specs and self._state is SessionState.IDLE:
+            if event.key in ("up", "down"):
+                if event.key == "up":
+                    self._suggest_list.action_cursor_up()
+                else:
+                    self._suggest_list.action_cursor_down()
+                event.stop()
+                return
+            if event.key == "escape":
+                self._hide_suggestions()
                 event.stop()
                 return
         # 注意：这里不能调用 super()._on_key(event)。Textual 的 _get_dispatch_methods

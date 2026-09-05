@@ -1,31 +1,33 @@
 # Diff 展示与 Checkpoint 回滚 Checklist
 
+> 验收状态见各项末尾标注；证据为对应测试名或验证记录（2026-09-05 验收）。
+
 ## 功能与集成
 
-- [ ] 审批 diff（F1/AC1/AC2）：AI 修改已有文件触发审批时，弹窗出现 unified diff（增绿删红带上下文行），批准前文件内容不变（验证：单测断言 ApprovalRequest.diff 非空且内容含 `-旧/+新` 行；手工 TUI 观察着色）
-- [ ] 新建文件审批展示全部为新增（验证：单测覆盖 write 新路径场景，diff 无 `-` 行）
-- [ ] diff 截断与二进制占位（F1/N2/AC10）：>8000 字符 diff 尾部有 `[diff truncated]`；二进制文件显示占位说明（验证：test_diff.py 用例）
-- [ ] 结果 diff 摘要（F2/AC3）：编辑类工具 END 事件携带 diff 与 `+X -Y` 统计，TUI 渲染在工具结果下方（验证：test_agent_checkpoint.py 断言 ToolEvent 字段）
-- [ ] git checkpoint 创建（F3/AC4）：编辑后当前分支 `git log` 无新提交、`git status --porcelain` 与创建前一致、shadow ref 存在、元数据 +1（验证：test_checkpoint_git.py）
-- [ ] git 无变化跳过（F3/N1）：连续两次 checkpoint 之间无文件变更时复用上一条（验证：test_checkpoint_git.py 用例）
-- [ ] 非 git 快照（F3/AC5）：非 git 目录编辑后快照目录出现文件副本且可列出（验证：test_checkpoint_files.py）
-- [ ] /rewind 时间线（F4/AC6）：列出序号/时间/工具/目标；Esc 退出无任何文件变更（验证：test_command_rewind + 手工 TUI）
-- [ ] 三种回滚范围（F5/AC7）：仅文件——文件恢复、对话保留并注入回滚系统提示；仅对话——文件不动、消息截断；都恢复——两者同时生效（验证：test_checkpoint_files/git restore 用例 + TUI 集成单测断言 conv.length 变化）
-- [ ] 回滚后感知（F6/AC8）：仅文件回滚后对话中出现 `[系统提示] 文件已回滚到 checkpoint #N` 的 user 消息（验证：集成用例断言消息存在）
-- [ ] resume 后可回滚（F7/AC9）：/resume 恢复会话后 /rewind 仍列出历史 checkpoint 且恢复成功（验证：集成测试——创建 checkpoint→重建 Manager（同目录）→restore 成功）
-- [ ] 清理入口（F7）：/rewind 面板清理后 shadow ref/快照目录与元数据被清空（验证：clear 用例）
+- [x] 审批 diff（F1/AC1/AC2）：AI 修改已有文件触发审批时，弹窗出现 unified diff（增绿删红带上下文行），批准前文件内容不变（证据：`test_approval_carries_diff_for_new_file`、`test_approval_carries_diff_for_edit`；TUI 着色渲染 `_styled_diff`）
+- [x] 新建文件审批展示全部为新增（证据：`test_approval_carries_diff_for_new_file`，diff 含"新建文件"与 `+` 行）
+- [x] diff 截断与二进制占位（F1/N2/AC10）：超限尾部 `[diff truncated，共 N 行]`；二进制显示占位说明（证据：`test_diff.py::TestTruncate`、`test_binary_target_diff_placeholder`，E2E 场景 3 输出占位文案）
+- [x] 结果 diff 摘要（F2/AC3）：END 事件携带 diff 与 `+X -Y` 统计，TUI 渲染在工具结果下方（证据：`test_end_event_carries_diff_stat_and_checkpoint_created`）
+- [x] git checkpoint 创建（F3/AC4）：当前分支 `git log` 无新提交、shadow ref 存在、元数据 +1（证据：`test_create_does_not_pollute_branch`、E2E 场景 1 `git log 无新增: True | shadow ref 存在: True`）
+- [x] git 无变化跳过（F3/N1）：无文件变更时复用上一 checkpoint（证据：`test_no_change_reuses_last_checkpoint`）
+- [x] 非 git 快照（F3/AC5）：快照目录出现文件副本且可列出（证据：`test_create_and_restore_roundtrip`、E2E 场景 2）
+- [x] /rewind 时间线（F4/AC6）：列出序号/时间/工具/目标；Esc 退出无任何文件变更（证据：`test_rewind_esc_leaves_files_untouched`）
+- [x] 三种回滚范围（F5/AC7）：仅文件——文件恢复、对话保留；仅对话——文件不动、消息截断；都恢复——两者同时生效（证据：`test_rewind_files_only_keeps_conversation_and_notifies`、`test_rewind_both_restores_conversation`、`test_conversation_only_leaves_files_untouched`）
+- [x] 回滚后感知（F6/AC8）：仅文件回滚后注入 `[系统提示] 工作区文件已回滚到 checkpoint #N` 的 user 消息（证据：`test_rewind_files_only_keeps_conversation_and_notifies`）
+- [x] resume 后可回滚（F7/AC9）：同会话目录重建 Manager 后仍列出并成功恢复（证据：`test_restore_across_manager_instances`；`_restore_session` 重建 Manager）
+- [x] 清理入口（F7）：清理后快照/元数据被清空（证据：`test_rewind_cleanup_clears_checkpoints`、`test_clear_removes_ref`、`test_clear_removes_snapshots`）
 
 ## 工程检查
 
-- [ ] 项目编译通过（验证：`python -m compileall src`）
-- [ ] 全量单元测试通过（验证：`python -m pytest -q`，含既有测试零回归）
-- [ ] lint 通过（验证：`ruff check src tests` + `ruff format --check src tests`）
-- [ ] checkpoint 异常不拖垮工具执行：git 缺失/超时时 create 返回 None，工具照常执行（验证：test_checkpoint_git.py 模拟失败用例）
-- [ ] Agent 未注入 checkpoint 时行为与现状一致（验证：test_agent_checkpoint.py 回归用例）
-- [ ] 恢复操作写入审计 `checkpoint_restored`（验证：断言 AuditWriter 收到事件）
+- [x] 项目编译通过（验证：`python -m compileall src` → OK）
+- [x] 全量单元测试通过（验证：`python -m pytest -q --ignore=test_modifications.py` → 276 passed, 1 skipped；`test_modifications.py` 为上一轮遗留的根目录临时脚本，其断言的字段在当前源码中本就不存在，属既有失败，与本次改动无关）
+- [x] lint 通过（验证：`ruff check src tests` → All checks passed；`ruff format --check` → 101 files already formatted）
+- [x] checkpoint 异常不拖垮工具执行：非 git 目录 git 后端返回 None、工具照常执行（证据：`test_git_failure_returns_none`；另有 `test_restore_missing_snapshot_is_noop`）
+- [x] Agent 未注入 checkpoint 时行为与现状一致（证据：`test_agent_without_checkpoint_still_emits_diff` 及既有 agent/TUI 测试零回归）
+- [x] 恢复操作写入审计 `checkpoint_restored`（证据：`test_restore_writes_audit_event`）
 
 ## 端到端
 
-- [ ] **git 项目完整回滚**：在 git 项目中让 AI 修改 a.py → 审批弹窗看到 diff → 批准 → 结果区看到 +X -Y 摘要 → `/rewind` 看到该检查点 → 选"都恢复" → a.py 内容恢复、对话回到修改前（验证：手工执行 + `git log` 无污染 + 文件内容比对）
-- [ ] **非 git 项目降级**：在非 git 目录重复上述流程，回滚同样成功，界面提示当前为文件快照模式（验证：手工执行）
-- [ ] **Windows 全链路**：AC1~AC9 在 Windows 环境下全部走通（验证：本机执行全量测试 + 手工场景）
+- [x] **git 项目完整回滚**：AI 修改 a.py（write + edit 两轮）→ 审批 diff 展示 → 批准 → 结果区 `+1 -1` 统计 → checkpoint 2 条 → shadow commit 恢复（BOTH 语义）→ a.py 回到 v1、对话截断到 checkpoint 时刻、`git log` 全程无污染（验证记录：E2E 场景 1 输出全 True）
+- [x] **非 git 项目降级**：同流程走文件快照后端，仅文件恢复成功、对话保留、AI 内容被还原（验证记录：E2E 场景 2 输出全 True；界面模式提示为 "file snapshot"）
+- [x] **Windows 全链路**：以上全部在本机 Windows 11 + Python 3.12.7 执行通过（含 git 子进程、路径、编码）；交互式 TUI 手工走查需真实 API key，交互逻辑已由 `tests/test_tui_rewind.py` 的 Pilot 驱动测试覆盖

@@ -149,3 +149,54 @@ class TestFilesBackend:
         backend = FilesBackend(str(workspace), str(session_dir))
         meta = CheckpointMeta(1, 0, "t", "x", "files", "999", 0)
         assert await backend.restore(meta) == ([], [])
+
+
+class TestManagerRestoreSemantics:
+    async def test_conversation_only_leaves_files_untouched(self, env):
+        from endless_code.checkpoint import CheckpointManager, RestoreScope
+
+        workspace, session_dir = env
+        _write(workspace, "a.py", "v1\n")
+        manager = CheckpointManager(str(workspace), str(session_dir), "s1")
+        meta = await manager.create("t", "a.py", 0)
+        assert meta is not None
+        _write(workspace, "a.py", "v2\n")
+        report = await manager.restore(meta, RestoreScope.CONVERSATION_ONLY)
+        assert report.ok
+        assert (workspace / "a.py").read_text(encoding="utf-8") == "v2\n"
+
+    async def test_restore_across_manager_instances(self, env):
+        """模拟 /resume 后用新 Manager（同会话目录）恢复（AC9）。"""
+        from endless_code.checkpoint import CheckpointManager, RestoreScope
+
+        workspace, session_dir = env
+        _write(workspace, "a.py", "v1\n")
+        first = CheckpointManager(str(workspace), str(session_dir), "s1")
+        meta = await first.create("t", "a.py", 0)
+        _write(workspace, "a.py", "v2\n")
+
+        second = CheckpointManager(str(workspace), str(session_dir), "s1")
+        assert len(second.list()) == 1
+        report = await second.restore(meta, RestoreScope.FILES_ONLY)
+        assert report.ok
+        assert (workspace / "a.py").read_text(encoding="utf-8") == "v1\n"
+
+    async def test_restore_writes_audit_event(self, env):
+        from endless_code.checkpoint import CheckpointManager, RestoreScope
+
+        class FakeAudit:
+            def __init__(self):
+                self.events = []
+
+            def record(self, event, **kwargs):
+                self.events.append((event, kwargs))
+
+        workspace, session_dir = env
+        _write(workspace, "a.py", "v1\n")
+        audit = FakeAudit()
+        manager = CheckpointManager(str(workspace), str(session_dir), "s1", audit=audit)
+        meta = await manager.create("t", "a.py", 0)
+        await manager.restore(meta, RestoreScope.FILES_ONLY)
+        kinds = [name for name, _ in audit.events]
+        assert "checkpoint_restored" in kinds
+        assert all(name for name, _ in audit.events)

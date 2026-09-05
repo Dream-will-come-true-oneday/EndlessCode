@@ -11,6 +11,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from endless_code.checkpoint import CheckpointManager
+from endless_code.checkpoint.diff import (
+    BINARY_PLACEHOLDER,
+    diff_stat,
+    file_diff,
+    truncate_diff,
+)
 from endless_code.compact import (
     CompactCircuitBreaker,
     ContentReplacementState,
@@ -56,6 +63,7 @@ from endless_code.tool import Registry, Result
 MAX_ITERATIONS = 25
 MAX_UNKNOWN_RUN = 3
 PLAN_REMINDER_INTERVAL = 4
+_DIFF_TOOLS = frozenset({"write_file", "edit_file"})
 NOTICE_MAX_ITER = "（已达最大迭代轮数 25，自动停止；可继续发消息推进。）"
 NOTICE_UNKNOWN_TOOLS = "（连续多轮只请求到未注册的工具，自动停止。）"
 NOTICE_STREAM_ERROR = "（请求出错，本轮已中断。）"
@@ -124,6 +132,8 @@ class ToolEvent:
     phase: Phase = Phase.START
     result: str = ""
     is_error: bool = False
+    diff: str = ""
+    stat: str = ""
 
 
 @dataclass
@@ -150,6 +160,7 @@ class ApprovalRequest:
     reason: str
     respond: asyncio.Future[Outcome]
     explanation: PermissionExplanation | None = None
+    diff: str = ""
 
 
 @dataclass
@@ -181,6 +192,7 @@ class Agent:
         instruction_text: str = "",
         memory_text: str = "",
         audit_writer: AuditWriter | None = None,
+        checkpoint: CheckpointManager | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -191,6 +203,7 @@ class Agent:
         self._instruction_text = instruction_text
         self._memory_text = memory_text
         self._audit_writer = audit_writer
+        self._checkpoint = checkpoint
 
     async def run(
         self,
@@ -386,7 +399,7 @@ class Agent:
 
             execution = _ExecutionState(results=[None] * len(round_state.calls))
             async for event in self._execute_events(
-                round_state.calls, cancel, execution, mode
+                round_state.calls, cancel, execution, mode, conv
             ):
                 yield event
 
@@ -569,9 +582,11 @@ class Agent:
         cancel: asyncio.Event,
         state: _ExecutionState,
         mode: Mode,
+        conv: Conversation,
     ) -> AsyncIterator[Event]:
         cancel_task = asyncio.create_task(cancel.wait())
         active_tasks: set[asyncio.Task[Result]] = set()
+        diffs: dict[int, tuple[str, str]] = {}
         try:
             index = 0
             while index < len(calls):
@@ -680,8 +695,8 @@ class Agent:
                             continue
                         if decision is Decision.ALLOW:
                             self._audit_approval(call, explanation, "not_required")
-                            result = await self._await_serial_call(
-                                call, cancel, cancel_task, explanation
+                            result, diff, stat = await self._run_side_effect(
+                                call, cancel, cancel_task, explanation, conv
                             )
                             if result is None:
                                 state.completed = False
@@ -690,6 +705,7 @@ class Agent:
                                 )
                                 break
                             state.results[current] = result
+                            diffs[current] = (diff, stat)
                             continue
 
                         respond: asyncio.Future[Outcome] = (
@@ -702,14 +718,15 @@ class Agent:
                                 reason=reason,
                                 respond=respond,
                                 explanation=explanation,
+                                diff=self._preview_diff(call),
                             )
                         )
                         outcome = await respond
                         self._audit_approval(call, explanation, outcome)
 
                         if outcome is Outcome.ALLOW_ONCE:
-                            result = await self._await_serial_call(
-                                call, cancel, cancel_task, explanation
+                            result, diff, stat = await self._run_side_effect(
+                                call, cancel, cancel_task, explanation, conv
                             )
                             if result is None:
                                 state.completed = False
@@ -718,6 +735,7 @@ class Agent:
                                 )
                                 break
                             state.results[current] = result
+                            diffs[current] = (diff, stat)
                         elif outcome is Outcome.ALLOW_FOREVER:
                             try:
                                 self._engine.persist_local_allow(call)
@@ -725,8 +743,8 @@ class Agent:
                                 logging.getLogger(__name__).warning(
                                     "持久化放行规则失败: %s", call.name, exc_info=True
                                 )
-                            result = await self._await_serial_call(
-                                call, cancel, cancel_task, explanation
+                            result, diff, stat = await self._run_side_effect(
+                                call, cancel, cancel_task, explanation, conv
                             )
                             if result is None:
                                 state.completed = False
@@ -735,6 +753,7 @@ class Agent:
                                 )
                                 break
                             state.results[current] = result
+                            diffs[current] = (diff, stat)
                         else:
                             state.results[current] = Result(
                                 content=reason, is_error=True
@@ -746,6 +765,7 @@ class Agent:
                         result = Result(content=NOTICE_CANCELLED, is_error=True)
                         state.results[current] = result
                     call = calls[current]
+                    diff, stat = diffs.get(current, ("", ""))
                     yield Event(
                         tool=ToolEvent(
                             call_id=call.id,
@@ -754,6 +774,8 @@ class Agent:
                             phase=Phase.END,
                             result=result.content,
                             is_error=result.is_error,
+                            diff=diff,
+                            stat=stat,
                         )
                     )
 
@@ -834,6 +856,97 @@ class Agent:
             is_error=result.is_error,
         )
         return result
+
+    async def _run_side_effect(
+        self,
+        call: ToolCall,
+        cancel: asyncio.Event,
+        cancel_task: asyncio.Task,
+        explanation: PermissionExplanation | None,
+        conv: Conversation,
+    ) -> tuple[Result | None, str, str]:
+        """checkpoint 创建 → 执行 → 结果 diff 计算。返回 (result, diff, stat)。"""
+        path = self._call_path(call)
+        exists_pre, text_pre = self._read_file_state(path)
+        if self._checkpoint is not None:
+            target = explanation.target if explanation is not None else call.name
+            await self._checkpoint.create(call.name, target, conv.length())
+        result = await self._await_serial_call(call, cancel, cancel_task, explanation)
+        if result is None or result.is_error:
+            return result, "", ""
+        diff = self._result_diff(call.name, path, exists_pre, text_pre)
+        stat = diff_stat(diff) if diff else ""
+        return result, diff, stat
+
+    def _preview_diff(self, call: ToolCall) -> str:
+        """审批前计算待执行 diff；失败静默返回空串，绝不阻塞审批。"""
+        if call.name not in _DIFF_TOOLS:
+            return ""
+        path = self._call_path(call)
+        if not path:
+            return ""
+        try:
+            data = json.loads(call.input or "{}")
+        except json.JSONDecodeError:
+            return ""
+        exists_pre, text_pre = self._read_file_state(path)
+        if call.name == "write_file":
+            new = data.get("content")
+            if not isinstance(new, str):
+                return ""
+            old = text_pre if exists_pre else None
+        else:
+            if not exists_pre:
+                return ""
+            if text_pre is None:
+                return BINARY_PLACEHOLDER
+            old_s = data.get("old_string")
+            new_s = data.get("new_string")
+            if not isinstance(old_s, str) or not isinstance(new_s, str):
+                return ""
+            old = text_pre
+            new = text_pre.replace(old_s, new_s, 1)
+        return truncate_diff(file_diff(path, old, new))
+
+    def _result_diff(
+        self, tool_name: str, path: str, exists_pre: bool, text_pre: str | None
+    ) -> str:
+        if tool_name not in _DIFF_TOOLS or not path:
+            return ""
+        exists_now, text_now = self._read_file_state(path)
+        if not exists_pre and not exists_now:
+            return ""
+        if (exists_pre and text_pre is None) or (exists_now and text_now is None):
+            return BINARY_PLACEHOLDER
+        old = text_pre if exists_pre else None
+        new = text_now if exists_now else None
+        return truncate_diff(file_diff(path, old, new))
+
+    @staticmethod
+    def _call_path(call: ToolCall) -> str:
+        try:
+            data = json.loads(call.input or "{}")
+        except json.JSONDecodeError:
+            return ""
+        path = data.get("path")
+        return path if isinstance(path, str) else ""
+
+    @staticmethod
+    def _read_file_state(path: str) -> tuple[bool, str | None]:
+        """返回 (文件是否存在, 文本内容)。文本为 None 表示二进制或读取失败。"""
+        if not path:
+            return False, None
+        file_path = Path(path)
+        if not file_path.exists():
+            return False, None
+        try:
+            raw = file_path.read_bytes()
+        except OSError:
+            return True, None
+        try:
+            return True, raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return True, None
 
     def _request_messages(self, conv: Conversation) -> list[Message]:
         """Build provider-only messages without mutating persisted conversation."""

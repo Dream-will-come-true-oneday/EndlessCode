@@ -10,7 +10,7 @@ from endless_code.permission import Mode
 
 
 class FakeHost:
-    """实现 CommandHost 全部 16 个方法，记录所有调用。"""
+    """实现 CommandHost 全部方法，记录所有调用。"""
 
     def __init__(self) -> None:
         self.notices: list[str] = []
@@ -38,6 +38,9 @@ class FakeHost:
         self.plan_called = False
         self.execute_called = False
         self.clear_called = False
+        self.rewind_called = False
+        self.rewind_available_value = True
+        self.checkpoint_mode_value = "git shadow"
 
     def show_notice(self, text: str) -> None:
         self.notices.append(text)
@@ -84,6 +87,15 @@ class FakeHost:
 
     def clear_session(self) -> None:
         self.clear_called = True
+
+    def start_rewind(self) -> None:
+        self.rewind_called = True
+
+    def rewind_available(self) -> bool:
+        return self.rewind_available_value
+
+    def get_checkpoint_mode(self) -> str:
+        return self.checkpoint_mode_value
 
     def quit_app(self) -> None:
         self.quit_called = True
@@ -334,3 +346,18 @@ def test_all_builtin_commands_registered(name: str) -> None:
     registry = Registry()
     register_builtin_commands(registry)
     assert registry.lookup(name) is not None
+
+
+def test_rewind_delegates_and_reports_mode() -> None:
+    dispatcher, host = new_dispatcher()
+    assert dispatcher.try_dispatch("/rewind") is True
+    assert host.rewind_called is True
+    assert any("git shadow" in n for n in host.notices)
+
+
+def test_rewind_unavailable_notices() -> None:
+    dispatcher, host = new_dispatcher()
+    host.rewind_available_value = False
+    assert dispatcher.try_dispatch("/rewind") is True
+    assert host.rewind_called is False
+    assert any("不支持" in n for n in host.notices)

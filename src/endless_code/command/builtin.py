@@ -1,4 +1,4 @@
-"""内置命令：13 条高频操作的定义与注册。"""
+"""内置命令：高频操作的定义与注册。"""
 
 from endless_code.command.prompts import (
     build_explain_prompt,
@@ -32,7 +32,7 @@ def _detail_line(spec: CommandSpec) -> str:
 
 
 def register_builtin_commands(registry: Registry) -> None:
-    """注册全部 13 条内置命令。"""
+    """注册全部内置命令。"""
 
     def help_command(host, args: str) -> None:
         needle = args.strip()
@@ -66,6 +66,13 @@ def register_builtin_commands(registry: Registry) -> None:
 
     def resume_command(host, _args: str) -> None:
         host.start_resume()
+
+    def rewind_command(host, _args: str) -> None:
+        if not host.rewind_available():
+            host.show_notice("当前环境不支持 checkpoint 回滚。")
+            return
+        host.show_notice(f"checkpoint 模式：{host.get_checkpoint_mode()}")
+        host.start_rewind()
 
     def audit_command(host, _args: str) -> None:
         host.show_audit()
@@ -174,6 +181,13 @@ def register_builtin_commands(registry: Registry) -> None:
             usage="/resume",
             kind=CommandKind.UI,
             handler=resume_command,
+        ),
+        CommandSpec(
+            name="/rewind",
+            description="回滚文件/对话到本会话检查点",
+            usage="/rewind",
+            kind=CommandKind.UI,
+            handler=rewind_command,
         ),
         CommandSpec(
             name="/audit",

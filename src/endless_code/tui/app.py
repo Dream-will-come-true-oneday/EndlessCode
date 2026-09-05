@@ -3,12 +3,12 @@
 import asyncio
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import ClassVar
 
-from rich.markdown import Markdown
+from rich.console import Group
 from rich.panel import Panel
 from rich.text import Text as RichText
 from textual.app import App, ComposeResult
@@ -27,6 +27,7 @@ from endless_code.agent import (
     SessionRuntime,
     new_session_runtime,
 )
+from endless_code.checkpoint import CheckpointManager, RestoreScope
 from endless_code.command import (
     CommandSpec,
     Dispatcher,
@@ -66,6 +67,7 @@ class SessionState(Enum):
     STREAMING = "streaming"
     APPROVING = "approving"
     RESUMING = "resuming"
+    REWINDING = "rewinding"
 
 
 @dataclass
@@ -179,6 +181,10 @@ class EndlessCodeApp(App):
         self._visible_resume_sessions = []
         self._last_error = ""
         self._last_reply = ""
+        self._checkpoint: CheckpointManager | None = None
+        self._rewind_metas: list = []
+        self._rewind_selected = None
+        self._rewind_phase = "list"
         self._command_registry = Registry()
         register_builtin_commands(self._command_registry)
         self._dispatcher = Dispatcher(self._command_registry, self)
@@ -265,6 +271,12 @@ class EndlessCodeApp(App):
                 self._runtime.session.session_id,
                 secrets=self._secrets,
             )
+            self._checkpoint = CheckpointManager(
+                str(Path.cwd().resolve()),
+                str(self._runtime.session.session_dir),
+                self._runtime.session.session_id,
+                audit=self._audit_writer,
+            )
             self._conv = Conversation(self._writer.append, self._writer.replace)
             if self._memory_manager is not None:
                 self._memory_manager.set_provider(self._provider, self._provider.model)
@@ -277,6 +289,7 @@ class EndlessCodeApp(App):
                 memory_manager=self._memory_manager,
                 instruction_text=self._instruction_text,
                 audit_writer=self._audit_writer,
+                checkpoint=self._checkpoint,
             )
             return True
         except Exception as exc:  # noqa: BLE001
@@ -308,9 +321,7 @@ class EndlessCodeApp(App):
         self._chat.write(Panel(self._safe(text), title="You", border_style="blue"))
 
     def _write_assistant_message(self, text: str) -> None:
-        self._chat.write(
-            Panel(Markdown(self._safe(text)), title="Assistant", border_style="green")
-        )
+        self._chat.write(RichText.from_markup(f"[green]{self._safe(text)}[/]"))
 
     def _write_error(self, err_msg: str) -> None:
         self._last_error = err_msg
@@ -353,6 +364,9 @@ class EndlessCodeApp(App):
         self._input.clear()
         if self._state is SessionState.RESUMING:
             self._resume_selected()
+            return
+        if self._state is SessionState.REWINDING:
+            self._rewind_select()
             return
         if not text:
             return
@@ -500,6 +514,165 @@ class EndlessCodeApp(App):
     def start_resume(self) -> None:
         self._command_resume()
 
+    def start_rewind(self) -> None:
+        self._command_rewind()
+
+    def rewind_available(self) -> bool:
+        return self._checkpoint is not None and self._checkpoint.available()
+
+    def get_checkpoint_mode(self) -> str:
+        return self._checkpoint.mode_label() if self._checkpoint else "--"
+
+    def _command_rewind(self) -> None:
+        if self._state is not SessionState.IDLE:
+            self._write_notice("请等待当前任务完成后再回滚。")
+            return
+        if self._checkpoint is None:
+            self._write_notice("当前会话没有可用的 checkpoint。")
+            return
+        metas = self._checkpoint.list()
+        if not metas:
+            self._write_notice(
+                f"本会话尚无 checkpoint（模式：{self._checkpoint.mode_label()}）。"
+            )
+            return
+        self._rewind_metas = metas
+        self._rewind_phase = "list"
+        self._rewind_selected = None
+        self._state = SessionState.REWINDING
+        self._chat.add_class("hidden")
+        self._resume_list.remove_class("hidden")
+        self._input.placeholder = "↑↓ 选择检查点，Enter 确认，Esc 取消"
+        self._render_rewind_list()
+        self._input.focus()
+
+    def _render_rewind_list(self) -> None:
+        options = []
+        for meta in self._rewind_metas:
+            time_str = (
+                datetime.fromtimestamp(meta.timestamp, tz=UTC)
+                .astimezone()
+                .strftime("%m-%d %H:%M:%S")
+            )
+            target = self._safe(meta.target)
+            options.append(
+                Option(
+                    f"#{meta.index} · {time_str} · {meta.tool} · {target}\n"
+                    f"        对话位置：{meta.conv_len} 条消息"
+                )
+            )
+        options.append(Option("清理本会话全部 checkpoint"))
+        self._resume_list.clear_options()
+        self._resume_list.add_options(options)
+        self._resume_list.highlighted = 0
+
+    def _render_rewind_scope(self) -> None:
+        meta = self._rewind_selected
+        options = [
+            Option("仅恢复文件（对话保留，AI 会收到回滚通知）"),
+            Option("仅恢复对话历史（文件保持当前状态）"),
+            Option("文件与对话都恢复"),
+            Option("取消"),
+        ]
+        self._resume_list.clear_options()
+        self._resume_list.add_options(options)
+        self._resume_list.highlighted = 0
+        if meta is not None:
+            self._write_notice(
+                f"已选择 checkpoint #{meta.index}（{meta.tool} · {self._safe(meta.target)}），选择恢复范围："
+            )
+
+    def _rewind_select(self) -> None:
+        index = self._resume_list.highlighted
+        if index is None or index < 0:
+            return
+        if self._rewind_phase == "list":
+            if index >= len(self._rewind_metas):
+                self._stream_task = asyncio.create_task(self._run_rewind_cleanup())
+                return
+            self._rewind_selected = self._rewind_metas[index]
+            self._rewind_phase = "scope"
+            self._render_rewind_scope()
+            return
+        meta = self._rewind_selected
+        scope_by_index = [
+            RestoreScope.FILES_ONLY,
+            RestoreScope.CONVERSATION_ONLY,
+            RestoreScope.BOTH,
+            None,
+        ]
+        scope = scope_by_index[index] if index < len(scope_by_index) else None
+        if scope is None or meta is None:
+            self._close_rewind()
+            return
+        self._stream_task = asyncio.create_task(self._execute_rewind(meta, scope))
+
+    async def _run_rewind_cleanup(self) -> None:
+        try:
+            if self._checkpoint is not None:
+                await self._checkpoint.clear()
+            self._write_notice("已清理本会话全部 checkpoint。")
+        except Exception as exc:  # noqa: BLE001
+            self._write_error(f"清理失败: {type(exc).__name__}: {exc}")
+        finally:
+            self._close_rewind()
+
+    async def _execute_rewind(self, meta, scope: RestoreScope) -> None:
+        try:
+            self._input.disabled = True
+            self._streaming.remove_class("hidden")
+            self._streaming.update("正在回滚...")
+            if self._checkpoint is None:
+                self._write_error("checkpoint 不可用。")
+                return
+            report = await self._checkpoint.restore(meta, scope)
+            if not report.ok:
+                self._write_error(f"回滚失败: {report.error}")
+                return
+            if scope is RestoreScope.CONVERSATION_ONLY:
+                self._truncate_conversation(meta)
+                self._write_notice(
+                    f"对话已回滚到 checkpoint #{meta.index}（文件保持当前状态）。"
+                )
+            elif scope is RestoreScope.BOTH:
+                self._truncate_conversation(meta)
+                self._write_notice(
+                    f"文件与对话已回滚到 checkpoint #{meta.index}"
+                    f"（覆盖 {len(report.restored_files)} 个文件、删除 {len(report.deleted_files)} 个）。"
+                )
+            else:
+                self._conv.add_user(
+                    f"[系统提示] 工作区文件已回滚到 checkpoint #{meta.index}，"
+                    "相关文件内容可能已变化，请重新读取后再修改。"
+                )
+                self._write_notice(
+                    f"文件已回滚到 checkpoint #{meta.index}"
+                    f"（覆盖 {len(report.restored_files)} 个文件、删除 {len(report.deleted_files)} 个）。"
+                    "AI 已收到回滚通知。"
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._write_error(f"回滚失败: {type(exc).__name__}: {exc}")
+        finally:
+            self._close_rewind()
+
+    def _truncate_conversation(self, meta) -> None:
+        messages = self._conv.messages()[: meta.conv_len]
+        self._conv.replace_history(messages)
+
+    def _close_rewind(self) -> None:
+        self._resume_list.add_class("hidden")
+        self._chat.remove_class("hidden")
+        self._input.placeholder = "输入消息…"
+        self._input.disabled = False
+        self._input.focus()
+        self._streaming.add_class("hidden")
+        self._streaming.update("")
+        self._state = SessionState.IDLE
+        self._rewind_phase = "list"
+        self._rewind_selected = None
+        self._rewind_metas = []
+        self._stream_task = None
+
     def enter_plan(self) -> None:
         self._command_plan()
 
@@ -645,8 +818,15 @@ class EndlessCodeApp(App):
                     self._runtime.session.session_id,
                     secrets=self._secrets,
                 )
+                self._checkpoint = CheckpointManager(
+                    str(Path.cwd().resolve()),
+                    str(self._runtime.session.session_dir),
+                    self._runtime.session.session_id,
+                    audit=self._audit_writer,
+                )
                 if self._agent is not None:
                     self._agent._audit_writer = self._audit_writer
+                    self._agent._checkpoint = self._checkpoint
                 threshold = (
                     self._runtime.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
                 )
@@ -729,7 +909,24 @@ class EndlessCodeApp(App):
             self._last_reply = text
             self._write_assistant_message(text)
         else:
-            self._chat.write(Markdown(self._safe(text)))
+            # Use plain text with ANSI formatting for selectable output
+            self._chat.write(RichText.from_markup(f"[green]{self._safe(text)}[/]"))
+
+    def _styled_diff(self, diff: str, max_lines: int = 60) -> RichText:
+        """diff 逐行着色（保持文本可选中复制）。"""
+        text = RichText()
+        for line in diff.splitlines()[:max_lines]:
+            if line.startswith(("+++", "---")):
+                text.append(line + "\n", style="bold")
+            elif line.startswith("@@"):
+                text.append(line + "\n", style="yellow")
+            elif line.startswith("+"):
+                text.append(line + "\n", style="green")
+            elif line.startswith("-"):
+                text.append(line + "\n", style="red")
+            else:
+                text.append(line + "\n")
+        return text
 
     def _render_approval(self) -> None:
         req = self.pending
@@ -757,8 +954,12 @@ class EndlessCodeApp(App):
             prefix = "> " if idx == self.approve_cursor else "  "
             lines.append(f"{prefix}{idx + 1}. {label}")
         lines.append("  ↑↓ 选择 · Enter 确认 · Esc 取消")
+        parts: list = [RichText("\n".join(lines))]
+        if req.diff:
+            parts.append(RichText("  变更预览：", style="bold"))
+            parts.append(self._styled_diff("    " + req.diff.replace("\n", "\n    ")))
         self._streaming.remove_class("hidden")
-        self._streaming.update("\n".join(lines))
+        self._streaming.update(Group(*parts))
 
     def _update_approving(self, key: str) -> None:
         if self.pending is None or self._state is not SessionState.APPROVING:
@@ -898,6 +1099,11 @@ class EndlessCodeApp(App):
             summary = "\n".join(lines[:8]) + "\n[truncated]"
         style = "red" if event.is_error else "dim"
         self._chat.write(RichText(f"  ⎿ {summary}", style=style))
+        if event.diff and not event.is_error:
+            self._chat.write(RichText(f"  ⎿ {event.stat}", style="cyan"))
+            self._chat.write(
+                self._styled_diff("    " + event.diff.replace("\n", "\n    "))
+            )
         self._tick()
 
     def _end_turn(self) -> None:
@@ -921,6 +1127,9 @@ class EndlessCodeApp(App):
         if self._state is SessionState.RESUMING:
             self._cancel_resume()
             return
+        if self._state is SessionState.REWINDING:
+            self._close_rewind()
+            return
         if (
             self._state in (SessionState.STREAMING, SessionState.APPROVING)
             and self._turn_cancel is not None
@@ -933,6 +1142,9 @@ class EndlessCodeApp(App):
     def action_cancel_turn(self) -> None:
         if self._state is SessionState.RESUMING:
             self._cancel_resume()
+            return
+        if self._state is SessionState.REWINDING:
+            self._close_rewind()
             return
         if (
             self._state in (SessionState.STREAMING, SessionState.APPROVING)
@@ -962,6 +1174,22 @@ class EndlessCodeApp(App):
                 self._resume_list.action_cursor_down()
                 event.stop()
                 return
+        if self._state is SessionState.REWINDING:
+            if event.key == "escape":
+                self._close_rewind()
+                event.stop()
+                return
+            if event.key in ("up", "k"):
+                self._resume_list.action_cursor_up()
+                event.stop()
+                return
+            if event.key in ("down", "j"):
+                self._resume_list.action_cursor_down()
+                event.stop()
+                return
+            # 注意：Enter 不在这里处理——Input 会先消费 Enter 并发出 Submitted，
+            # 由 on_input_submitted 的 REWINDING 分支调用 _rewind_select，
+            # 与 RESUMING 的单路分发模式保持一致，避免双重选择。
         if self._state is SessionState.APPROVING:
             key = event.key
             if key in (

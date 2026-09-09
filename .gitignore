@@ -24,15 +24,15 @@ env/
 # uv
 uv.lock
 
-# OS
-.DS_Store
-Thumbs.db
-
-# 测试与评测产物
+# 评测与测试产物（pytest --cov / evals/runner.py 生成）
+evals/reports/
 .coverage
 pytest_out.txt
 pytest_err.txt
-evals/reports/
+
+# OS
+.DS_Store
+Thumbs.db
 
 # 工具与会话缓存
 .qoder/

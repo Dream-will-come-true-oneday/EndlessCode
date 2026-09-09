@@ -1,0 +1,39 @@
+# P3 真实模型评测任务集（需要 API key，由 evals/llm_eval.py 执行）
+#
+# 运行方式：
+# - 本地：设置 DEEPSEEK_API_KEY 环境变量后 ``python evals/llm_eval.py``
+# - CI：.github/workflows/eval.yml 夜间/手动（secrets.DEEPSEEK_API_KEY）
+#
+# 设计说明：
+# - 每个任务由真实 Provider 执行，judge 负责判定（规则或 LLM-as-judge）。
+# - compact-retention：压缩保留率。构造 30 回合合成历史（每回合登记一个
+#   可验证事实），先跑一次真实摘要压缩，再对压缩前历史均匀抽取 10 个关键
+#   事实问答；压缩后摘要回答正确率 >= 0.9 为通过。judge 为 1 次批量调用，
+#   解析失败时回退到规则判定。
+# - consistency：同提示词重复 3 次（温度跟随 Provider 默认，与产品行为一致），
+#   关键结论一致率 >= 0.9 为通过；解析失败回退到 difflib 文本相似度。
+# - cost：记录固定任务的 input/output tokens，与上次 llm_eval.json 报告
+#   对比偏差阈值 ±20%；首次运行只记录基线。
+#
+# 全部任务合计调用预算约 17 次 API 调用。
+
+tasks:
+  - id: compact-retention-01
+    kind: compact_retention
+    description: 长任务历史压缩后关键事实保留率
+    rounds: 30            # 构造的历史回合数
+    facts: 10             # 抽取的关键事实问答数
+    threshold: 0.9
+
+  - id: consistency-01
+    kind: consistency
+    description: 同一编程任务重复执行的输出稳定性
+    prompt: "阅读 README.md，用一句话总结项目定位，不要调用工具。"
+    repeats: 3
+    threshold: 0.9
+
+  - id: cost-01
+    kind: cost
+    description: 固定任务的成本基线（与上次报告对比）
+    prompt: "Reply with 'ready'."
+    max_deviation: 0.2

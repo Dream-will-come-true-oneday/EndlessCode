@@ -22,6 +22,8 @@ packages = ["src/endless_code"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "pytest-rerunfailures>=14.0",
     "ruff>=0.4",
 ]
 
@@ -31,6 +33,26 @@ asyncio_default_fixture_loop_scope = "function"
 # 把仓库根加入 sys.path，使 tests 内的 from tests.xxx import 绝对导入
 # 在任何调用方式下（python -m pytest 与裸 pytest）都与 CI 一致。
 pythonpath = ["."]
+# 评测体系的严格 marker 声明与覆盖率门槛（合入自 archive/eval-system）。
+addopts = "--strict-markers"
+markers = [
+    "unit: 纯函数/状态机单元测试",
+    "integration: 模块组合集成测试",
+    "e2e: 端到端场景测试（FakeLLM 驱动）",
+    "stability: 失败注入稳定性测试",
+    "perf: 性能/成本基线测试",
+    "eval: 真实模型评测（需要 API key，默认跳过）",
+]
+
+[tool.coverage.run]
+source = ["endless_code"]
+
+[tool.coverage.report]
+fail_under = 85
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+]
 
 [tool.ruff]
 # ruff 0.16 起 format 会重排 Markdown 中的 Python 代码块。docs 下的 spec/plan/task

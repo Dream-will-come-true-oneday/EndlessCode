@@ -2,6 +2,13 @@
 
 from dataclasses import dataclass
 
+from endless_code.prompt.style import (
+    DEFAULT_STYLE_NAME,
+    STYLE_MODULE_NAME,
+    STYLE_PRIORITY,
+    style_content,
+)
+
 
 @dataclass(frozen=True)
 class Module:
@@ -85,6 +92,14 @@ def assemble_system(modules: list[Module]) -> str:
     )
 
 
-def build_system_prompt(instructions: str = "", memory: str = "") -> str:
-    """构造可缓存的稳定系统提示。"""
-    return assemble_system(fixed_modules() + optional_modules(instructions, memory))
+def build_system_prompt(
+    instructions: str = "",
+    memory: str = "",
+    style: str = DEFAULT_STYLE_NAME,
+) -> str:
+    """构造可缓存的稳定系统提示；未知或默认样式时不注入样式模块。"""
+    return assemble_system(
+        fixed_modules()
+        + [Module(STYLE_MODULE_NAME, STYLE_PRIORITY, style_content(style))]
+        + optional_modules(instructions, memory)
+    )

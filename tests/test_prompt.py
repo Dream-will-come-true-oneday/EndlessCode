@@ -1,12 +1,17 @@
 import pytest
 
 from endless_code.prompt import (
+    DEFAULT_STYLE_NAME,
+    SYSTEM_PROMPT,
     Environment,
     Module,
+    all_styles,
     assemble_system,
     build_system_prompt,
+    find_style,
     fixed_modules,
     plan_reminder,
+    style_content,
     system_reminder,
 )
 from endless_code.prompt import environment as environment_module
@@ -70,3 +75,34 @@ def test_prompt_includes_non_empty_instructions_and_memory() -> None:
     assert "project rule" in prompt
     assert "remember this" in prompt
     assert prompt.index("project rule") < prompt.index("remember this")
+
+
+def test_default_style_keeps_prompt_byte_identical() -> None:
+    """默认/未知样式不注入任何模块，提示与改动前逐字节相同（N1/N3）。"""
+    expected = build_system_prompt()
+    assert build_system_prompt("", "", DEFAULT_STYLE_NAME) == expected
+    assert build_system_prompt("", "", "nope") == expected
+    assert expected == SYSTEM_PROMPT
+
+
+def test_non_default_styles_inject_after_tone_module() -> None:
+    for name in ("concise", "explanatory", "learning"):
+        prompt = build_system_prompt("", "", name)
+        assert "precedence over the tone guidance" in prompt
+        assert prompt.index("markdown only when it improves") < prompt.index(
+            "precedence over the tone guidance"
+        )
+
+
+def test_style_content_ordering_with_instructions_and_memory() -> None:
+    prompt = build_system_prompt("project rule", "remember this", "concise")
+    assert prompt.index("precedence over the tone guidance") < prompt.index(
+        "project rule"
+    )
+
+
+def test_find_style_is_case_insensitive_and_strips() -> None:
+    assert find_style(" Concise ").name == "concise"
+    assert find_style("nope") is None
+    assert style_content("nope") == ""
+    assert len(all_styles()) == 4

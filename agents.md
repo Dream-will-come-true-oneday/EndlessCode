@@ -1,6 +1,6 @@
 ---
 name: endless-spec
-description: "Spec 驱动开发：协作澄清需求，依次生成并审批 spec.md、plan.md、task.md、checklist.md，再按文档开发和验收。开始任何功能、模块或章节开发前使用。"
+description: "Spec 驱动开发：协作澄清需求，依次生成并审批 spec.md、plan.md、task.md、checklist.md，再按文档开发和验收；完成一项新功能或优化后必须提交并推送到远端（dev → main 双分支）。开始任何功能、模块或章节开发前使用。"
 ---
 
 # Spec 驱动开发
@@ -257,9 +257,55 @@ T1 -> T2 -> T3
 - [x] 场景 — 结果：...
 ```
 
+## 阶段七：提交与推送
+
+<HARD-GATE>
+完成一项新功能开发或一次优化后，必须提交到本地并推送到远端 GitHub 仓库。只改本地不推送，视为该功能未完成。
+</HARD-GATE>
+
+### 分支模型
+
+- 仓库只保留两个长期分支：`dev`（开发）与 `main`（稳定）。
+- 禁止长期保留 `feat/*`、`test`、`archive/*` 等分支；临时分支合并进 `dev` 后立即删除本地与远端副本。
+- 日常开发一律在 `dev` 上进行；禁止直接在 `main` 上提交。
+- 推送顺序固定：先推 `dev`，再把 `dev` 合并进 `main` 并推送 `main`。
+
+标准流程（PowerShell 用 `;` 分隔命令）：
+
+```bash
+git checkout dev
+git add -A ; git commit -m "<已选定的提交信息>"
+git push origin dev
+git checkout main ; git merge dev ; git push origin main
+git checkout dev
+```
+
+若发现 `main` 上有 `dev` 没有的提交（历史遗留），先 `git checkout dev ; git merge main` 把 `main` 回收进 `dev`，再走上面的流程。
+
+### 提交信息生成规则
+
+1. 提交前必须先看真实改动：`git diff --staged`（未暂存时 `git diff HEAD`）。禁止凭记忆或猜测编写提交信息。
+2. 基于 diff 输出 **3 条候选提交信息**，等用户选定（或直接改写）后再执行 `git commit`：
+   - **候选 A｜极简标题**：单行，不超过 50 字符，动词开头，只说清做了什么。
+   - **候选 B｜标准规范格式**：`<type>(<scope>): <subject>`，`type` 取 `feat`/`fix`/`docs`/`refactor`/`perf`/`test`/`build`/`ci`/`chore`，`scope` 为受影响的模块名。
+   - **候选 C｜带正文解释**：标题 + 空行 + 正文，正文必须依次覆盖三点：**改动目的**、**改动背景**、**潜在风险**。
+3. 候选 C 的正文要求：
+   - 明确区分“改了什么”（放标题与首段，落到具体文件/模块/行为）与“为什么改”（放背景段，说明原有实现的问题或需求来源）。
+   - 潜在风险写明影响面、兼容性、需要回归的场景，以及回滚方式。
+   - 每段 1-3 句，使用陈述句，不写“应该没问题”这类无证据结论。
+4. 用词禁令：禁止使用 `update`、`modify`、`change`、`fix bug`、`improve`、`调整`、`完善`、`一些改动`、`杂项` 等模糊词。若确需使用“优化”“重构”等词，必须紧跟具体对象与具体手段或指标，例如“为命令面板增加前缀匹配的实时建议”而非“优化命令面板”。
+5. 一次提交只做一件事；diff 中出现互不相关的改动时，先拆分为多次提交再分别写信息。
+
+### 推送前检查
+
+- 运行项目已配置的工程检查（如 `pytest`、`ruff`、`mypy`），失败先修复再提交。
+- 禁止 `git push --force`、禁止改写已推送的历史，除非用户明确要求。
+- 推送后用 `git log --oneline -1 origin/dev` 与 `git log --oneline -1 origin/main` 确认远端已同步，并在回复中给出证据。
+
 ## 禁止跳步
 
 - “任务很简单”不构成跳过文档的理由；文档可短，但必须存在并审批。
 - 不得直接从想法跳到代码或从 `spec.md` 跳到实现。
 - `checklist.md` 必须在编码前完成，它验证需求，测试则验证代码。
 - 不确定用户意图时先问；不确定实现状态时先运行验证。
+- 功能或优化完成后未提交并推送到远端 `dev` 与 `main`，不得宣告任务完成。

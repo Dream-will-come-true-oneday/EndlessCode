@@ -10,6 +10,7 @@
 # 连接失败 / 配置非法 / 超时的 server 会被跳过，其余 server 与内置工具照常可用。
 
 mcp_servers:
+  # GitHub MCP - 代码仓库管理
   github:
     type: stdio
     command: npx
@@ -17,13 +18,21 @@ mcp_servers:
     env:
       GITHUB_TOKEN: "${GITHUB_TOKEN}"          # 从宿主环境展开，密钥不入配置
 
+  # SQLite MCP - 本地数据库访问
   local-sqlite:
     type: stdio
     command: python
     args: ["-m", "mcp_server_sqlite", "--db", "./data.db"]
 
+  # HTTP MCP - 自定义 HTTP 端点
   example-http:
     type: http
     url: "https://mcp.example.com/mcp"
     headers:
       Authorization: "Bearer ${EXAMPLE_TOKEN}"  # 自定义 HTTP 头，也支持 ${VAR}
+
+# 使用提示:
+# 1. 先设置环境变量：export GITHUB_TOKEN=ghp_xxx (Linux/Mac) 或 $env:GITHUB_TOKEN="ghp_xxx"(PowerShell)
+# 2. 复制到用户级配置：cp docs/mcp/mcp-servers.example.yaml ~/.config/endless-code/mcp.yaml
+# 3. 或直接复制到项目级：cp docs/mcp/mcp-servers.example.yaml .endless-code/mcp.yaml
+# 4. 重启 endless-code 即可自动加载

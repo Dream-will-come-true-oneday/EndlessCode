@@ -57,7 +57,12 @@ from endless_code.permission import (
 )
 from endless_code.permission.audit import audit_args_summary
 from endless_code.permission.engine import Engine, new_engine
-from endless_code.prompt import build_system_prompt, gather_environment, plan_reminder
+from endless_code.prompt import (
+    DEFAULT_STYLE_NAME,
+    build_system_prompt,
+    gather_environment,
+    plan_reminder,
+)
 from endless_code.tool import Registry, Result
 
 MAX_ITERATIONS = 25
@@ -193,6 +198,7 @@ class Agent:
         memory_text: str = "",
         audit_writer: AuditWriter | None = None,
         checkpoint: CheckpointManager | None = None,
+        output_style: str = DEFAULT_STYLE_NAME,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -204,6 +210,11 @@ class Agent:
         self._memory_text = memory_text
         self._audit_writer = audit_writer
         self._checkpoint = checkpoint
+        self._output_style = output_style
+
+    def set_output_style(self, style: str) -> None:
+        """设置输出样式；下一轮 run 组装稳定提示时生效。"""
+        self._output_style = style
 
     async def run(
         self,
@@ -228,7 +239,9 @@ class Agent:
             if self._memory_manager is not None
             else self._memory_text
         )
-        stable_system = build_system_prompt(self._instruction_text, memory_text)
+        stable_system = build_system_prompt(
+            self._instruction_text, memory_text, self._output_style
+        )
 
         unknown_run = 0
         for iteration in range(1, MAX_ITERATIONS + 1):

@@ -30,7 +30,10 @@ from endless_code.llm import (
     Usage,
 )
 from endless_code.permission import Decision, Mode, Outcome, new_engine
-from endless_code.prompt import PLAN_MODE_REMINDER
+from endless_code.prompt import (
+    PLAN_MODE_REMINDER,
+    build_system_prompt,
+)
 from endless_code.tool import Registry, Result
 
 
@@ -526,6 +529,55 @@ async def test_cache_usage_is_forwarded_from_request_provider() -> None:
         usage.cache_write,
         usage.cache_read,
     ) == (3, 2, 7, 5)
+
+
+async def _request_round(
+    provider: RequestProvider, conv: Conversation, agent: Agent
+) -> None:
+    """跑一轮对话，让 provider 记录一次完整 Request。"""
+    conv.add_user("round")
+    await _run(agent, conv)
+
+
+@pytest.mark.asyncio
+async def test_output_style_reaches_stable_system_prompt() -> None:
+    provider = RequestProvider([[StreamEvent(text="ok"), StreamEvent(done=True)]])
+    conv = Conversation()
+    agent = Agent(provider, _registry(), output_style="concise")
+    await _request_round(provider, conv, agent)
+    stable = provider.requests[0].system.stable
+    assert "precedence over the tone guidance" in stable
+    assert "Be extremely brief" in stable
+
+
+@pytest.mark.asyncio
+async def test_default_style_stable_prompt_unchanged() -> None:
+    provider = RequestProvider([[StreamEvent(text="ok"), StreamEvent(done=True)]])
+    conv = Conversation()
+    agent = Agent(provider, _registry())
+    await _request_round(provider, conv, agent)
+    assert provider.requests[0].system.stable == build_system_prompt("", "")
+
+
+@pytest.mark.asyncio
+async def test_set_output_style_applies_next_round() -> None:
+    provider = RequestProvider(
+        [
+            [StreamEvent(text="ok"), StreamEvent(done=True)],
+            [StreamEvent(text="ok2"), StreamEvent(done=True)],
+        ]
+    )
+    conv = Conversation()
+    agent = Agent(provider, _registry())
+    await _request_round(provider, conv, agent)
+    assert "precedence over the tone guidance" not in (
+        provider.requests[0].system.stable
+    )
+    agent.set_output_style("explanatory")
+    await _request_round(provider, conv, agent)
+    stable = provider.requests[1].system.stable
+    assert "precedence over the tone guidance" in stable
+    assert "why this approach was chosen" in stable
 
 
 class EmergencyProvider:

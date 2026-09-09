@@ -27,3 +27,18 @@ uv.lock
 # OS
 .DS_Store
 Thumbs.db
+
+# 测试与评测产物
+.coverage
+pytest_out.txt
+pytest_err.txt
+evals/reports/
+
+# 工具与会话缓存
+.qoder/
+.zcode/
+
+# 临时验证脚本与一次性改动总结（不入库）
+CHANGES_SUMMARY.md
+test_modifications.py
+closure_demo.py

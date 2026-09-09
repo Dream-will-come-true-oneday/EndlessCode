@@ -11,7 +11,17 @@ from endless_code.compact.layer2 import (
     auto_compact,
     force_compact,
 )
+from endless_code.compact.rolling import SummaryState
+from endless_code.compact.state import (
+    CompactCircuitBreaker,
+    ContentReplacementState,
+    RecoveryState,
+    SessionContext,
+    TrimLedger,
+)
 from endless_code.compact.token import estimate_tokens
+from endless_code.compact.trim import apply_local_trim
+from endless_code.conversation import Conversation
 from endless_code.llm import Message, ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -25,20 +35,22 @@ class TriggerKind(Enum):
 
 @dataclass
 class ManageInput:
-    conv: object
+    conv: Conversation
     provider: object
     model: str
     context_window: int
     budget: ContextBudget
     tool_defs: list[ToolDefinition]
-    replacement: object
-    recovery: object
-    auto_tracking: object
-    session: object
+    replacement: ContentReplacementState
+    recovery: RecoveryState
+    auto_tracking: CompactCircuitBreaker
+    session: SessionContext
     usage_anchor: int
     anchor_msg_len: int
     estimated_token: int
     trigger: TriggerKind
+    summary_state: SummaryState | None = None
+    trim_ledger: TrimLedger | None = None
 
 
 @dataclass
@@ -75,11 +87,25 @@ async def manage_context(input_: ManageInput) -> ManageOutput:
             "context window %s leaves no normal compaction margin, running degraded",
             budget.context_window,
         )
-    if after_layer1 < budget.effective_auto_threshold or input_.auto_tracking.tripped():
+    threshold = budget.effective_auto_threshold
+    if after_layer1 < threshold or input_.auto_tracking.tripped():
         return ManageOutput(before, after_layer1)
 
+    # L1：本地确定性裁剪，零模型调用；压到触发线以下就不再花 LLM。
+    trimmed = apply_local_trim(
+        layer1,
+        input_.recovery,
+        budget,
+        input_.trim_ledger if input_.trim_ledger is not None else TrimLedger(),
+        active=True,
+    )
+    input_.conv.replace_history(trimmed)
+    after_trim = estimate_tokens(input_.usage_anchor, trimmed, input_.anchor_msg_len)
+    if after_trim < threshold:
+        return ManageOutput(before, after_trim)
+
     input_.estimated_token = before
-    return await _auto_compact_guarded(input_, after_layer1)
+    return await _auto_compact_guarded(input_, after_trim)
 
 
 async def _auto_compact_guarded(input_, fallback_after: int) -> ManageOutput:
@@ -89,7 +115,9 @@ async def _auto_compact_guarded(input_, fallback_after: int) -> ManageOutput:
     keep: int | None = None
     min_messages: int | None = None
     problem = ""
+    state = input_.summary_state
     for _ in range(2):
+        snapshot = state.snapshot() if state is not None else None
         try:
             messages, _, after = await auto_compact(input_, keep, min_messages)
         except Exception as exc:
@@ -99,6 +127,9 @@ async def _auto_compact_guarded(input_, fallback_after: int) -> ManageOutput:
         if not problem:
             input_.conv.replace_history(messages)
             return ManageOutput(before, after, compacted=True)
+        # 摘要被拒意味着历史没被替换，不能让覆盖点停在未采纳的新摘要上。
+        if state is not None and snapshot is not None:
+            state.rollback(snapshot)
         keep = max(1, budget.recent_keep_tokens // 2)
         min_messages = 1
     logger.info("context compaction quality check failed: %s", problem)

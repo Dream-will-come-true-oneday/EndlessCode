@@ -10,7 +10,9 @@ from endless_code.compact import (
     ContentReplacementState,
     ManageInput,
     RecoveryState,
+    SummaryState,
     TriggerKind,
+    TrimLedger,
     build_context_budget,
     estimate_tokens,
     manage_context,
@@ -21,6 +23,7 @@ from endless_code.compact.compact import _quality_problem
 from endless_code.compact.layer2 import group_by_user_turn, pick_recent_tail
 from endless_code.compact.recovery import build_recovery_attachment
 from endless_code.compact.summary_prompt import build_summary_prompt, extract_summary
+from endless_code.compact.trim import SUPERSEDED_PREFIX
 from endless_code.conversation import Conversation
 from endless_code.llm import (
     Message,
@@ -52,6 +55,9 @@ def _input(
     context_window: int = 200_000,
     trigger: TriggerKind = TriggerKind.MANUAL,
     estimated_token: int = 100,
+    recovery: RecoveryState | None = None,
+    summary_state: SummaryState | None = None,
+    trim_ledger: TrimLedger | None = None,
 ) -> ManageInput:
     return ManageInput(
         conv=conv,
@@ -67,13 +73,15 @@ def _input(
             )
         ],
         replacement=ContentReplacementState(),
-        recovery=RecoveryState(),
+        recovery=recovery if recovery is not None else RecoveryState(),
         auto_tracking=CompactCircuitBreaker(),
         session=new_session_context(str(tmp_path)),
         usage_anchor=0,
         anchor_msg_len=0,
         estimated_token=estimated_token,
         trigger=trigger,
+        summary_state=summary_state,
+        trim_ledger=trim_ledger,
     )
 
 
@@ -247,6 +255,7 @@ async def test_quality_gate_failure_keeps_history_and_reports_error(tmp_path) ->
     conv = Conversation()
     conv.add_user("x" * 2_000_000)
     provider = SummaryProvider("<summary>## 1 主要请求和意图\n巨型上下文</summary>")
+    state = SummaryState("旧版正文", 2, 3)
     input_ = _input(
         tmp_path,
         conv,
@@ -254,12 +263,15 @@ async def test_quality_gate_failure_keeps_history_and_reports_error(tmp_path) ->
         context_window=128_000,
         trigger=TriggerKind.AUTO,
         estimated_token=600_000,
+        summary_state=state,
     )
     result = await manage_context(input_)
     assert result.compacted is False
     assert isinstance(result.err, CompactionQualityError)
     assert len(conv.messages()) == 1
     assert conv.messages()[0].content.startswith("x")
+    # 摘要被拒 → 历史没换，滚动状态的覆盖点与轮次也不能前进
+    assert state.snapshot() == ("旧版正文", 2, 3)
 
 
 @pytest.mark.asyncio
@@ -320,3 +332,98 @@ def test_quality_problem_detects_orphan_tool_results() -> None:
     ]
     assert _quality_problem(paired, 10, budget) == ""
     assert _quality_problem([], 10, budget) == "压缩后历史为空"
+
+
+@pytest.mark.asyncio
+async def test_l1_trims_stale_reads_and_skips_summary(tmp_path) -> None:
+    """L1 本地裁剪零 LLM 调用，压到触发线以下后不再摘要（AC3）。"""
+    recovery = RecoveryState()
+    for index in range(1, 25):
+        recovery.record_read(f"c{index}", str(tmp_path / "a.txt"))
+    conv = Conversation()
+    conv.add_tool_results(
+        [
+            ToolResult(tool_call_id=f"c{index}", content=f"READ{index}-" + "x" * 5_000)
+            for index in range(1, 25)
+        ]
+    )
+    for _ in range(5):
+        conv.add_user("u" * 5_000)
+    provider = SummaryProvider("<summary>不应被调用</summary>")
+    state = SummaryState()
+    ledger = TrimLedger()
+    input_ = _input(
+        tmp_path,
+        conv,
+        provider,
+        context_window=32_000,
+        trigger=TriggerKind.AUTO,
+        estimated_token=200_000,
+        recovery=recovery,
+        summary_state=state,
+        trim_ledger=ledger,
+    )
+
+    result = await manage_context(input_)
+
+    assert len(provider.requests) == 0  # 全程零模型调用
+    assert result.compacted is False
+    results = conv.messages()[0].tool_results
+    superseded = [r for r in results if r.content.startswith(SUPERSEDED_PREFIX)]
+    assert len(superseded) == 23  # c24 是最新读取，保留原文
+    # c24 已被 L0 落盘成预览，F1 优先于 F2：预览正文（含原文片段）不被削成纯指针
+    assert not results[-1].content.startswith(SUPERSEDED_PREFIX)
+    assert "READ24-" in results[-1].content
+    assert result.after_tokens < input_.budget.effective_auto_threshold
+    assert ledger.pointer_for("c1") is not None
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_keeps_full_semantics(tmp_path) -> None:
+    """手动 /compact 不触发 L1、不写滚动状态，仍为无条件全量重摘（F7/AC7）。"""
+    recovery = RecoveryState()
+    recovery.record_read("c1", str(tmp_path / "a.txt"))
+    conv = Conversation()
+    conv.add_tool_results([ToolResult(tool_call_id="c1", content="x" * 5_000)])
+    conv.add_user("请总结")
+    provider = SummaryProvider("<summary>## 1 主要请求和意图\n请总结</summary>")
+    state = SummaryState()
+    ledger = TrimLedger()
+    input_ = _input(
+        tmp_path,
+        conv,
+        provider,
+        context_window=32_000,
+        trigger=TriggerKind.MANUAL,
+        recovery=recovery,
+        summary_state=state,
+        trim_ledger=ledger,
+    )
+
+    result = await manage_context(input_)
+
+    assert result.compacted is True
+    assert len(provider.requests) == 1  # 全量摘要照常发生
+    assert ledger.pointer_for("c1") is None  # 不做本地裁剪
+    assert state.revision == 0  # 不写滚动状态
+    assert conv.messages()[0].content.startswith("## 历史会话摘要")
+
+
+@pytest.mark.asyncio
+async def test_below_threshold_skips_l1_and_summary(tmp_path) -> None:
+    conv = Conversation()
+    conv.add_user("小消息")
+    provider = SummaryProvider("<summary>不应被调用</summary>")
+    input_ = _input(
+        tmp_path,
+        conv,
+        provider,
+        context_window=128_000,
+        trigger=TriggerKind.AUTO,
+        estimated_token=10,
+    )
+
+    result = await manage_context(input_)
+
+    assert len(provider.requests) == 0
+    assert result.compacted is False

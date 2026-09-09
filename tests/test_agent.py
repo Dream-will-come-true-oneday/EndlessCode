@@ -3,6 +3,7 @@
 import asyncio
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 
@@ -20,7 +21,9 @@ from endless_code.agent import (
     ToolEvent,
     new_session_runtime,
 )
+from endless_code.compact import SummaryState
 from endless_code.compact.const import ESTIMATE_CHARS_PER_TOKEN
+from endless_code.compact.rolling import STATE_FILENAME
 from endless_code.conversation import Conversation
 from endless_code.llm import (
     Message,
@@ -874,3 +877,182 @@ async def test_compaction_resets_token_meter(tmp_path) -> None:
 
     await _run(agent, conv)
     assert runtime.meter.chars_per_token == ESTIMATE_CHARS_PER_TOKEN
+
+
+class LimitedWindowProvider:
+    """按模型真实接受量（而非配置窗口）返回 PTL 的 provider。"""
+
+    name = "limited-fake"
+    model = "limited-model"
+
+    def __init__(self, limit_tokens: int) -> None:
+        self.limit_bytes = limit_tokens * ESTIMATE_CHARS_PER_TOKEN
+        self.ptl_calls = 0
+        self.main_calls = 0
+        self.summary_calls = 0
+
+    async def stream(self, request: Request):
+        if not request.system.stable:
+            self.summary_calls += 1
+            yield StreamEvent(text="<summary>## 1 主要请求和意图\n收敛窗口</summary>")
+            yield StreamEvent(done=True)
+            return
+        self.main_calls += 1
+        size = sum(len(item.content.encode("utf-8")) for item in request.messages)
+        if size > self.limit_bytes:
+            self.ptl_calls += 1
+            yield StreamEvent(err=PromptTooLongError("too long"))
+            return
+        yield StreamEvent(text="ok")
+        yield StreamEvent(done=True)
+
+
+def _history_of_tokens(tokens: int, parts: int) -> Conversation:
+    """构造估算量刚好是 tokens 的历史（ASCII 按默认 chars/token 折算）。"""
+    conv = Conversation()
+    total_bytes = int(tokens * ESTIMATE_CHARS_PER_TOKEN)
+    payload = (total_bytes - len("user") * parts) // parts
+    for _ in range(parts):
+        conv.add_user("x" * payload)
+    return conv
+
+
+@pytest.mark.asyncio
+async def test_prompt_too_long_calibrates_window_and_budget(tmp_path) -> None:
+    """配置 1M、模型只吃 100k：PTL 后窗口收敛为 121_600 并重建预算（AC6）。"""
+    provider = LimitedWindowProvider(100_000)
+    conv = _history_of_tokens(128_000, 20)
+    runtime = new_session_runtime(str(tmp_path), 1_000_000)
+    agent = Agent(provider, _registry(), runtime=runtime)
+
+    events = await _run(agent, conv)
+
+    notices = [event for event in events if event.notice and "收敛" in event.notice]
+    assert len(notices) == 1
+    assert runtime.context_window == 121_600
+    assert runtime.budget.context_window == 121_600
+    assert runtime.clamp_notice_sent is True
+    assert provider.ptl_calls == 1
+    # 校准先于紧急压缩，让修正后的预算把本轮抗下来
+    assert conv.messages()[-1].content == "ok"
+    assert [event.compact.phase for event in events if event.compact is not None] == [
+        CompactPhase.BEFORE_EMERGENCY,
+        CompactPhase.AFTER_EMERGENCY,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_calibration_clamps_further_without_repeat_notice(tmp_path) -> None:
+    """同一会话再次超限：只取更小的窗口，不重复提示（AC6）。"""
+    provider = LimitedWindowProvider(10_000)
+    conv = _history_of_tokens(128_000, 20)
+    runtime = new_session_runtime(str(tmp_path), 1_000_000)
+    agent = Agent(provider, _registry(), runtime=runtime)
+
+    first = await _run(agent, conv)
+
+    assert runtime.context_window == 121_600
+    assert (
+        len([event for event in first if event.notice and "收敛" in event.notice]) == 1
+    )
+
+    second = await _run(agent, conv)
+
+    assert provider.ptl_calls >= 3  # 新一轮仍撞上限
+    assert 16_000 < runtime.context_window < 121_600
+    assert (
+        len([event for event in second if event.notice and "收敛" in event.notice]) == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_calibrated_window_keeps_following_turns_within_budget(tmp_path) -> None:
+    """自愈端到端：收敛后的预算使后续轮次不再超限（AC6）。"""
+    provider = LimitedWindowProvider(100_000)
+    conv = _history_of_tokens(128_000, 20)
+    runtime = new_session_runtime(str(tmp_path), 1_000_000)
+    agent = Agent(provider, _registry(), runtime=runtime)
+    await _run(agent, conv)
+
+    conv.add_user("x" * 40_000)
+    events = await _run(agent, conv)
+
+    assert provider.ptl_calls == 1  # 新一轮没再撞上限
+    assert runtime.context_window == 121_600
+    assert conv.messages()[-1].content == "ok"
+    assert not [event for event in events if event.compact is not None]
+
+
+@pytest.mark.asyncio
+async def test_auto_compaction_persists_rolling_state(tmp_path) -> None:
+    """自动压缩后滚动状态写入会话目录（AC5）。"""
+    provider = SummaryOnlyProvider()
+    conv = Conversation()
+    for _ in range(10):
+        conv.add_user("x" * 40_000)
+    runtime = new_session_runtime(str(tmp_path), 128_000)
+    agent = Agent(provider, _registry(), runtime=runtime)
+
+    await _run(agent, conv)
+
+    assert provider.summary_calls == 1
+    state_path = Path(runtime.session.session_dir) / STATE_FILENAME
+    assert state_path.exists()
+    loaded = SummaryState.load(runtime.session.session_dir)
+    assert loaded.revision == 1
+    assert loaded.covered_messages > 0
+    assert loaded.summary_text
+
+
+class RollingProbeProvider:
+    """记录每次摘要请求的提示词，用于验证增量只摘新片段。"""
+
+    name = "rolling-probe-fake"
+    model = "rolling-probe-model"
+
+    def __init__(self) -> None:
+        self.summary_prompts: list[str] = []
+        self.round_marker = 0
+
+    async def stream(self, request: Request):
+        if not request.system.stable:
+            self.round_marker += 1
+            self.summary_prompts.append(
+                "\n".join(item.content for item in request.messages)
+            )
+            yield StreamEvent(
+                text=f"<summary>## 1 主要请求和意图\n第{self.round_marker}版摘要</summary>"
+            )
+            yield StreamEvent(done=True)
+            return
+        yield StreamEvent(text="ok")
+        yield StreamEvent(done=True)
+
+
+@pytest.mark.asyncio
+async def test_rolling_progression_summarizes_only_new_segments(tmp_path) -> None:
+    """长会话增量演进：首轮建状态，后续只摘覆盖点之后的新片段（AC4、端到端）。"""
+    provider = RollingProbeProvider()
+    conv = _history_of_tokens(128_000, 20)
+    runtime = new_session_runtime(str(tmp_path), 128_000)
+    agent = Agent(provider, _registry(), runtime=runtime)
+
+    await _run(agent, conv)
+
+    assert runtime.summary_state.revision == 1
+    first_prompt = provider.summary_prompts[0]
+    assert "上一版摘要" not in first_prompt
+    x_block = "x" * 22_396  # _history_of_tokens(128_000, 20) 的正文
+    assert first_prompt.count(x_block) == 20  # 首轮全量：全部历史送入模型
+
+    for _ in range(14):
+        conv.add_user("y" * 22_396)
+    await _run(agent, conv)
+
+    assert runtime.summary_state.revision == 2
+    second_prompt = provider.summary_prompts[1]
+    assert "上一版摘要" in second_prompt
+    assert "第1版摘要" in second_prompt
+    assert second_prompt.count("y" * 22_396) == 14
+    assert second_prompt.count(x_block) == 5  # 只重送上次保留的近期原文
+    assert len(second_prompt) < len(first_prompt)  # 摘要成本逐轮下降

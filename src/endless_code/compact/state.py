@@ -114,18 +114,57 @@ class FileReadRecord:
     timestamp: datetime
 
 
+class TrimLedger:
+    """L1 指针决策账本：冻结每个工具结果的最终指针文本，重放字节级幂等。
+
+    与 ``ContentReplacementState`` 分开：L0 冻结的是落盘预览，L1 冻结的是裁剪
+    指针；两者每轮各自重放，否则 L0 会在下一轮把预览盖回指针之上。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._pointers: dict[str, str] = {}
+
+    def pointer_for(self, tool_use_id: str) -> str | None:
+        with self._lock:
+            return self._pointers.get(tool_use_id)
+
+    def supersede(self, tool_use_id: str, pointer: str) -> str:
+        """首次写入并返回指针；重复调用返回已冻结文本，保证字节级幂等。"""
+        with self._lock:
+            return self._pointers.setdefault(tool_use_id, pointer)
+
+
 class RecoveryState:
-    """最近成功读取文件的线程安全快照。"""
+    """最近成功读取文件的线程安全快照，附执行期读取台账。"""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._files: dict[str, FileReadRecord] = {}
+        self._reads: dict[str, str] = {}
+        self._latest_call: dict[str, str] = {}
 
     def record_file(self, path: str, content: str) -> None:
         resolved = str(Path(path).expanduser().resolve())
         record = FileReadRecord(resolved, content, datetime.now(UTC))
         with self._lock:
             self._files[resolved] = record
+
+    def record_read(self, tool_call_id: str, path: str) -> None:
+        """记录一次读取的工具调用与路径，供 L1 判定过时读取。"""
+        resolved = str(Path(path).expanduser().resolve())
+        with self._lock:
+            self._reads[tool_call_id] = resolved
+            self._latest_call[resolved] = tool_call_id
+
+    def read_path_of(self, tool_call_id: str) -> str | None:
+        with self._lock:
+            return self._reads.get(tool_call_id)
+
+    def latest_call_for(self, path: str) -> str | None:
+        resolved = str(Path(path).expanduser().resolve())
+        with self._lock:
+            return self._latest_call.get(resolved)
 
     def snapshot(self) -> list[FileReadRecord]:
         with self._lock:

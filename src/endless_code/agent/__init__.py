@@ -19,13 +19,17 @@ from endless_code.checkpoint.diff import (
     truncate_diff,
 )
 from endless_code.compact import (
+    MIN_CALIBRATED_WINDOW,
     CompactCircuitBreaker,
     ContentReplacementState,
     ContextBudget,
     ManageInput,
     RecoveryState,
+    SessionContext,
+    SummaryState,
     TokenMeter,
     TriggerKind,
+    TrimLedger,
     appended_bytes,
     build_context_budget,
     estimate_tool_schema_tokens,
@@ -73,6 +77,7 @@ NOTICE_UNKNOWN_TOOLS = "（连续多轮只请求到未注册的工具，自动�
 NOTICE_STREAM_ERROR = "（请求出错，本轮已中断。）"
 NOTICE_CANCELLED = "（已取消。）"
 NOTICE_EMPTY_FINAL = "（任务已结束，模型未返回文本。）"
+NOTICE_WINDOW_CLAMPED = "（请求超限，有效上下文窗口已收敛为 {} token，后续按此压缩。）"
 DEFERRED_TOOLS_MESSAGE = (
     "以下 MCP 工具尚未加载；如果任务需要其中某个工具，请先使用 "
     "ToolSearch（mcp_search_tools）查询并激活：\n"
@@ -106,12 +111,15 @@ class SessionRuntime:
     replacement: ContentReplacementState
     recovery: RecoveryState
     auto_tracking: CompactCircuitBreaker
-    session: object
+    session: SessionContext
     context_window: int = 1_000_000
     budget: ContextBudget = field(
         default_factory=lambda: build_context_budget(1_000_000)
     )
     meter: TokenMeter = field(default_factory=TokenMeter)
+    summary_state: SummaryState = field(default_factory=SummaryState)
+    trim_ledger: TrimLedger = field(default_factory=TrimLedger)
+    clamp_notice_sent: bool = False
     usage_anchor: int = 0
     anchor_msg_len: int = 0
     run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -136,6 +144,8 @@ def new_session_runtime(
         context_window=context_window,
     )
     runtime.budget = build_context_budget(context_window)
+    # 新会话目录里不会有状态文件，load 的缺失分支返回全新状态。
+    runtime.summary_state = SummaryState.load(runtime.session.session_dir)
     return runtime
 
 
@@ -302,6 +312,8 @@ class Agent:
                     anchor_msg_len=self._runtime.anchor_msg_len,
                     estimated_token=estimated,
                     trigger=TriggerKind.AUTO,
+                    summary_state=self._runtime.summary_state,
+                    trim_ledger=self._runtime.trim_ledger,
                 )
             )
             if likely_auto:
@@ -315,6 +327,7 @@ class Agent:
                 )
             if managed.compacted:
                 self._runtime.meter.reset()
+                self._runtime.summary_state.save(self._runtime.session.session_dir)
 
             emergency_retried = False
             while True:
@@ -341,6 +354,9 @@ class Agent:
                 if emergency_retried:
                     break
                 emergency_retried = True
+                clamped = self._calibrate_window(conv, definitions)
+                if clamped:
+                    yield Event(notice=NOTICE_WINDOW_CLAMPED.format(clamped))
                 yield Event(compact=CompactEvent(CompactPhase.BEFORE_EMERGENCY))
                 try:
                     emergency = await manage_context(
@@ -363,6 +379,8 @@ class Agent:
                                 self._runtime.anchor_msg_len,
                             ),
                             trigger=TriggerKind.EMERGENCY,
+                            summary_state=self._runtime.summary_state,
+                            trim_ledger=self._runtime.trim_ledger,
                         )
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -384,6 +402,8 @@ class Agent:
                 self._runtime.usage_anchor = 0
                 self._runtime.anchor_msg_len = 0
                 self._runtime.meter.reset()
+                if emergency.compacted:
+                    self._invalidate_summary_state()
                 retry_estimate = self._runtime.meter.estimate(0, conv.messages(), 0)
                 if retry_estimate >= self._runtime.budget.effective_emergency_threshold:
                     round_state.error = PromptTooLongError("压缩后上下文仍超过安全阈值")
@@ -571,8 +591,39 @@ class Agent:
                 path = Path(raw_path)
                 content = path.read_text(encoding="utf-8", errors="replace")
                 self._runtime.recovery.record_file(str(path), content)
+                self._runtime.recovery.record_read(call.id, str(path))
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
+
+    def _calibrate_window(
+        self, conv: Conversation, tool_defs: list[ToolDefinition]
+    ) -> int:
+        """请求超限时把有效窗口收敛到模型实际接受量，返回新窗口，未变化返回 0。"""
+        runtime = self._runtime
+        observed = runtime.meter.estimate(
+            runtime.usage_anchor, conv.messages(), runtime.anchor_msg_len
+        )
+        clamped = max(
+            MIN_CALIBRATED_WINDOW,
+            min(runtime.context_window, int(observed * 0.95)),
+        )
+        if clamped >= runtime.context_window:
+            return 0
+        runtime.context_window = clamped
+        runtime.refresh_budget(tool_defs)
+        if runtime.clamp_notice_sent:
+            return 0
+        runtime.clamp_notice_sent = True
+        return clamped
+
+    def _invalidate_summary_state(self) -> None:
+        """全量重摘后作废滚动状态。
+
+        手动/紧急压缩不写滚动状态（F7），但历史已被重建，旧覆盖点会
+        指向不存在的内容，留着它下轮增量会拿陈旧摘要去合并、丢新摘要。
+        """
+        self._runtime.summary_state = SummaryState()
+        self._runtime.summary_state.save(self._runtime.session.session_dir)
 
     async def run_force_compact(
         self, conv: Conversation, mode: Mode = Mode.DEFAULT
@@ -605,11 +656,15 @@ class Agent:
                     anchor_msg_len=self._runtime.anchor_msg_len,
                     estimated_token=estimated,
                     trigger=TriggerKind.MANUAL,
+                    summary_state=self._runtime.summary_state,
+                    trim_ledger=self._runtime.trim_ledger,
                 )
             )
             self._runtime.usage_anchor = 0
             self._runtime.anchor_msg_len = 0
             self._runtime.meter.reset()
+            if result.compacted:
+                self._invalidate_summary_state()
             return result.before_tokens, result.after_tokens
 
     async def _execute_events(

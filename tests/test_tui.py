@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 from textual.widgets import Footer, Header, Input, OptionList, RichLog
 
+from endless_code.compact import SummaryState
 from endless_code.config import ProviderConfig
 from endless_code.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
 from endless_code.permission import Mode, new_engine
@@ -270,6 +271,66 @@ async def test_resume_switches_to_selected_persisted_session(
                 "恢复这条历史",
                 "历史回复",
             ]
+
+
+@pytest.mark.asyncio
+async def test_resume_state_continues_rolling_summary(tmp_path, monkeypatch) -> None:
+    """恢复会话接回滚动状态，下一次自动压缩继续走增量（AC5、端到端）。"""
+    monkeypatch.chdir(tmp_path)
+    directory = tmp_path / ".endless-code" / "sessions" / "20260805-120000-abef"
+    writer = Writer(str(directory), "fake-model")
+    writer.append(Message(role="user", content="## 历史会话摘要\n旧版摘要正文"))
+    writer.append(
+        Message(role="assistant", content="已加载上下文摘要与恢复信息，请继续。")
+    )
+    writer.append(Message(role="user", content="历史提问"))
+    writer.append(Message(role="assistant", content="历史回复"))
+    writer.close()
+    SummaryState("旧版摘要正文", 2, 3).save(str(directory))
+
+    provider = FakeProvider(
+        [
+            [
+                StreamEvent(text="<summary>## 1 主要请求和意图\n新版摘要</summary>"),
+                StreamEvent(done=True),
+            ],
+            [StreamEvent(text="收到"), StreamEvent(done=True)],
+        ]
+    )
+    with patch("endless_code.tui.app.new_provider", return_value=provider):
+        app = EndlessCodeApp(
+            [_config(context_window=32_000)], new_default_registry(), engine=_engine()
+        )
+        async with app.run_test() as pilot:
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            app._command_resume()
+            app._render_resume_options("")
+            target_index = next(
+                index
+                for index, item in enumerate(app._visible_resume_sessions)
+                if item.id == directory.name
+            )
+            app._resume_list.highlighted = target_index
+            app._resume_selected()
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+
+            assert app._runtime.summary_state.revision == 3
+            assert app._runtime.summary_state.covered_messages == 2
+
+            for _ in range(30):
+                app._conv.add_user("x" * 3_000)
+            app._handle_idle_input("继续")
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+
+            summary_prompt = "\n".join(
+                message.content for message in provider.requests[0][0]
+            )
+            assert "上一版摘要" in summary_prompt  # 走的是增量分支
+            assert "旧版摘要正文" in summary_prompt
+            assert app._runtime.summary_state.revision == 4
+            assert (
+                SummaryState.load(app._runtime.session.session_dir).revision == 4
+            )  # 新状态已落盘
 
 
 @pytest.mark.asyncio
@@ -692,6 +753,10 @@ async def test_model_switch_keeps_conversation_session_and_writer(
             count = app._conv.length()
             mode_before = app.mode
 
+            # 模拟已发生的窗口自校准，切换模型必须把它复位
+            app._runtime.context_window = 20_000
+            app._runtime.clamp_notice_sent = True
+
             app._handle_idle_input("/model 2")
             await pilot.pause()
 
@@ -700,6 +765,7 @@ async def test_model_switch_keeps_conversation_session_and_writer(
             assert app._runtime.session.session_id == session_id
             assert app._writer.path == writer_path
             assert app._runtime.context_window == 64_000
+            assert app._runtime.clamp_notice_sent is False
             assert app._runtime.budget.context_window == 64_000
             assert app._runtime.usage_anchor == 0
             assert app._runtime.anchor_msg_len == 0

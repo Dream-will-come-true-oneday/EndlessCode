@@ -41,6 +41,8 @@ class FakeHost:
             context_window=1000000,
             usable_window=960000,
             auto_compact_threshold=795000,
+            summary_revision=2,
+            calibrated_window=1000000,
         )
         self.memory_index_value = ""
         self.last_error_value = ""
@@ -269,9 +271,18 @@ def test_status_outputs_all_fields() -> None:
         "上下文窗口：1000000",
         "可用窗口：960000",
         "自动压缩阈值：795000",
+        "滚动摘要轮次：2",
     ):
         assert expected in joined
     assert "降级" not in joined
+    assert "校准后窗口" not in joined  # 未收敛时不占一行
+
+
+def test_status_shows_calibrated_window_after_clamp() -> None:
+    dispatcher, host = new_dispatcher()
+    host.session_info = replace(host.session_info, calibrated_window=121600)
+    assert dispatcher.try_dispatch("/status") is True
+    assert "校准后窗口：121600" in host.notices[-1]
 
 
 def test_status_marks_degraded_window() -> None:

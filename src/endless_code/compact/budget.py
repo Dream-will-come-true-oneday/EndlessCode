@@ -21,6 +21,9 @@ _OUTPUT_RESERVE_TOKENS = (0.040, 4_096, 40_000)
 # 压缩后的期望驻留量，供质量校验判定「摘得够不够」。
 COMPACT_TARGET_RATIO = 0.6
 
+# 窗口自校准的下限：防御异常小的估算把窗口打到不可用。
+MIN_CALIBRATED_WINDOW = 16_000
+
 
 @dataclass(frozen=True)
 class ContextBudget:

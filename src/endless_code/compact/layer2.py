@@ -34,15 +34,15 @@ def _provider_stream(provider, request: Request) -> AsyncIterator[StreamEvent]:
     return stream_fn(request)
 
 
-def pick_recent_tail(
+def recent_tail_start(
     messages: list[Message],
     budget: ContextBudget,
     max_tokens: int | None = None,
     min_messages: int | None = None,
-) -> list[Message]:
-    """从尾部保留足够的新近原文，且不拆开工具调用配对。"""
+) -> int:
+    """近期原文保留区的起始下标；空历史返回 0。"""
     if not messages:
-        return []
+        return 0
     keep = budget.recent_keep_tokens
     if max_tokens is not None and max_tokens > 0:
         keep = max_tokens
@@ -56,7 +56,17 @@ def pick_recent_tail(
             break
     while start > 0 and messages[start].role == "tool":
         start -= 1
-    return messages[start:]
+    return start
+
+
+def pick_recent_tail(
+    messages: list[Message],
+    budget: ContextBudget,
+    max_tokens: int | None = None,
+    min_messages: int | None = None,
+) -> list[Message]:
+    """从尾部保留足够的新近原文，且不拆开工具调用配对。"""
+    return messages[recent_tail_start(messages, budget, max_tokens, min_messages) :]
 
 
 def group_by_user_turn(messages: list[Message]) -> list[list[Message]]:
@@ -73,22 +83,42 @@ def group_by_user_turn(messages: list[Message]) -> list[list[Message]]:
     return groups
 
 
+PLACEHOLDER_TEXT = "已加载上下文摘要与恢复信息，请继续。"
+SUMMARY_MESSAGE_PREFIX = "## 历史会话摘要"
+
+
 def _join_after_summary(summary: Message, recent: list[Message]) -> list[Message]:
     if not recent:
         return [summary]
     if recent[0].role == "tool":
         return [summary]
     if recent[0].role == "user":
-        return [
-            summary,
-            Message(role="assistant", content="已加载上下文摘要与恢复信息，请继续。"),
-            *recent,
-        ]
+        return [summary, Message(role="assistant", content=PLACEHOLDER_TEXT), *recent]
     return [summary, *recent]
 
 
-async def summarize_once(input_, messages: list[Message]) -> str:
-    request = Request(messages=build_summary_prompt(messages), tools=[])
+def leading_compacted_count(messages: list[Message]) -> int:
+    """统计历史开头已被摘要覆盖的前导消息数（摘要消息与固定占位）。"""
+    count = 0
+    for message in messages:
+        if message.role == "user" and message.content.startswith(
+            SUMMARY_MESSAGE_PREFIX
+        ):
+            count += 1
+            continue
+        if message.role == "assistant" and message.content == PLACEHOLDER_TEXT:
+            count += 1
+            continue
+        break
+    return count
+
+
+async def summarize_once(
+    input_, messages: list[Message], previous_summary: str = ""
+) -> str:
+    request = Request(
+        messages=build_summary_prompt(messages, previous_summary), tools=[]
+    )
     text: list[str] = []
     async for event in _provider_stream(input_.provider, request):
         if event.err is not None:
@@ -98,7 +128,9 @@ async def summarize_once(input_, messages: list[Message]) -> str:
     return extract_summary("".join(text))
 
 
-async def ptl_retry(input_, messages: list[Message], first_error: Exception) -> str:
+async def ptl_retry(
+    input_, messages: list[Message], first_error: Exception, previous_summary: str = ""
+) -> str:
     """摘要请求超限时丢弃最旧用户组后重试。"""
     groups = group_by_user_turn(messages)
     error = first_error
@@ -114,10 +146,17 @@ async def ptl_retry(input_, messages: list[Message], first_error: Exception) -> 
             break
         reduced = [message for group in groups for message in group]
         try:
-            return await summarize_once(input_, reduced)
+            return await summarize_once(input_, reduced, previous_summary)
         except PromptTooLongError as exc:
             error = exc
     raise error
+
+
+def _summary_message(summary_text: str, recovery: str) -> Message:
+    return Message(
+        role="user",
+        content=f"{SUMMARY_MESSAGE_PREFIX}\n{summary_text}\n\n{recovery}",
+    )
 
 
 async def run_summary(
@@ -134,10 +173,31 @@ async def run_summary(
     except PromptTooLongError as exc:
         summary_text = await ptl_retry(input_, old_messages, exc)
     recovery = build_recovery_attachment(snapshot, input_.tool_defs, input_.budget)
-    summary = Message(
-        role="user",
-        content=f"## 历史会话摘要\n{summary_text}\n\n{recovery}",
+    summary = _summary_message(summary_text, recovery)
+    tail = pick_recent_tail(
+        old_messages, input_.budget, recent_keep_tokens, recent_min_messages
     )
+    return _join_after_summary(summary, tail), summary_text
+
+
+async def run_rolling_summary(
+    input_,
+    recent_keep_tokens: int | None = None,
+    recent_min_messages: int | None = None,
+) -> tuple[list[Message], str]:
+    """滚动增量摘要：只摘上次覆盖点之后的新片段，并与上一版摘要合并。"""
+    old_messages = input_.conv.messages()
+    if not old_messages:
+        return [], ""
+    state = input_.summary_state
+    segment = old_messages[state.covered_messages :]
+    snapshot = input_.recovery.snapshot()
+    try:
+        summary_text = await summarize_once(input_, segment, state.summary_text)
+    except PromptTooLongError as exc:
+        summary_text = await ptl_retry(input_, segment, exc, state.summary_text)
+    recovery = build_recovery_attachment(snapshot, input_.tool_defs, input_.budget)
+    summary = _summary_message(summary_text, recovery)
     tail = pick_recent_tail(
         old_messages, input_.budget, recent_keep_tokens, recent_min_messages
     )
@@ -150,10 +210,19 @@ async def auto_compact(
     recent_min_messages: int | None = None,
 ) -> tuple[list[Message], int, int]:
     before = input_.estimated_token
+    state = input_.summary_state
+    rolling = state is not None and state.usable_for_rolling(
+        len(input_.conv.messages())
+    )
     try:
-        messages, summary_text = await run_summary(
-            input_, recent_keep_tokens, recent_min_messages
-        )
+        if rolling:
+            messages, summary_text = await run_rolling_summary(
+                input_, recent_keep_tokens, recent_min_messages
+            )
+        else:
+            messages, summary_text = await run_summary(
+                input_, recent_keep_tokens, recent_min_messages
+            )
     except Exception:
         input_.auto_tracking.record_failure()
         raise
@@ -161,6 +230,9 @@ async def auto_compact(
         input_.auto_tracking.record_failure()
         raise CompactionQualityError("模型返回的摘要为空或过短，已保留原始历史。")
     input_.auto_tracking.record_success()
+    # 全量与滚动都要建状态：首次全量摘要同样产生覆盖点，缺了它第二次永远不会走增量。
+    if state is not None:
+        state.rolling_update(summary_text, leading_compacted_count(messages))
     return messages, before, estimate_tokens(0, messages, 0)
 
 

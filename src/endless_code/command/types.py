@@ -86,6 +86,8 @@ class SessionInfo:
     usable_window: int = 0
     auto_compact_threshold: int = 0
     degraded: bool = False
+    summary_revision: int = 0
+    calibrated_window: int = 0
 
 
 class CommandError(Exception):

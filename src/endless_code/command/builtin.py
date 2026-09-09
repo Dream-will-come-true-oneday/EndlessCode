@@ -112,10 +112,19 @@ def register_builtin_commands(registry: Registry) -> None:
             f"上下文窗口：{info.context_window}",
             f"可用窗口：{info.usable_window}",
             threshold_line,
-            f"Token 用量：↑{info.tokens_in} ↓{info.tokens_out}",
-            f"会话标识：{info.session_id}",
-            f"消息数：{info.message_count}",
+            f"滚动摘要轮次：{info.summary_revision}",
         ]
+        if info.calibrated_window and info.calibrated_window != info.context_window:
+            lines.insert(
+                7, f"校准后窗口：{info.calibrated_window}（已按模型实际接受量收敛）"
+            )
+        lines.extend(
+            [
+                f"Token 用量：↑{info.tokens_in} ↓{info.tokens_out}",
+                f"会话标识：{info.session_id}",
+                f"消息数：{info.message_count}",
+            ]
+        )
         host.show_notice("\n".join(lines))
 
     def model_command(host, args: str) -> None:

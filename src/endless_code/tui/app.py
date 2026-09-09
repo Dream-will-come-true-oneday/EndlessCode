@@ -39,7 +39,7 @@ from endless_code.command import (
     parse_command,
     register_builtin_commands,
 )
-from endless_code.compact import estimate_tokens, open_session_context
+from endless_code.compact import SummaryState, estimate_tokens, open_session_context
 from endless_code.config import ConfigError, ProviderConfig, effective_context_window
 from endless_code.conversation import Conversation
 from endless_code.llm import Provider, new_provider
@@ -198,6 +198,7 @@ class EndlessCodeApp(App):
         self._dispatcher = Dispatcher(self._command_registry, self)
         self._suggest_specs: list[CommandSpec] = []
         self._output_style: str = DEFAULT_STYLE_NAME
+        self._configured_window: int = 0
         for provider in providers:
             try:
                 secret = provider.resolve_api_key()
@@ -267,8 +268,9 @@ class EndlessCodeApp(App):
             if self._audit_writer is not None:
                 self._audit_writer.close()
             self._provider = new_provider(cfg)
+            self._configured_window = effective_context_window(cfg)
             self._runtime = new_session_runtime(
-                str(Path.cwd().resolve()), effective_context_window(cfg)
+                str(Path.cwd().resolve()), self._configured_window
             )
             self._writer = Writer(
                 self._runtime.session.session_dir, self._provider.model
@@ -353,7 +355,9 @@ class EndlessCodeApp(App):
         if secret:
             self._secrets.add(secret)
         if self._runtime is not None:
-            self._runtime.context_window = effective_context_window(cfg)
+            self._configured_window = effective_context_window(cfg)
+            self._runtime.context_window = self._configured_window
+            self._runtime.clamp_notice_sent = False
             self._runtime.refresh_budget([])
             self._runtime.usage_anchor = 0
             self._runtime.anchor_msg_len = 0
@@ -640,10 +644,17 @@ class EndlessCodeApp(App):
             session_id=(self._runtime.session.session_id if self._runtime else "--"),
             message_count=self._conv.length(),
             output_style=style_label(self._output_style),
-            context_window=(self._runtime.context_window if self._runtime else 0),
+            context_window=(
+                self._configured_window
+                or (self._runtime.context_window if self._runtime else 0)
+            ),
             usable_window=budget.usable_window if budget else 0,
             auto_compact_threshold=(budget.effective_auto_threshold if budget else 0),
             degraded=budget.degraded if budget else False,
+            summary_revision=(
+                self._runtime.summary_state.revision if self._runtime else 0
+            ),
+            calibrated_window=(self._runtime.context_window if self._runtime else 0),
         )
 
     def get_memory_index(self) -> str:
@@ -958,6 +969,10 @@ class EndlessCodeApp(App):
             if self._runtime is not None:
                 self._runtime.session = open_session_context(
                     str(Path.cwd().resolve()), info.id
+                )
+                # 旧会话的滚动摘要状态跟着目录一起接回，损坏时 load 自动回全新状态。
+                self._runtime.summary_state = SummaryState.load(
+                    self._runtime.session.session_dir
                 )
                 self._audit_writer = AuditWriter(
                     self._runtime.session.session_dir,

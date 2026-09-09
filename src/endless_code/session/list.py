@@ -45,6 +45,8 @@ def list_sessions(sessions_dir: str) -> list[SessionInfo]:
 
 
 def _read_summary(path: Path) -> tuple[str, str]:
+    """返回 (标题, 最近使用的模型)：完整遍历，标题取首条 user 消息。"""
+    title = ""
     model = ""
     try:
         with path.open(encoding="utf-8") as file:
@@ -53,16 +55,18 @@ def _read_summary(path: Path) -> tuple[str, str]:
                     entry = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                if not model and isinstance(entry.get("model"), str):
+                if isinstance(entry.get("model"), str) and entry["model"]:
                     model = entry["model"]
-                if entry.get("role") == "user" and isinstance(
-                    entry.get("content"), str
+                if (
+                    not title
+                    and entry.get("role") == "user"
+                    and isinstance(entry.get("content"), str)
                 ):
                     text = entry["content"].strip().replace("\n", " ")
-                    return _truncate(text) or "（空消息）", model
+                    title = _truncate(text) or "（空消息）"
     except OSError:
         return "（无法读取）", model
-    return "（无标题会话）", model
+    return title or "（无标题会话）", model
 
 
 def _truncate(text: str, limit: int = 50) -> str:

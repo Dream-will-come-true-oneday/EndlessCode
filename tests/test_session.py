@@ -67,3 +67,58 @@ def test_list_and_cleanup_only_use_new_session_ids(tmp_path: Path) -> None:
     clean_expired(str(sessions))
     assert not expired.exists()
     assert old.exists()
+
+
+def test_writer_records_model_and_style_markers(tmp_path: Path) -> None:
+    directory = tmp_path / "20260909-120000-abcd"
+    writer = Writer(str(directory), "m1")
+    writer.append(Message(role="user", content="hi"))
+    writer.write_model_marker("m1", "m2")
+    writer.write_style_marker("concise")
+    writer.close()
+
+    rows = [
+        json.loads(line)
+        for line in (directory / "conversation.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [row.get("type") or row.get("role") for row in rows] == [
+        "user",
+        "model_switch",
+        "style_switch",
+    ]
+    assert rows[1]["model"] == "m2"
+    assert rows[1]["previous"] == "m1"
+    assert isinstance(rows[1]["ts"], int)
+    assert rows[2]["style"] == "concise"
+
+
+def test_loader_ignores_switch_markers(tmp_path: Path) -> None:
+    directory = tmp_path / "20260909-120000-abcd"
+    writer = Writer(str(directory), "m1")
+    writer.append(Message(role="user", content="ok"))
+    writer.write_model_marker("m1", "m2")
+    writer.append(Message(role="assistant", content="reply"))
+    writer.write_style_marker("concise")
+    writer.close()
+
+    loaded = load_session(str(directory))
+    assert [message.role for message in loaded.messages] == ["user", "assistant"]
+    assert [message.content for message in loaded.messages] == ["ok", "reply"]
+
+
+def test_list_sessions_reports_latest_model(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    directory = sessions / "20260909-120000-abcd"
+    directory.mkdir(parents=True)
+    writer = Writer(str(directory), "m1")
+    writer.append(Message(role="user", content="第一条标题"))
+    writer.append(Message(role="assistant", content="reply"))
+    writer.write_model_marker("m1", "m2")
+    writer.close()
+
+    items = list_sessions(str(sessions))
+    assert len(items) == 1
+    assert items[0].model == "m2"
+    assert items[0].title.startswith("第一条标题")

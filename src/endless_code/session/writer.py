@@ -48,6 +48,26 @@ class Writer:
         with self._lock:
             self._write({"type": "compact", "ts": int(time.time())})
 
+    def write_model_marker(self, previous: str, current: str) -> None:
+        """记录会话内模型切换，供追溯与最近模型展示。"""
+        with self._lock:
+            self._model = current
+            self._write(
+                {
+                    "type": "model_switch",
+                    "ts": int(time.time()),
+                    "model": current,
+                    "previous": previous,
+                }
+            )
+
+    def write_style_marker(self, style: str) -> None:
+        """记录输出样式切换。"""
+        with self._lock:
+            self._write(
+                {"type": "style_switch", "ts": int(time.time()), "style": style}
+            )
+
     def append_all(self, messages: list[Message]) -> None:
         for message in messages:
             self.append(message)

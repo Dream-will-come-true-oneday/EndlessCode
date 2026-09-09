@@ -1,0 +1,162 @@
+[
+  {
+    "source": "d87656bb3df71faddd0e14ce2c3ba9f69573921b",
+    "new": "130250f10c9f7c1941333f178b2542c89dd3f631",
+    "title": "Delete CLAUDE.md"
+  },
+  {
+    "source": "fbc30fd047e49052617ffe921c350c8fbeb8ec76",
+    "new": "a695d33edcde60aeaa2b59c43de227b4f4b7b223",
+    "title": "feat: 实现工具系统——从聊天机器人到能干活的 Agent"
+  },
+  {
+    "source": "5cf0367f38a5c1b6453dfd93747afc7e0b352ba2",
+    "new": "c1435af5532e61c582f47e2e783c7ec39de3ce31",
+    "title": "docs: 更新工具系统设计文档与 CLAUDE.md"
+  },
+  {
+    "source": "38db3b6c3955639089861b5ba918b391f9719db0",
+    "new": "0cfd73a3b95ebaa18ed172571cd49a2e38bc1c2c",
+    "title": "docs: adapt agent loop specs for endless-code"
+  },
+  {
+    "source": "d87f1f2a14dee2ed7b4e46dafab24b5478f4bc56",
+    "new": "48f6edc3bcc22646e299472c661bcec60a3d9320",
+    "title": "feat: add agent loop foundations and output redaction"
+  },
+  {
+    "source": "9bad816c032de8a6b0cd4b7622294adb69c90c5f",
+    "new": "84f4340f3a172ef766793f32047ba210a3d6050e",
+    "title": "fix: classify tools and clean up bash processes"
+  },
+  {
+    "source": "b6cd7bce9bfa68ee3dca20fbce48f2dd52efc44a",
+    "new": "5fcc269562a437aed16c2017aaea335746e32bd4",
+    "title": "feat: report usage from openai-compatible streams"
+  },
+  {
+    "source": "dfdba9746acc4f9f46cbee842e3faa439a895ee4",
+    "new": "c372c11cf11d13022f51aa1d16af85eac7c4dd12",
+    "title": "feat: implement cancellable react agent loop"
+  },
+  {
+    "source": "f1dbfea906cf891ec5215f0288594a837ae6b791",
+    "new": "deaafd92bf6122c42e06d6a975dc3780a113f1a1",
+    "title": "feat: connect tui to agent loop modes and cancellation"
+  },
+  {
+    "source": "ccd3384be60540ddbb10587e21dd4474a9fd2844",
+    "new": "76b3d99768cb277b2a86e488a90ff165c79bf708",
+    "title": "docs: describe agent loop controls"
+  },
+  {
+    "source": "afa0a5d9e4facc84407ad5af3157c064eb08f41f",
+    "new": "58f4235d0ccbfe60e6091e7e0db7c0e8e1aace78",
+    "title": "chore: complete Agent Loop validation"
+  },
+  {
+    "source": "668cac5be18e7ed393922af0fac0c6e589b4b5f4",
+    "new": "17d45cf452c8af436f01a22fe2127b7b59e6d7a0",
+    "title": "docs: position endless-code as a terminal coding agent"
+  },
+  {
+    "source": "1a9f5f141427ef75bb0e5327a18c2868a25bd355",
+    "new": "875f7558ce26bb9afadb412422ec2ecc119d6c6e",
+    "title": "feat: engineer system prompts and provider adapters"
+  },
+  {
+    "source": "a5025ac584c40bcace908bb535f7ccdce7d01733",
+    "new": "9262064979d04ef14b272ac21ad25a309e275592",
+    "title": "完善中文项目说明"
+  },
+  {
+    "source": "5006648b620f70885850a27460d45b01b7ad2445",
+    "new": "1e6c0260e16840442001f972747dcd40b2aeb6f1",
+    "title": "feat: add permission policy engine"
+  },
+  {
+    "source": "5006648b620f70885850a27460d45b01b7ad2445",
+    "new": "36bf6803445a4f364cd8049f30c5ef79380e7853",
+    "title": "test: cover permission and TUI policy paths"
+  },
+  {
+    "source": "5006648b620f70885850a27460d45b01b7ad2445",
+    "new": "27d992af159ecf0722e1a6874a63f1eee2d4866b",
+    "title": "docs: document permission settings and safety boundaries"
+  },
+  {
+    "source": "53481f62f7281c4096b81ddc9940d4195a945680",
+    "new": "6a48c7cd1f1127e3e288a5de76b27e6ca2784b35",
+    "title": "Delete docs/example-question.png"
+  },
+  {
+    "source": "aa2ae1cb6732a5d51497e543ce209c772c4100e8",
+    "new": "3467e46b3af093548310ac9ea30d9cc33c7efa9e",
+    "title": "feat: add MCP client and remote tool adapters"
+  },
+  {
+    "source": "aa2ae1cb6732a5d51497e543ce209c772c4100e8",
+    "new": "29a2f1c4426aefb8974b1842d86820a596eef0a5",
+    "title": "test: cover MCP config, transports, and tool dispatch"
+  },
+  {
+    "source": "aa2ae1cb6732a5d51497e543ce209c772c4100e8",
+    "new": "12aec0d003d3b8fe2cf0e3c51a9745c1f2194467",
+    "title": "docs: document MCP configuration and migration"
+  },
+  {
+    "source": "cf4439e27e08dfdcb2ebcef6c011cfcf86a7f75f",
+    "new": "43eb00cf124d23d7abb8d2742f82d57b6d3c478d",
+    "title": "fix: 修复 TUI 输入框退格一次删除两个字符"
+  },
+  {
+    "source": "5738ccd29fbff7d4aaf42ff7729495417d625d22",
+    "new": "7dede01bb9ead9d818fb431a88b64083e1756240",
+    "title": "feat: add long-context compaction and recovery"
+  },
+  {
+    "source": "5738ccd29fbff7d4aaf42ff7729495417d625d22",
+    "new": "42058b6bc5be2520e1d8b804a361a54049933956",
+    "title": "test: cover compaction, recovery, and context limits"
+  },
+  {
+    "source": "5738ccd29fbff7d4aaf42ff7729495417d625d22",
+    "new": "e5b6da0d96a6650219ec1244364631e17a9c3673",
+    "title": "docs: document long-session context management"
+  },
+  {
+    "source": "4ff1e415bb18396c2dd82a22aa85a3384b5a3399",
+    "new": "b1ecc4b08288218a0811d3541db728b5938b993a",
+    "title": "feat: add project instructions and session persistence"
+  },
+  {
+    "source": "4ff1e415bb18396c2dd82a22aa85a3384b5a3399",
+    "new": "8244b2088432dfdd0945d51fa3c421dce8e492a2",
+    "title": "test: cover instructions, sessions, and memory flows"
+  },
+  {
+    "source": "4ff1e415bb18396c2dd82a22aa85a3384b5a3399",
+    "new": "9a85d97e813c605a47e98ea9826a58b573a7c978",
+    "title": "docs: document cross-session memory and recovery"
+  },
+  {
+    "source": "d1f9a8e53f16b94b70c5622caebb446320c66cba",
+    "new": "1fa6bdea0adaf18f0e82872b441955c2d6f2338d",
+    "title": "feat: configure default context window and dynamic limits"
+  },
+  {
+    "source": "d1f9a8e53f16b94b70c5622caebb446320c66cba",
+    "new": "a2cedd283658ccab5dba498458c232be22c3f848",
+    "title": "test: verify context-window scaling behavior"
+  },
+  {
+    "source": "d1f9a8e53f16b94b70c5622caebb446320c66cba",
+    "new": "ee6517f8cf2529f01706dcb273d6f250a7fdcb43",
+    "title": "docs: record the 1M context-window design"
+  },
+  {
+    "source": "7c1c2b6e89f2ca515fd6cb9ef102256f1c0dd1d7",
+    "new": "d62e30a59e9fa8df6fa5c5c10b7c9762abbbfde5",
+    "title": "ci: 新增 GitHub Actions 工作流"
+  }
+]

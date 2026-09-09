@@ -465,6 +465,40 @@ async def test_stream_error_has_terminal_history_and_can_continue() -> None:
     assert conv.messages()[-1].content == "ok"
 
 
+class RaisingProvider:
+    """stream 产出部分文本后直接抛异常，模拟网络重置等带外故障。"""
+
+    name = "raising-fake"
+    model = "raising-model"
+
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def stream(self, request):
+        self.requests.append(request)
+        yield StreamEvent(text="partial")
+        if len(self.requests) == 1:
+            raise RuntimeError("connection reset")
+        yield StreamEvent(done=True)
+
+
+@pytest.mark.asyncio
+async def test_provider_raised_error_takes_recovery_path_and_can_continue() -> None:
+    provider = RaisingProvider()
+    conv = Conversation()
+    conv.add_user("first")
+    events = await _run(Agent(provider, _registry()), conv)
+    assert any(isinstance(event.err, RuntimeError) for event in events)
+    assert sum(event.done for event in events) == 1
+    assert NOTICE_STREAM_ERROR in conv.messages()[-1].content
+    assert conv.last_role() == "assistant"
+
+    conv.add_user("second")
+    events = await _run(Agent(provider, _registry()), conv)
+    assert any(event.text == "partial" for event in events)
+    assert conv.messages()[-1].content == "partial"
+
+
 class RequestProvider:
     name = "request-fake"
     model = "request-model"

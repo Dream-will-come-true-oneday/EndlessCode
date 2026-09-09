@@ -29,6 +29,12 @@ dev = [
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 
+[tool.ruff]
+# ruff 0.16 起 format 会重排 Markdown 中的 Python 代码块。docs 下的 spec/plan/task
+# 大量使用类体内缩进片段作为实现契约，重排后会变成带 self 的模块级函数，
+# 误导按文档实现的人，故把 docs 排除；src、tests、examples 仍全量受检。
+extend-exclude = ["docs"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

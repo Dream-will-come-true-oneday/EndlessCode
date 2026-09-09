@@ -5,7 +5,14 @@ import pytest
 from endless_code.command.builtin import register_builtin_commands
 from endless_code.command.dispatcher import Dispatcher
 from endless_code.command.registry import Registry
-from endless_code.command.types import CommandKind, CommandSpec, SessionInfo
+from endless_code.command.types import (
+    CommandKind,
+    CommandSpec,
+    ModelOption,
+    SessionInfo,
+    StyleOption,
+    SwitchResult,
+)
 from endless_code.permission import Mode
 
 
@@ -28,6 +35,8 @@ class FakeHost:
             tokens_out=22,
             session_id="sess-1",
             message_count=3,
+            output_style="默认",
+            context_window=1000000,
         )
         self.memory_index_value = ""
         self.last_error_value = ""
@@ -41,6 +50,22 @@ class FakeHost:
         self.rewind_called = False
         self.rewind_available_value = True
         self.checkpoint_mode_value = "git shadow"
+        self.model_options = [
+            ModelOption(1, "fake", "fake-model", True),
+            ModelOption(2, "deepseek", "deepseek-chat", False),
+        ]
+        self.style_options = [
+            StyleOption("default", "默认", "d", True),
+            StyleOption("concise", "简洁", "c", False),
+        ]
+        self.switch_result = SwitchResult(
+            True, "已切换到 deepseek（deepseek-chat）。", "deepseek", "deepseek-chat"
+        )
+        self.style_result = SwitchResult(
+            True, "已切换到 简洁 样式，下一轮回答生效。", "concise"
+        )
+        self.switch_calls: list[str] = []
+        self.style_calls: list[str] = []
 
     def show_notice(self, text: str) -> None:
         self.notices.append(text)
@@ -63,6 +88,20 @@ class FakeHost:
     def set_mode(self, mode: Mode) -> None:
         self.mode = mode
         self.set_mode_calls.append(mode)
+
+    def get_model_options(self) -> list[ModelOption]:
+        return self.model_options
+
+    def switch_model(self, selector: str) -> SwitchResult:
+        self.switch_calls.append(selector)
+        return self.switch_result
+
+    def get_style_options(self) -> list[StyleOption]:
+        return self.style_options
+
+    def set_output_style(self, name: str) -> SwitchResult:
+        self.style_calls.append(name)
+        return self.style_result
 
     def get_session_info(self) -> SessionInfo:
         return self.session_info
@@ -216,8 +255,74 @@ def test_status_outputs_all_fields() -> None:
     dispatcher, host = new_dispatcher()
     assert dispatcher.try_dispatch("/status") is True
     joined = "\n".join(host.notices)
-    for expected in ("0.1.0", "fake", "fake-model", "sess-1", "3"):
+    for expected in (
+        "0.1.0",
+        "fake",
+        "fake-model",
+        "sess-1",
+        "3",
+        "输出样式：默认",
+        "上下文窗口：1000000",
+    ):
         assert expected in joined
+
+
+def test_model_command_lists_options_and_marks_current() -> None:
+    dispatcher, host = new_dispatcher()
+    assert dispatcher.try_dispatch("/model") is True
+    notice = host.notices[-1]
+    assert "1. fake — fake-model（当前）" in notice
+    assert "2. deepseek — deepseek-chat" in notice
+    assert host.switch_calls == []
+
+
+def test_model_command_switch_success_uses_notice() -> None:
+    dispatcher, host = new_dispatcher()
+    assert dispatcher.try_dispatch("/model 2") is True
+    assert host.switch_calls == ["2"]
+    assert "已切换到 deepseek" in host.notices[-1]
+    assert host.errors == []
+
+
+def test_model_command_switch_failure_uses_error() -> None:
+    dispatcher, host = new_dispatcher()
+    host.switch_result = SwitchResult(
+        False, "未找到模型：nope。输入 /model 查看可用列表。"
+    )
+    assert dispatcher.try_dispatch("/model nope") is True
+    assert host.switch_calls == ["nope"]
+    assert "未找到模型" in host.errors[-1]
+    assert host.notices == []
+
+
+def test_model_command_empty_list() -> None:
+    dispatcher, host = new_dispatcher()
+    host.model_options = []
+    assert dispatcher.try_dispatch("/model") is True
+    assert host.notices[-1] == "未配置可用模型。"
+    assert host.switch_calls == []
+
+
+def test_style_command_lists_and_switches() -> None:
+    dispatcher, host = new_dispatcher()
+    assert dispatcher.try_dispatch("/style") is True
+    notice = host.notices[-1]
+    assert "concise（简洁）" in notice and notice.count("（当前）") == 1
+    assert dispatcher.try_dispatch("/style concise") is True
+    assert host.style_calls == ["concise"]
+    assert "下一轮回答生效" in host.notices[-1]
+    assert host.errors == []
+
+
+def test_style_command_unknown_reports_error() -> None:
+    dispatcher, host = new_dispatcher()
+    host.style_result = SwitchResult(
+        False,
+        "未知输出样式：nope。可选：default / concise / explanatory / learning",
+    )
+    assert dispatcher.try_dispatch("/style nope") is True
+    assert "可选：default" in host.errors[-1]
+    assert host.notices == []
 
 
 def test_review_sends_prompt_message() -> None:
@@ -336,6 +441,8 @@ def test_complete_excludes_hidden() -> None:
         "/audit",
         "/memory",
         "/permissions",
+        "/model",
+        "/style",
         "/status",
         "/review",
         "/fix",

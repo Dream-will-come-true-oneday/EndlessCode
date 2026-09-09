@@ -31,8 +31,11 @@ from endless_code.checkpoint import CheckpointManager, RestoreScope
 from endless_code.command import (
     CommandSpec,
     Dispatcher,
+    ModelOption,
     Registry,
     SessionInfo,
+    StyleOption,
+    SwitchResult,
     parse_command,
     register_builtin_commands,
 )
@@ -44,7 +47,13 @@ from endless_code.llm import Provider, new_provider
 from endless_code.memory import Manager
 from endless_code.permission import AuditWriter, Mode, Outcome
 from endless_code.permission.engine import Engine, new_engine
-from endless_code.prompt import EXECUTE_DIRECTIVE
+from endless_code.prompt import (
+    DEFAULT_STYLE_NAME,
+    EXECUTE_DIRECTIVE,
+    all_styles,
+    find_style,
+    style_label,
+)
 from endless_code.security import redact_sensitive, summarize_tool_args
 from endless_code.session import Writer, list_sessions, load_session
 from endless_code.tool import Registry as ToolRegistry
@@ -189,6 +198,7 @@ class EndlessCodeApp(App):
         register_builtin_commands(self._command_registry)
         self._dispatcher = Dispatcher(self._command_registry, self)
         self._suggest_specs: list[CommandSpec] = []
+        self._output_style: str = DEFAULT_STYLE_NAME
         for provider in providers:
             try:
                 secret = provider.resolve_api_key()
@@ -290,6 +300,7 @@ class EndlessCodeApp(App):
                 instruction_text=self._instruction_text,
                 audit_writer=self._audit_writer,
                 checkpoint=self._checkpoint,
+                output_style=self._output_style,
             )
             return True
         except Exception as exc:  # noqa: BLE001
@@ -297,12 +308,101 @@ class EndlessCodeApp(App):
             self._write_error(f"{type(exc).__name__}: {exc}")
             return False
 
+    def _resolve_model_selector(self, selector: str) -> ProviderConfig | None:
+        """把编号或名称/模型标识解析为目标配置；未命中返回 None。"""
+        needle = selector.strip()
+        if not needle:
+            return None
+        if needle.isdigit():
+            index = int(needle) - 1
+            if 0 <= index < len(self._providers):
+                return self._providers[index]
+            return None
+        for cfg in self._providers:
+            if needle.lower() in (cfg.name.lower(), cfg.model.lower()):
+                return cfg
+        return None
+
+    def _switch_provider(self, cfg: ProviderConfig) -> SwitchResult:
+        """运行期切换模型：先构造后提交，保证失败时原状态零变更。"""
+        if (
+            self._provider is not None
+            and cfg.name == self._provider.name
+            and cfg.model == self._provider.model
+        ):
+            return SwitchResult(
+                True, f"当前已在使用 {cfg.name}（{cfg.model}）。", cfg.name, cfg.model
+            )
+        try:
+            secret = cfg.resolve_api_key()
+        except Exception as exc:  # noqa: BLE001
+            return SwitchResult(
+                False,
+                self._safe(
+                    f"模型 {cfg.name} 的 API key 不可用：{type(exc).__name__}: {exc}"
+                ),
+            )
+        try:
+            provider = new_provider(cfg)
+        except Exception as exc:  # noqa: BLE001
+            return SwitchResult(
+                False, self._safe(f"切换失败：{type(exc).__name__}: {exc}")
+            )
+
+        old_model = self._provider.model if self._provider else ""
+        self._provider = provider
+        if secret:
+            self._secrets.add(secret)
+        self._runtime.context_window = effective_context_window(cfg)
+        self._runtime.usage_anchor = 0
+        self._runtime.anchor_msg_len = 0
+        if self._writer is not None:
+            self._writer.write_model_marker(old_model, provider.model)
+        if self._memory_manager is not None:
+            self._memory_manager.set_provider(provider, provider.model)
+        self._agent = Agent(
+            provider,
+            self._tool_registry,
+            self._version,
+            self._engine,
+            self._runtime,
+            memory_manager=self._memory_manager,
+            instruction_text=self._instruction_text,
+            audit_writer=self._audit_writer,
+            checkpoint=self._checkpoint,
+            output_style=self._output_style,
+        )
+        self._update_status()
+        return SwitchResult(
+            True, f"已切换到 {cfg.name}（{provider.model}）。", cfg.name, provider.model
+        )
+
+    def _command_set_style(self, name: str) -> SwitchResult:
+        """切换输出样式；下一轮请求生效，不触碰历史消息。"""
+        style = find_style(name)
+        if style is None:
+            options = " / ".join(item.name for item in all_styles())
+            return SwitchResult(False, f"未知输出样式：{name}。可选：{options}")
+        if style.name == self._output_style:
+            return SwitchResult(True, f"当前已是 {style.label} 样式。", style.name)
+        self._output_style = style.name
+        if self._agent is not None:
+            self._agent.set_output_style(style.name)
+        if self._writer is not None:
+            self._writer.write_style_marker(style.name)
+        self._update_status()
+        return SwitchResult(
+            True, f"已切换到 {style.label} 样式，下一轮回答生效。", style.name
+        )
+
     def _update_status(self) -> None:
         provider_name = self._provider.name if self._provider else "--"
         model = self._provider.model if self._provider else "--"
         mode_label = MODE_LABELS.get(self._mode, str(self._mode))
+        style = style_label(self._output_style)
+        window = self._runtime.context_window if self._runtime else 0
         self.sub_title = (
-            f"{mode_label} | {provider_name} | {model} | "
+            f"{mode_label} | {provider_name} | {model} | {style} | {window} ctx | "
             f"↑{self._usage_in} ↓{self._usage_out} tok | /help 查看命令"
         )
 
@@ -488,6 +588,38 @@ class EndlessCodeApp(App):
         self._write_notice(f"已切换到 {MODE_LABELS.get(mode, str(mode))} 模式")
         self._update_status()
 
+    # ---- 模型与输出样式：命令层经此访问切换能力，均只在空闲态生效 ----
+
+    def get_model_options(self) -> list[ModelOption]:
+        current = self._provider.name if self._provider else ""
+        return [
+            ModelOption(index, cfg.name, cfg.model, cfg.name == current)
+            for index, cfg in enumerate(self._providers, 1)
+        ]
+
+    def switch_model(self, selector: str) -> SwitchResult:
+        if self._state is not SessionState.IDLE:
+            return SwitchResult(False, "当前任务尚未结束，暂不能切换模型。")
+        cfg = self._resolve_model_selector(selector)
+        if cfg is None:
+            return SwitchResult(
+                False, f"未找到模型：{selector}。输入 /model 查看可用列表。"
+            )
+        return self._switch_provider(cfg)
+
+    def get_style_options(self) -> list[StyleOption]:
+        return [
+            StyleOption(
+                item.name, item.label, item.description, item.name == self._output_style
+            )
+            for item in all_styles()
+        ]
+
+    def set_output_style(self, name: str) -> SwitchResult:
+        if self._state is not SessionState.IDLE:
+            return SwitchResult(False, "当前任务尚未结束，暂不能切换输出样式。")
+        return self._command_set_style(name)
+
     def get_session_info(self) -> SessionInfo:
         return SessionInfo(
             version=self._version,
@@ -498,6 +630,8 @@ class EndlessCodeApp(App):
             tokens_out=self._usage_out,
             session_id=(self._runtime.session.session_id if self._runtime else "--"),
             message_count=self._conv.length(),
+            output_style=style_label(self._output_style),
+            context_window=(self._runtime.context_window if self._runtime else 0),
         )
 
     def get_memory_index(self) -> str:

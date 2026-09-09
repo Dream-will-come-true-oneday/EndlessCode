@@ -9,8 +9,11 @@ from endless_code.command.types import (
     CommandError,
     CommandKind,
     CommandSpec,
+    ModelOption,
     ParsedCommand,
     SessionInfo,
+    StyleOption,
+    SwitchResult,
 )
 
 __all__ = [
@@ -19,9 +22,12 @@ __all__ = [
     "CommandKind",
     "CommandSpec",
     "Dispatcher",
+    "ModelOption",
     "ParsedCommand",
     "Registry",
     "SessionInfo",
+    "StyleOption",
+    "SwitchResult",
     "parse_command",
     "register_builtin_commands",
 ]

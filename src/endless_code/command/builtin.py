@@ -98,18 +98,58 @@ def register_builtin_commands(registry: Registry) -> None:
         host.set_mode(mode)
         host.show_notice(f"已切换到 {mode} 模式。")
 
-    def status_command(host, _args: str) -> None:
+    def status_command(host, args: str) -> None:
         info = host.get_session_info()
         lines = [
             f"版本：{info.version}",
             f"Provider：{info.provider}",
             f"模型：{info.model}",
             f"权限模式：{info.mode}",
+            f"输出样式：{info.output_style}",
+            f"上下文窗口：{info.context_window}",
             f"Token 用量：↑{info.tokens_in} ↓{info.tokens_out}",
             f"会话标识：{info.session_id}",
             f"消息数：{info.message_count}",
         ]
         host.show_notice("\n".join(lines))
+
+    def model_command(host, args: str) -> None:
+        needle = args.strip()
+        if not needle:
+            options = host.get_model_options()
+            if not options:
+                host.show_notice("未配置可用模型。")
+                return
+            lines = ["可用模型："]
+            for option in options:
+                line = f"{option.index}. {option.name} — {option.model}"
+                if option.current:
+                    line += "（当前）"
+                lines.append(line)
+            host.show_notice("\n".join(lines))
+            return
+        result = host.switch_model(needle)
+        if result.ok:
+            host.show_notice(result.message)
+        else:
+            host.show_error(result.message)
+
+    def style_command(host, args: str) -> None:
+        needle = args.strip()
+        if not needle:
+            lines = ["输出样式："]
+            for option in host.get_style_options():
+                line = f"{option.name}（{option.label}）— {option.description}"
+                if option.current:
+                    line += "（当前）"
+                lines.append(line)
+            host.show_notice("\n".join(lines))
+            return
+        result = host.set_output_style(needle)
+        if result.ok:
+            host.show_notice(result.message)
+        else:
+            host.show_error(result.message)
 
     def review_command(host, args: str) -> None:
         host.send_user_message(build_review_prompt(args))
@@ -212,6 +252,24 @@ def register_builtin_commands(registry: Registry) -> None:
             handler=permissions_command,
             aliases=("/perm",),
             arg_hint=f"[{_PERMISSION_OPTIONS}]",
+        ),
+        CommandSpec(
+            name="/model",
+            description="列出或切换本会话使用的模型",
+            usage="/model [编号|名称]",
+            kind=CommandKind.UI,
+            handler=model_command,
+            aliases=("/models",),
+            arg_hint="[编号|名称]",
+        ),
+        CommandSpec(
+            name="/style",
+            description="列出或切换输出样式",
+            usage="/style [样式名]",
+            kind=CommandKind.UI,
+            handler=style_command,
+            aliases=("/styles",),
+            arg_hint="[样式名]",
         ),
         CommandSpec(
             name="/status",

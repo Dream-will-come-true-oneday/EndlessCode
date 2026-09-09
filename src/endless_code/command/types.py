@@ -40,6 +40,36 @@ class ParsedCommand:
 
 
 @dataclass(frozen=True)
+class ModelOption:
+    """一个可选模型：编号、provider 名、模型标识与是否当前使用。"""
+
+    index: int
+    name: str
+    model: str
+    current: bool
+
+
+@dataclass(frozen=True)
+class StyleOption:
+    """一个可选输出样式：标识、展示名、一句话说明与是否当前使用。"""
+
+    name: str
+    label: str
+    description: str
+    current: bool
+
+
+@dataclass(frozen=True)
+class SwitchResult:
+    """切换结果：是否成功、成功摘要或失败/拒绝原因，及成功时的目标。"""
+
+    ok: bool
+    message: str
+    name: str = ""
+    model: str = ""
+
+
+@dataclass(frozen=True)
 class SessionInfo:
     """综合状态命令所需快照。"""
 
@@ -51,6 +81,8 @@ class SessionInfo:
     tokens_out: int
     session_id: str
     message_count: int
+    output_style: str = "default"
+    context_window: int = 0
 
 
 class CommandError(Exception):

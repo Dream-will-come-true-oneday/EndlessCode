@@ -12,7 +12,7 @@ from endless_code.config import ProviderConfig
 from endless_code.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
 from endless_code.permission import Mode, new_engine
 from endless_code.prompt import EXECUTE_DIRECTIVE, PLAN_MODE_REMINDER
-from endless_code.session import Writer
+from endless_code.session import Writer, list_sessions
 from endless_code.tool import Registry, Result, new_default_registry
 from endless_code.tui.app import EndlessCodeApp, SessionState
 
@@ -521,11 +521,19 @@ async def test_tab_completion_single_and_multi_match() -> None:
         assert inp.value == "/pe"
         assert "/perm" in _chat_text(app) and "/permissions" in _chat_text(app)
 
-        inp.value = "/st"
+        inp.value = "/stat"
         app.action_complete_command()
         await pilot.pause()
         assert inp.value == "/status "
         assert inp.cursor_position == len("/status ")
+
+        # 新增 /style 后，/st 不再唯一：多匹配保留原文并展示候选
+        inp.value = "/st"
+        app.action_complete_command()
+        await pilot.pause()
+        assert inp.value == "/st"
+        text_in_chat = _chat_text(app)
+        assert "/status" in text_in_chat and "/style" in text_in_chat
 
 
 @pytest.mark.asyncio
@@ -625,3 +633,244 @@ async def test_suggestion_down_then_enter_executes_second() -> None:
         assert app._suggest_specs == []
         # 第二个候选 /compact 已执行并输出压缩提示
         assert "已压缩" in _chat_text(app)
+
+
+# ---- 会话内模型切换与输出样式（docs/model-style） ----
+
+
+def _second_config() -> ProviderConfig:
+    return ProviderConfig(
+        name="deepseek",
+        protocol="deepseek",
+        api_key=TEST_SECRET,
+        model="deepseek-chat",
+        context_window=64_000,
+    )
+
+
+def _broken_config() -> ProviderConfig:
+    env_name = "ENDLESS_CODE_TEST_MISSING_KEY_SWITCH"
+    os.environ.pop(env_name, None)
+    return ProviderConfig(
+        name="deepseek",
+        protocol="deepseek",
+        api_key=f"${env_name}",
+        model="deepseek-chat",
+    )
+
+
+def _deepseek_fake() -> FakeProvider:
+    """第二个 provider 的替身：覆写实例属性以报告目标模型。"""
+    fake = FakeProvider([])
+    fake.name = "deepseek"
+    fake.model = "deepseek-chat"
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_model_switch_keeps_conversation_session_and_writer(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    provider = FakeProvider([[StreamEvent(text="first"), StreamEvent(done=True)]])
+    with patch(
+        "endless_code.tui.app.new_provider", side_effect=[provider, _deepseek_fake()]
+    ):
+        app = EndlessCodeApp(
+            [_config(), _second_config()], new_default_registry(), engine=_engine()
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._handle_select_input("1")
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            app._start_turn("hi")
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+
+            session_id = app._runtime.session.session_id
+            writer_path = app._writer.path
+            count = app._conv.length()
+            mode_before = app.mode
+
+            app._handle_idle_input("/model 2")
+            await pilot.pause()
+
+            assert app._provider.model == "deepseek-chat"
+            assert app._conv.length() == count
+            assert app._runtime.session.session_id == session_id
+            assert app._writer.path == writer_path
+            assert app._runtime.context_window == 64_000
+            assert app._runtime.usage_anchor == 0
+            assert app._runtime.anchor_msg_len == 0
+            assert "deepseek-chat" in app.sub_title
+            assert app.mode == mode_before
+            assert app.state is SessionState.IDLE
+
+
+@pytest.mark.asyncio
+async def test_model_switch_failure_keeps_previous_provider(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    with patch("endless_code.tui.app.new_provider", return_value=FakeProvider([])):
+        app = EndlessCodeApp(
+            [_config(), _broken_config()], new_default_registry(), engine=_engine()
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._handle_select_input("1")
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            count = app._conv.length()
+
+            app._handle_idle_input("/model 2")
+            await pilot.pause()
+
+            assert "API key 不可用" in _chat_text(app)
+            assert app._provider.model == "fake-model"
+            assert app._conv.length() == count
+            assert app.state is SessionState.IDLE
+
+
+@pytest.mark.asyncio
+async def test_model_switch_rejected_while_busy() -> None:
+    provider = BlockingProvider()
+    with patch("endless_code.tui.app.new_provider", return_value=provider):
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+        async with app.run_test() as pilot:
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            app._start_turn("wait")
+            await provider.started.wait()
+
+            app._handle_idle_input("/model 1")
+            await pilot.pause()
+            assert "尚未结束" in _chat_text(app)
+
+            app.action_cancel_turn()
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            assert app._provider is provider
+
+
+@pytest.mark.asyncio
+async def test_model_selector_matches_name_and_rejects_unknown(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    with patch(
+        "endless_code.tui.app.new_provider",
+        side_effect=[FakeProvider([]), _deepseek_fake()],
+    ):
+        app = EndlessCodeApp(
+            [_config(), _second_config()], new_default_registry(), engine=_engine()
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._handle_select_input("1")
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+
+            app._handle_idle_input("/model deepseek")
+            await pilot.pause()
+            assert app._provider.model == "deepseek-chat"
+
+            app._handle_idle_input("/model nope")
+            await pilot.pause()
+            assert "未找到模型" in _chat_text(app)
+            assert app._provider.model == "deepseek-chat"
+
+
+@pytest.mark.asyncio
+async def test_style_switch_updates_agent_and_writes_marker(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    with patch("endless_code.tui.app.new_provider", return_value=FakeProvider([])):
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+        async with app.run_test() as pilot:
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+
+            app._handle_idle_input("/style concise")
+            await pilot.pause()
+
+            assert app._output_style == "concise"
+            assert app._agent._output_style == "concise"
+            assert "简洁" in app.sub_title
+            assert "下一轮回答生效" in _chat_text(app)
+
+            rows = [
+                json.loads(line)
+                for line in app._writer.path.read_text(encoding="utf-8").splitlines()
+            ]
+            assert any(
+                row.get("type") == "style_switch" and row.get("style") == "concise"
+                for row in rows
+            )
+
+
+@pytest.mark.asyncio
+async def test_style_switch_unknown_name_keeps_current() -> None:
+    with patch("endless_code.tui.app.new_provider", return_value=FakeProvider([])):
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+        async with app.run_test() as pilot:
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+
+            app._handle_idle_input("/style nope")
+            await pilot.pause()
+
+            chat = _chat_text(app)
+            assert "未知输出样式" in chat
+            assert "explanatory" in chat
+            assert app._output_style == "default"
+
+
+@pytest.mark.asyncio
+async def test_style_switch_rejected_while_busy() -> None:
+    provider = BlockingProvider()
+    with patch("endless_code.tui.app.new_provider", return_value=provider):
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+        async with app.run_test() as pilot:
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            app._start_turn("wait")
+            await provider.started.wait()
+
+            app._handle_idle_input("/style concise")
+            await pilot.pause()
+            assert "尚未结束" in _chat_text(app)
+            assert app._output_style == "default"
+
+            app.action_cancel_turn()
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+
+
+@pytest.mark.asyncio
+async def test_status_command_shows_style_and_window() -> None:
+    with patch("endless_code.tui.app.new_provider", return_value=FakeProvider([])):
+        app = EndlessCodeApp([_config()], new_default_registry(), engine=_engine())
+        async with app.run_test() as pilot:
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+
+            app._handle_idle_input("/status")
+            await pilot.pause()
+            chat = _chat_text(app)
+            assert "输出样式：默认" in chat
+            assert "上下文窗口：1000000" in chat
+
+
+@pytest.mark.asyncio
+async def test_model_switch_marker_feeds_resume_list(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    with patch(
+        "endless_code.tui.app.new_provider",
+        side_effect=[FakeProvider([]), _deepseek_fake()],
+    ):
+        app = EndlessCodeApp(
+            [_config(), _second_config()], new_default_registry(), engine=_engine()
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._handle_select_input("1")
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+
+            app._handle_idle_input("/model 2")
+            await pilot.pause()
+
+            items = list_sessions(str(app._sessions_dir))
+            assert len(items) == 1
+            assert items[0].model == "deepseek-chat"

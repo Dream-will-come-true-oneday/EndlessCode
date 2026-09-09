@@ -2,7 +2,12 @@
 
 from typing import Protocol
 
-from endless_code.command.types import SessionInfo
+from endless_code.command.types import (
+    ModelOption,
+    SessionInfo,
+    StyleOption,
+    SwitchResult,
+)
 from endless_code.permission import Mode
 
 
@@ -21,6 +26,12 @@ class CommandHost(Protocol):
     # 权限模式
     def get_mode(self) -> Mode: ...
     def set_mode(self, mode: Mode) -> None: ...
+
+    # 模型与输出样式
+    def get_model_options(self) -> list[ModelOption]: ...
+    def switch_model(self, selector: str) -> SwitchResult: ...
+    def get_style_options(self) -> list[StyleOption]: ...
+    def set_output_style(self, name: str) -> SwitchResult: ...
 
     # 状态与记忆
     def get_session_info(self) -> SessionInfo: ...

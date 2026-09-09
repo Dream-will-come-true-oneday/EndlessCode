@@ -4,16 +4,23 @@ import inspect
 import math
 from collections.abc import AsyncIterator
 
+from endless_code.compact.budget import ContextBudget
 from endless_code.compact.const import (
     PTL_DROP_PERCENTAGE,
     PTL_RETRY_LIMIT,
     RECENT_KEEP_MESSAGES,
-    RECENT_KEEP_TOKENS,
 )
 from endless_code.compact.recovery import build_recovery_attachment
 from endless_code.compact.summary_prompt import build_summary_prompt, extract_summary
 from endless_code.compact.token import estimate_tokens
 from endless_code.llm import Message, PromptTooLongError, Request, StreamEvent
+
+# 只看「摘得出东西」，拦住空白或标记碎片；量够不够由编排层的预算判定。
+MIN_SUMMARY_CHARS = 8
+
+
+class CompactionQualityError(Exception):
+    """摘要结果不合格，不能拿它替换历史。"""
 
 
 def _provider_stream(provider, request: Request) -> AsyncIterator[StreamEvent]:
@@ -27,16 +34,25 @@ def _provider_stream(provider, request: Request) -> AsyncIterator[StreamEvent]:
     return stream_fn(request)
 
 
-def pick_recent_tail(messages: list[Message]) -> list[Message]:
+def pick_recent_tail(
+    messages: list[Message],
+    budget: ContextBudget,
+    max_tokens: int | None = None,
+    min_messages: int | None = None,
+) -> list[Message]:
     """从尾部保留足够的新近原文，且不拆开工具调用配对。"""
     if not messages:
         return []
+    keep = budget.recent_keep_tokens
+    if max_tokens is not None and max_tokens > 0:
+        keep = max_tokens
+    floor = RECENT_KEEP_MESSAGES if min_messages is None else max(1, min_messages)
     total = 0
     start = len(messages)
     for count, index in enumerate(range(len(messages) - 1, -1, -1), start=1):
         total += estimate_tokens(0, [messages[index]], 0)
         start = index
-        if total >= RECENT_KEEP_TOKENS and count >= RECENT_KEEP_MESSAGES:
+        if total >= keep and count >= floor:
             break
     while start > 0 and messages[start].role == "tool":
         start -= 1
@@ -104,35 +120,55 @@ async def ptl_retry(input_, messages: list[Message], first_error: Exception) -> 
     raise error
 
 
-async def run_summary(input_) -> list[Message]:
+async def run_summary(
+    input_,
+    recent_keep_tokens: int | None = None,
+    recent_min_messages: int | None = None,
+) -> tuple[list[Message], str]:
     old_messages = input_.conv.messages()
     if not old_messages:
-        return []
+        return [], ""
     snapshot = input_.recovery.snapshot()
     try:
         summary_text = await summarize_once(input_, old_messages)
     except PromptTooLongError as exc:
         summary_text = await ptl_retry(input_, old_messages, exc)
-    recovery = build_recovery_attachment(snapshot, input_.tool_defs)
+    recovery = build_recovery_attachment(snapshot, input_.tool_defs, input_.budget)
     summary = Message(
         role="user",
         content=f"## 历史会话摘要\n{summary_text}\n\n{recovery}",
     )
-    return _join_after_summary(summary, pick_recent_tail(old_messages))
+    tail = pick_recent_tail(
+        old_messages, input_.budget, recent_keep_tokens, recent_min_messages
+    )
+    return _join_after_summary(summary, tail), summary_text
 
 
-async def auto_compact(input_) -> tuple[list[Message], int, int]:
+async def auto_compact(
+    input_,
+    recent_keep_tokens: int | None = None,
+    recent_min_messages: int | None = None,
+) -> tuple[list[Message], int, int]:
     before = input_.estimated_token
     try:
-        messages = await run_summary(input_)
+        messages, summary_text = await run_summary(
+            input_, recent_keep_tokens, recent_min_messages
+        )
     except Exception:
         input_.auto_tracking.record_failure()
         raise
+    if len(summary_text.strip()) < MIN_SUMMARY_CHARS:
+        input_.auto_tracking.record_failure()
+        raise CompactionQualityError("模型返回的摘要为空或过短，已保留原始历史。")
     input_.auto_tracking.record_success()
     return messages, before, estimate_tokens(0, messages, 0)
 
 
-async def force_compact(input_) -> tuple[list[Message], int, int]:
+async def force_compact(
+    input_,
+    recent_keep_tokens: int | None = None,
+    recent_min_messages: int | None = None,
+) -> tuple[list[Message], int, int]:
     before = input_.estimated_token
-    messages = await run_summary(input_)
+    messages, _ = await run_summary(input_, recent_keep_tokens, recent_min_messages)
     return messages, before, estimate_tokens(0, messages, 0)

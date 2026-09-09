@@ -97,12 +97,13 @@ class BlockingTool(SecretTool):
         return Result(content="unreachable")
 
 
-def _config(*, api_key: str = TEST_SECRET) -> ProviderConfig:
+def _config(*, api_key: str = TEST_SECRET, context_window: int = 0) -> ProviderConfig:
     return ProviderConfig(
         name="fake",
         protocol="openai",
         api_key=api_key,
         model="fake-model",
+        context_window=context_window,
     )
 
 
@@ -699,8 +700,10 @@ async def test_model_switch_keeps_conversation_session_and_writer(
             assert app._runtime.session.session_id == session_id
             assert app._writer.path == writer_path
             assert app._runtime.context_window == 64_000
+            assert app._runtime.budget.context_window == 64_000
             assert app._runtime.usage_anchor == 0
             assert app._runtime.anchor_msg_len == 0
+            assert app.get_session_info().auto_compact_threshold == 49_344
             assert "deepseek-chat" in app.sub_title
             assert app.mode == mode_before
             assert app.state is SessionState.IDLE
@@ -747,6 +750,40 @@ async def test_model_switch_rejected_while_busy() -> None:
             app.action_cancel_turn()
             await _wait_for_state(app, pilot, SessionState.IDLE)
             assert app._provider is provider
+
+
+@pytest.mark.asyncio
+async def test_tiny_window_marks_degraded_compaction(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    provider = FakeProvider(
+        [
+            [StreamEvent(text="<summary>## 1 主要请求和意图\n继续任务</summary>")],
+            [StreamEvent(text="ok"), StreamEvent(done=True)],
+        ]
+    )
+    with patch("endless_code.tui.app.new_provider", return_value=provider):
+        app = EndlessCodeApp(
+            [_config(context_window=1_000)],
+            new_default_registry(),
+            engine=_engine(),
+        )
+        async with app.run_test() as pilot:
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            assert app._runtime.budget.degraded is True
+            assert "降级压缩" in app.sub_title
+            info = app.get_session_info()
+            assert info.degraded is True
+            assert info.usable_window == 1
+
+            app._handle_idle_input("/status")
+            await pilot.pause()
+            assert "已进入降级模式" in _chat_text(app)
+
+            # 降级窗口仍要压缩，并且本轮能正常结束。
+            app._start_turn("hi")
+            await _wait_for_state(app, pilot, SessionState.IDLE)
+            assert "历史会话摘要" in app._conv.messages()[0].content
+            assert app.state is SessionState.IDLE
 
 
 @pytest.mark.asyncio

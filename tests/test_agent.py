@@ -20,10 +20,12 @@ from endless_code.agent import (
     ToolEvent,
     new_session_runtime,
 )
+from endless_code.compact.const import ESTIMATE_CHARS_PER_TOKEN
 from endless_code.conversation import Conversation
 from endless_code.llm import (
     Message,
     PromptTooLongError,
+    Request,
     StreamEvent,
     ToolCall,
     ToolDefinition,
@@ -766,3 +768,109 @@ async def test_explicit_memory_signal_schedules_background_update(tmp_path) -> N
         "请记住我偏好中文回复",
         "done",
     ]
+
+
+def test_refresh_budget_follows_window_and_tools(tmp_path) -> None:
+    runtime = new_session_runtime(str(tmp_path), 128_000)
+    assert runtime.budget.effective_auto_threshold == 101_760
+
+    runtime.context_window = 1_000_000
+    plain = runtime.refresh_budget([])
+    assert plain.auto_compact_threshold == 795_000
+
+    loaded = runtime.refresh_budget(
+        [
+            ToolDefinition(
+                name="read_file",
+                description="d" * 3_500,
+                input_schema={"type": "object"},
+            )
+        ]
+    )
+    assert loaded.tool_schema_tokens > 0
+    assert loaded.usable_window == plain.usable_window - loaded.tool_schema_tokens
+
+
+class SummaryOnlyProvider:
+    """主请求走 system，摘要请求不带 system，据此分流。"""
+
+    name = "auto-compact-fake"
+    model = "auto-compact-model"
+
+    def __init__(self) -> None:
+        self.main_calls = 0
+        self.summary_calls = 0
+
+    async def stream(self, request: Request):
+        if not request.system.stable:
+            self.summary_calls += 1
+            yield StreamEvent(
+                text="<summary>## 1 主要请求和意图\n继续既有任务。</summary>"
+            )
+            yield StreamEvent(done=True)
+            return
+        self.main_calls += 1
+        yield StreamEvent(text="ok")
+        yield StreamEvent(done=True)
+
+
+@pytest.mark.asyncio
+async def test_small_window_turn_triggers_auto_compaction(tmp_path) -> None:
+    """128k 窗口下回合内必须看到自动压缩；固定阈值时代阈值是负数。"""
+    provider = SummaryOnlyProvider()
+    conv = Conversation()
+    for _ in range(10):
+        conv.add_user("x" * 40_000)
+    agent = Agent(
+        provider,
+        _registry(),
+        runtime=new_session_runtime(str(tmp_path), 128_000),
+    )
+    events = await _run(agent, conv)
+    phases = [event.compact.phase for event in events if event.compact is not None]
+    assert phases == [CompactPhase.BEFORE_AUTO, CompactPhase.AFTER_AUTO]
+    assert provider.summary_calls == 1
+    assert "历史会话摘要" in conv.messages()[0].content
+
+
+class UsageProvider:
+    name = "usage-fake"
+    model = "usage-model"
+
+    def __init__(self, usage: Usage) -> None:
+        self.usage = usage
+        self.calls = 0
+
+    async def stream(self, request: Request):
+        self.calls += 1
+        yield StreamEvent(text="收到")
+        yield StreamEvent(done=True, usage=self.usage)
+
+
+@pytest.mark.asyncio
+async def test_reported_usage_calibrates_token_meter(tmp_path) -> None:
+    provider = UsageProvider(Usage(input_tokens=1000, output_tokens=100))
+    conv = Conversation()
+    conv.add_user("请分析" + "中" * 600)
+    runtime = new_session_runtime(str(tmp_path))
+    agent = Agent(provider, _registry(), runtime=runtime)
+
+    await _run(agent, conv)
+    assert runtime.meter.samples >= 1
+    assert runtime.meter.chars_per_token != ESTIMATE_CHARS_PER_TOKEN
+    assert runtime.usage_anchor == 1100
+
+
+@pytest.mark.asyncio
+async def test_compaction_resets_token_meter(tmp_path) -> None:
+    provider = SummaryOnlyProvider()
+    conv = Conversation()
+    for _ in range(10):
+        conv.add_user("中" * 40_000)
+    runtime = new_session_runtime(str(tmp_path), 128_000)
+    agent = Agent(provider, _registry(), runtime=runtime)
+    runtime.meter.observe(added_bytes=400_000, added_tokens=400_000)
+    assert runtime.meter.chars_per_token != ESTIMATE_CHARS_PER_TOKEN
+
+    await _run(agent, conv)
+    assert runtime.meter.chars_per_token == ESTIMATE_CHARS_PER_TOKEN

@@ -6,20 +6,29 @@ import pytest
 
 from endless_code.compact import (
     CompactCircuitBreaker,
+    CompactionQualityError,
     ContentReplacementState,
     ManageInput,
     RecoveryState,
     TriggerKind,
+    build_context_budget,
     estimate_tokens,
     manage_context,
     new_session_context,
     offload_and_snip,
 )
+from endless_code.compact.compact import _quality_problem
 from endless_code.compact.layer2 import group_by_user_turn, pick_recent_tail
 from endless_code.compact.recovery import build_recovery_attachment
 from endless_code.compact.summary_prompt import build_summary_prompt, extract_summary
 from endless_code.conversation import Conversation
-from endless_code.llm import Message, StreamEvent, ToolDefinition, ToolResult
+from endless_code.llm import (
+    Message,
+    StreamEvent,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+)
 
 
 class SummaryProvider:
@@ -37,13 +46,19 @@ class SummaryProvider:
 
 
 def _input(
-    tmp_path: Path, conv: Conversation, provider: SummaryProvider
+    tmp_path: Path,
+    conv: Conversation,
+    provider: SummaryProvider,
+    context_window: int = 200_000,
+    trigger: TriggerKind = TriggerKind.MANUAL,
+    estimated_token: int = 100,
 ) -> ManageInput:
     return ManageInput(
         conv=conv,
         provider=provider,
         model=provider.model,
-        context_window=200_000,
+        context_window=context_window,
+        budget=build_context_budget(context_window),
         tool_defs=[
             ToolDefinition(
                 name="read_file",
@@ -57,8 +72,8 @@ def _input(
         session=new_session_context(str(tmp_path)),
         usage_anchor=0,
         anchor_msg_len=0,
-        estimated_token=100,
-        trigger=TriggerKind.MANUAL,
+        estimated_token=estimated_token,
+        trigger=trigger,
     )
 
 
@@ -73,12 +88,13 @@ def test_session_context_and_decision_freeze(tmp_path) -> None:
 def test_layer1_offloads_large_result_and_is_stable(tmp_path) -> None:
     state = ContentReplacementState()
     context = new_session_context(str(tmp_path))
+    budget = build_context_budget(1_000_000)
     source = Message(
         role="tool",
         tool_results=[ToolResult(tool_call_id="large", content="x" * 260_000)],
     )
-    first = offload_and_snip([source], state, context)
-    second = offload_and_snip(first, state, context)
+    first = offload_and_snip([source], state, context, budget)
+    second = offload_and_snip(first, state, context, budget)
     preview = first[0].tool_results[0].content
     assert "original size: 260000 bytes" in preview
     assert "[head preview]" in preview
@@ -89,9 +105,10 @@ def test_layer1_offloads_large_result_and_is_stable(tmp_path) -> None:
     assert source.tool_results[0].content == "x" * 260_000
 
 
-def test_layer1_limits_aggregate_results(tmp_path) -> None:
+def test_layer1_aggregate_limit_is_dynamic(tmp_path) -> None:
     state = ContentReplacementState()
     context = new_session_context(str(tmp_path))
+    budget = build_context_budget(1_000_000)
     message = Message(
         role="tool",
         tool_results=[
@@ -99,7 +116,7 @@ def test_layer1_limits_aggregate_results(tmp_path) -> None:
             for index in range(5)
         ],
     )
-    result = offload_and_snip([message], state, context)[0]
+    result = offload_and_snip([message], state, context, budget)[0]
     remaining = sum(
         len(item.content.encode("utf-8"))
         for item in result.tool_results
@@ -112,6 +129,28 @@ def test_layer1_limits_aggregate_results(tmp_path) -> None:
     )
 
 
+def test_layer1_small_window_offloads_what_1m_window_keeps(tmp_path) -> None:
+    """40KB 结果在 128k 窗口下必须落盘，在 1M 窗口下保留原文。"""
+    content = "x" * 40_000
+    result = Message(role="tool", tool_results=[ToolResult("call", content)])
+
+    small = offload_and_snip(
+        [result],
+        ContentReplacementState(),
+        new_session_context(str(tmp_path)),
+        build_context_budget(128_000),
+    )[0]
+    assert "[tool result offloaded" in small.tool_results[0].content
+
+    large = offload_and_snip(
+        [result],
+        ContentReplacementState(),
+        new_session_context(str(tmp_path)),
+        build_context_budget(1_000_000),
+    )[0]
+    assert large.tool_results[0].content == content
+
+
 def test_token_and_recent_tail_keep_tool_pair() -> None:
     messages = [
         Message(role="user", content="u" * 20_000),
@@ -121,9 +160,13 @@ def test_token_and_recent_tail_keep_tool_pair() -> None:
         Message(role="user", content="next"),
     ]
     assert estimate_tokens(5_000, [Message(role="user", content="x" * 350)], 0) >= 5_100
-    tail = pick_recent_tail(messages)
+    tail = pick_recent_tail(messages, build_context_budget(1_000_000))
     assert tail[0].role != "tool"
     assert len(tail) >= 5
+    tight = pick_recent_tail(
+        messages, build_context_budget(32_000), max_tokens=1, min_messages=1
+    )
+    assert len(tight) < len(messages)
 
 
 def test_summary_prompt_and_recovery_are_deterministic() -> None:
@@ -136,8 +179,9 @@ def test_summary_prompt_and_recovery_are_deterministic() -> None:
     recovery = RecoveryState()
     recovery.record_file("README.md", "content")
     defs = [ToolDefinition("read_file", "read", {"type": "object"})]
-    first = build_recovery_attachment(recovery.snapshot(), defs)
-    second = build_recovery_attachment(recovery.snapshot(), defs)
+    budget = build_context_budget(1_000_000)
+    first = build_recovery_attachment(recovery.snapshot(), defs, budget)
+    second = build_recovery_attachment(recovery.snapshot(), defs, budget)
     assert first == second
     assert "当前可用工具" in first
     assert '"type": "object"' in first
@@ -168,3 +212,111 @@ def test_group_by_user_turn() -> None:
         ]
     )
     assert [len(group) for group in groups] == [3, 1]
+
+
+@pytest.mark.asyncio
+async def test_small_window_auto_compaction_triggers_and_tightens_tail(
+    tmp_path,
+) -> None:
+    """128k 窗口下自动压缩必须真跑；固定阈值时代这里永不压缩。"""
+    conv = Conversation()
+    for _ in range(10):
+        conv.add_user("x" * 140_000)
+    provider = SummaryProvider(
+        "<summary>## 1 主要请求和意图\n延续既有任务并保留全部用户诉求。</summary>"
+    )
+    input_ = _input(
+        tmp_path,
+        conv,
+        provider,
+        context_window=128_000,
+        trigger=TriggerKind.AUTO,
+        estimated_token=400_000,
+    )
+    result = await manage_context(input_)
+    assert result.compacted is True
+    assert result.err is None
+    assert result.after_tokens < input_.budget.compact_target
+    assert "历史会话摘要" in conv.messages()[0].content
+    # 首轮尾部保留量超标 → 收紧后重试一次。
+    assert len(provider.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_quality_gate_failure_keeps_history_and_reports_error(tmp_path) -> None:
+    conv = Conversation()
+    conv.add_user("x" * 2_000_000)
+    provider = SummaryProvider("<summary>## 1 主要请求和意图\n巨型上下文</summary>")
+    input_ = _input(
+        tmp_path,
+        conv,
+        provider,
+        context_window=128_000,
+        trigger=TriggerKind.AUTO,
+        estimated_token=600_000,
+    )
+    result = await manage_context(input_)
+    assert result.compacted is False
+    assert isinstance(result.err, CompactionQualityError)
+    assert len(conv.messages()) == 1
+    assert conv.messages()[0].content.startswith("x")
+
+
+@pytest.mark.asyncio
+async def test_degraded_window_still_compacts(tmp_path) -> None:
+    conv = Conversation()
+    conv.add_user("请总结")
+    provider = SummaryProvider("<summary>## 1 主要请求和意图\n请总结</summary>")
+    input_ = _input(
+        tmp_path,
+        conv,
+        provider,
+        context_window=1_000,
+        trigger=TriggerKind.AUTO,
+        estimated_token=10,
+    )
+    assert input_.budget.degraded is True
+    result = await manage_context(input_)
+    assert result.compacted is True
+    assert "历史会话摘要" in conv.messages()[0].content
+
+
+@pytest.mark.asyncio
+async def test_blank_summary_keeps_history(tmp_path) -> None:
+    """模型只返空标记时不能拿它替换历史。"""
+    conv = Conversation()
+    for _ in range(10):
+        conv.add_user("x" * 40_000)
+    provider = SummaryProvider("<summary>   </summary>")
+    input_ = _input(
+        tmp_path,
+        conv,
+        provider,
+        context_window=128_000,
+        trigger=TriggerKind.AUTO,
+        estimated_token=120_000,
+    )
+    result = await manage_context(input_)
+    assert result.compacted is False
+    assert isinstance(result.err, CompactionQualityError)
+    assert len(conv.messages()) == 10
+    assert input_.auto_tracking.tripped() is False
+
+
+def test_quality_problem_detects_orphan_tool_results() -> None:
+    budget = build_context_budget(1_000_000)
+    orphans = [
+        Message(role="user", content="摘要"),
+        Message(role="tool", tool_results=[ToolResult("dangling", "ok")]),
+    ]
+    assert "无对应调用的工具结果" in _quality_problem(orphans, 10, budget)
+    paired = [
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(id="c1", name="read_file", input="{}")],
+        ),
+        Message(role="tool", tool_results=[ToolResult("c1", "ok")]),
+    ]
+    assert _quality_problem(paired, 10, budget) == ""
+    assert _quality_problem([], 10, budget) == "压缩后历史为空"

@@ -40,7 +40,6 @@ from endless_code.command import (
     register_builtin_commands,
 )
 from endless_code.compact import estimate_tokens, open_session_context
-from endless_code.compact.const import AUTO_SAFETY_MARGIN, SUMMARY_RESERVE
 from endless_code.config import ConfigError, ProviderConfig, effective_context_window
 from endless_code.conversation import Conversation
 from endless_code.llm import Provider, new_provider
@@ -353,9 +352,12 @@ class EndlessCodeApp(App):
         self._provider = provider
         if secret:
             self._secrets.add(secret)
-        self._runtime.context_window = effective_context_window(cfg)
-        self._runtime.usage_anchor = 0
-        self._runtime.anchor_msg_len = 0
+        if self._runtime is not None:
+            self._runtime.context_window = effective_context_window(cfg)
+            self._runtime.refresh_budget([])
+            self._runtime.usage_anchor = 0
+            self._runtime.anchor_msg_len = 0
+            self._runtime.meter.reset()
         if self._writer is not None:
             self._writer.write_model_marker(old_model, provider.model)
         if self._memory_manager is not None:
@@ -401,8 +403,14 @@ class EndlessCodeApp(App):
         mode_label = MODE_LABELS.get(self._mode, str(self._mode))
         style = style_label(self._output_style)
         window = self._runtime.context_window if self._runtime else 0
+        degraded = (
+            " | 降级压缩"
+            if (self._runtime is not None and self._runtime.budget.degraded)
+            else ""
+        )
         self.sub_title = (
-            f"{mode_label} | {provider_name} | {model} | {style} | {window} ctx | "
+            f"{mode_label} | {provider_name} | {model} | {style} | "
+            f"{window} ctx{degraded} | "
             f"↑{self._usage_in} ↓{self._usage_out} tok | /help 查看命令"
         )
 
@@ -621,6 +629,7 @@ class EndlessCodeApp(App):
         return self._command_set_style(name)
 
     def get_session_info(self) -> SessionInfo:
+        budget = self._runtime.budget if self._runtime is not None else None
         return SessionInfo(
             version=self._version,
             provider=self._provider.name if self._provider else "--",
@@ -632,6 +641,9 @@ class EndlessCodeApp(App):
             message_count=self._conv.length(),
             output_style=style_label(self._output_style),
             context_window=(self._runtime.context_window if self._runtime else 0),
+            usable_window=budget.usable_window if budget else 0,
+            auto_compact_threshold=(budget.effective_auto_threshold if budget else 0),
+            degraded=budget.degraded if budget else False,
         )
 
     def get_memory_index(self) -> str:
@@ -961,9 +973,7 @@ class EndlessCodeApp(App):
                 if self._agent is not None:
                     self._agent._audit_writer = self._audit_writer
                     self._agent._checkpoint = self._checkpoint
-                threshold = (
-                    self._runtime.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
-                )
+                threshold = self._runtime.budget.effective_auto_threshold
                 if (
                     self._agent is not None
                     and estimate_tokens(0, loaded.messages, 0) >= threshold

@@ -21,18 +21,17 @@ from endless_code.checkpoint.diff import (
 from endless_code.compact import (
     CompactCircuitBreaker,
     ContentReplacementState,
+    ContextBudget,
     ManageInput,
     RecoveryState,
+    TokenMeter,
     TriggerKind,
-    estimate_tokens,
+    appended_bytes,
+    build_context_budget,
+    estimate_tool_schema_tokens,
     manage_context,
     new_session_context,
     usage_anchor,
-)
-from endless_code.compact.const import (
-    AUTO_SAFETY_MARGIN,
-    MANUAL_SAFETY_MARGIN,
-    SUMMARY_RESERVE,
 )
 from endless_code.conversation import Conversation
 from endless_code.llm import (
@@ -109,22 +108,35 @@ class SessionRuntime:
     auto_tracking: CompactCircuitBreaker
     session: object
     context_window: int = 1_000_000
+    budget: ContextBudget = field(
+        default_factory=lambda: build_context_budget(1_000_000)
+    )
+    meter: TokenMeter = field(default_factory=TokenMeter)
     usage_anchor: int = 0
     anchor_msg_len: int = 0
     run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     turn_count: int = 0
 
+    def refresh_budget(self, tool_defs: list[ToolDefinition]) -> ContextBudget:
+        """按当前窗口与工具定义开销重建预算；窗口变更后必须调用。"""
+        self.budget = build_context_budget(
+            self.context_window, estimate_tool_schema_tokens(tool_defs)
+        )
+        return self.budget
+
 
 def new_session_runtime(
     workspace: str, context_window: int = 1_000_000
 ) -> SessionRuntime:
-    return SessionRuntime(
+    runtime = SessionRuntime(
         replacement=ContentReplacementState(),
         recovery=RecoveryState(),
         auto_tracking=CompactCircuitBreaker(),
         session=new_session_context(workspace),
         context_window=context_window,
     )
+    runtime.budget = build_context_budget(context_window)
+    return runtime
 
 
 @dataclass
@@ -262,16 +274,14 @@ class Agent:
                 else ""
             )
 
-            estimated = estimate_tokens(
+            budget = self._runtime.refresh_budget(definitions)
+            estimated = self._runtime.meter.estimate(
                 self._runtime.usage_anchor,
                 conv.messages(),
                 self._runtime.anchor_msg_len,
             )
-            auto_threshold = (
-                self._runtime.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
-            )
             likely_auto = (
-                estimated >= auto_threshold
+                estimated >= budget.effective_auto_threshold
                 and not self._runtime.auto_tracking.tripped()
             )
             if likely_auto:
@@ -282,6 +292,7 @@ class Agent:
                     provider=self._provider,
                     model=self._provider.model,
                     context_window=self._runtime.context_window,
+                    budget=budget,
                     tool_defs=definitions,
                     replacement=self._runtime.replacement,
                     recovery=self._runtime.recovery,
@@ -302,6 +313,8 @@ class Agent:
                         managed.err,
                     )
                 )
+            if managed.compacted:
+                self._runtime.meter.reset()
 
             emergency_retried = False
             while True:
@@ -336,6 +349,7 @@ class Agent:
                             provider=self._provider,
                             model=self._provider.model,
                             context_window=self._runtime.context_window,
+                            budget=self._runtime.budget,
                             tool_defs=definitions,
                             replacement=self._runtime.replacement,
                             recovery=self._runtime.recovery,
@@ -343,7 +357,7 @@ class Agent:
                             session=self._runtime.session,
                             usage_anchor=self._runtime.usage_anchor,
                             anchor_msg_len=self._runtime.anchor_msg_len,
-                            estimated_token=estimate_tokens(
+                            estimated_token=self._runtime.meter.estimate(
                                 self._runtime.usage_anchor,
                                 conv.messages(),
                                 self._runtime.anchor_msg_len,
@@ -369,12 +383,9 @@ class Agent:
                 )
                 self._runtime.usage_anchor = 0
                 self._runtime.anchor_msg_len = 0
-                retry_estimate = estimate_tokens(0, conv.messages(), 0)
-                if retry_estimate >= (
-                    self._runtime.context_window
-                    - SUMMARY_RESERVE
-                    - MANUAL_SAFETY_MARGIN
-                ):
+                self._runtime.meter.reset()
+                retry_estimate = self._runtime.meter.estimate(0, conv.messages(), 0)
+                if retry_estimate >= self._runtime.budget.effective_emergency_threshold:
                     round_state.error = PromptTooLongError("压缩后上下文仍超过安全阈值")
                     break
 
@@ -523,7 +534,12 @@ class Agent:
     def _record_usage_anchor(self, usage: Usage | None, conv: Conversation) -> None:
         if usage is None:
             return
-        self._runtime.usage_anchor = usage_anchor(usage)
+        total = usage_anchor(usage)
+        self._runtime.meter.observe(
+            appended_bytes(conv.messages(), self._runtime.anchor_msg_len),
+            total - self._runtime.usage_anchor,
+        )
+        self._runtime.usage_anchor = total
         self._runtime.anchor_msg_len = conv.length()
 
     def _schedule_memory_update(self, conv: Conversation) -> None:
@@ -568,7 +584,7 @@ class Agent:
                 if mode is Mode.PLAN
                 else self._registry.definitions()
             )
-            estimated = estimate_tokens(
+            estimated = self._runtime.meter.estimate(
                 self._runtime.usage_anchor,
                 conv.messages(),
                 self._runtime.anchor_msg_len,
@@ -579,6 +595,7 @@ class Agent:
                     provider=self._provider,
                     model=self._provider.model,
                     context_window=self._runtime.context_window,
+                    budget=self._runtime.refresh_budget(definitions),
                     tool_defs=definitions,
                     replacement=self._runtime.replacement,
                     recovery=self._runtime.recovery,
@@ -592,6 +609,7 @@ class Agent:
             )
             self._runtime.usage_anchor = 0
             self._runtime.anchor_msg_len = 0
+            self._runtime.meter.reset()
             return result.before_tokens, result.after_tokens
 
     async def _execute_events(

@@ -100,6 +100,9 @@ def register_builtin_commands(registry: Registry) -> None:
 
     def status_command(host, args: str) -> None:
         info = host.get_session_info()
+        threshold_line = f"自动压缩阈值：{info.auto_compact_threshold}"
+        if info.degraded:
+            threshold_line += "（窗口过小，已进入降级模式）"
         lines = [
             f"版本：{info.version}",
             f"Provider：{info.provider}",
@@ -107,6 +110,8 @@ def register_builtin_commands(registry: Registry) -> None:
             f"权限模式：{info.mode}",
             f"输出样式：{info.output_style}",
             f"上下文窗口：{info.context_window}",
+            f"可用窗口：{info.usable_window}",
+            threshold_line,
             f"Token 用量：↑{info.tokens_in} ↓{info.tokens_out}",
             f"会话标识：{info.session_id}",
             f"消息数：{info.message_count}",

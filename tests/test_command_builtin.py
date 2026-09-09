@@ -1,5 +1,7 @@
 """分发器与内置命令测试：FakeHost 全程不导入渲染框架。"""
 
+from dataclasses import replace
+
 import pytest
 
 from endless_code.command.builtin import register_builtin_commands
@@ -37,6 +39,8 @@ class FakeHost:
             message_count=3,
             output_style="默认",
             context_window=1000000,
+            usable_window=960000,
+            auto_compact_threshold=795000,
         )
         self.memory_index_value = ""
         self.last_error_value = ""
@@ -263,8 +267,18 @@ def test_status_outputs_all_fields() -> None:
         "3",
         "输出样式：默认",
         "上下文窗口：1000000",
+        "可用窗口：960000",
+        "自动压缩阈值：795000",
     ):
         assert expected in joined
+    assert "降级" not in joined
+
+
+def test_status_marks_degraded_window() -> None:
+    dispatcher, host = new_dispatcher()
+    host.session_info = replace(host.session_info, degraded=True)
+    assert dispatcher.try_dispatch("/status") is True
+    assert "已进入降级模式" in host.notices[-1]
 
 
 def test_model_command_lists_options_and_marks_current() -> None:

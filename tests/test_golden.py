@@ -10,6 +10,7 @@ from pathlib import Path
 
 from endless_code.compact import (
     ContentReplacementState,
+    build_context_budget,
     new_session_context,
     offload_and_snip,
 )
@@ -94,7 +95,8 @@ def test_offload_preview_format_contract(tmp_path) -> None:
         role="tool",
         tool_results=[ToolResult(tool_call_id="large", content="y" * 260_000)],
     )
-    replaced = offload_and_snip([source], state, context)
+    budget = build_context_budget(1_000_000)
+    replaced = offload_and_snip([source], state, context, budget)
     preview = replaced[0].tool_results[0].content
     normalized = preview.replace(context.spill_dir, "<SPILL_DIR>")
     assert "[head preview]" in normalized

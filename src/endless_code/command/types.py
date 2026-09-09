@@ -83,6 +83,9 @@ class SessionInfo:
     message_count: int
     output_style: str = "default"
     context_window: int = 0
+    usable_window: int = 0
+    auto_compact_threshold: int = 0
+    degraded: bool = False
 
 
 class CommandError(Exception):
